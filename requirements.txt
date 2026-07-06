@@ -1,0 +1,14 @@
+# 自動車追い越し検出パイプライン 依存パッケージ
+#
+# 注意: Python 3.14 では torch / ultralytics のビルド済みwheelが
+# まだ無い場合があります。その場合は Python 3.11 か 3.12 の利用を推奨。
+#
+#   py -3.12 -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements.txt
+
+ultralytics>=8.2.0      # YOLO 検出 + ByteTrack トラッキング
+opencv-python>=4.9.0    # 動画読み込み・描画
+numpy>=1.26
+lap>=0.5.12             # ByteTrack の割り当て計算 (ultralytics が要求)
+pywebview>=5.0           # HTML/CSS/JavaScript GUI (Windows WebView2)

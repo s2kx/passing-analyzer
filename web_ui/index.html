@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>自転車追い越し解析ワークフロー</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">MATSUMOTO LAB · RIDER SAFETY</p>
+      <h1>追い越し解析ワークフロー</h1>
+    </div>
+    <div class="status-pill" id="globalStatus"><span></span>準備完了</div>
+  </header>
+
+  <main class="app-shell">
+    <nav class="steps" aria-label="解析手順">
+      <button class="step active" data-step="detect"><b>1</b><span>動画検出<small>GoPro</small></span></button>
+      <button class="step" data-step="review"><b>2</b><span>候補確認<small>クリップ</small></span></button>
+      <button class="step" data-step="sync"><b>3</b><span>PCAP・同期<small>GPS / VeloView</small></span></button>
+      <button class="step" data-step="lidar"><b>4</b><span>点群・出力<small>CSV / EXE</small></span></button>
+      <button class="step" data-step="edit"><b>5</b><span>軌跡 edit.csv<small>EXPORT</small></span></button>
+      <button class="step" data-step="final"><b>6</b><span>最終Excel<small>SUBMIT</small></span></button>
+    </nav>
+
+    <section class="panel active" id="panel-detect">
+      <div class="section-heading">
+        <div><span class="section-number">01</span><h2>GoPro動画から候補を検出</h2></div>
+        <p>動画とカメラ方向を指定すると、AIが追い越し候補と確認用クリップを作成します。</p>
+      </div>
+      <div class="grid two-column">
+        <article class="card form-card">
+          <label>GoPro動画（複数選択可・上から順に時間を連結）</label>
+          <ul id="videoList" class="video-list"><li class="empty">動画を追加してください</li></ul>
+          <div class="button-row video-list-actions">
+            <button class="secondary" id="addVideos">動画を追加</button>
+            <button class="secondary" id="clearVideos">すべて削除</button>
+          </div>
+          <label>出力フォルダ</label>
+          <div class="path-input"><input id="outPath" readonly><button data-pick="out">選択</button></div>
+          <div class="field-row">
+            <fieldset><legend>カメラ方向</legend><label class="radio"><input type="radio" name="view" value="front">前方</label><label class="radio"><input type="radio" name="view" value="rear" checked>後方</label></fieldset>
+            <fieldset><legend>追加設定</legend><label class="check"><input id="overlay" type="checkbox">検出枠動画</label><label class="check"><input id="roadRoi" type="checkbox">道路ROI</label></fieldset>
+          </div>
+          <div class="button-row">
+            <button class="primary large" id="startDetection">追い越し候補を検出</button>
+            <button class="secondary" id="loadExisting">既存の結果を読み込む</button>
+          </div>
+        </article>
+        <article class="card progress-card">
+          <div class="card-title"><h3>解析状況</h3><span id="progressLabel">0%</span></div>
+          <div class="progress-track"><div id="progressBar"></div></div>
+          <p id="processMessage" class="process-message">動画を選択して開始してください。</p>
+          <pre id="processLog" class="log">待機中...</pre>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-review">
+      <div class="section-heading">
+        <div><span class="section-number">02</span><h2>クリップを確認</h2></div>
+        <p>各候補を再生し、本当の追い越しは「採用」、誤検知は「除外」にします。</p>
+      </div>
+      <div class="review-layout">
+        <article class="card preview-card main-preview">
+          <div class="video-stage">
+            <div class="video-placeholder" id="videoPlaceholder"><span>▶</span><p>候補を選択すると<br>クリップを再生できます</p></div>
+            <video id="clipPlayer" controls hidden></video>
+          </div>
+          <div class="preview-controls">
+            <div class="preview-meta">
+              <div><span id="previewId">候補未選択</span><span class="badge" id="previewStatus">未確認</span></div>
+              <strong id="previewTime">--:--</strong>
+            </div>
+            <div class="control-row">
+              <label class="speed-select"><span>速度</span><select id="speedSelect" aria-label="再生速度">
+                <option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="1.5">1.5x</option><option value="2">2x</option><option value="3">3x</option><option value="4">4x</option><option value="5">5x</option>
+              </select></label>
+              <div class="transport-buttons"><button class="secondary" id="previousClip">← 前の候補</button><button class="secondary" id="nextClip">次の候補 →</button></div>
+            </div>
+            <div class="decision-buttons"><button class="accept" data-status="採用">✓ 採用 <kbd data-keyhint="accept">A</kbd></button><button class="reject" data-status="除外">× 除外 <kbd data-keyhint="reject">D</kbd></button><button class="secondary" data-status="未確認">未確認へ戻す <kbd data-keyhint="unreview">W</kbd></button></div>
+            <div class="shortcut-help"><span><kbd>Space</kbd> 再生 / 一時停止</span><span><kbd>←</kbd><kbd>→</kbd> 候補移動</span><span>車種 <kbd data-keyhint="kei">B</kbd>軽 <kbd data-keyhint="normal">N</kbd>普通 <kbd data-keyhint="large">M</kbd>大型</span><span>採否決定後は次の候補を自動再生</span></div>
+          </div>
+        </article>
+        <aside class="card table-card">
+          <div class="card-title"><h3>追い越し候補</h3><div class="counter"><span id="reviewedCount">0</span> / <span id="eventCount">0</span> 確認済み</div></div>
+          <div class="table-wrap">
+            <table><thead><tr><th>ID</th><th>車種</th><th>危険感</th><th>開始</th><th>終了</th><th>結果</th></tr></thead><tbody id="eventRows"><tr><td colspan="6" class="empty">検出結果を読み込んでください</td></tr></tbody></table>
+          </div>
+          <div class="button-row">
+            <button class="secondary" id="saveReviews">レビュー結果をCSV保存</button>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-sync">
+      <div class="section-heading">
+        <div><span class="section-number">03</span><h2>PCAP読み込みと時刻同期</h2></div>
+        <p>LiDARのPCAPを先に読み込み、GPSまたは手入力でGoProとの時刻差を決めます。</p>
+      </div>
+      <article class="card form-card compact pcap-sync-card">
+        <label>LiDARデータ (.pcap)</label><div class="path-input"><input id="pcapPath" readonly><button data-pick="pcap">選択</button></div>
+        <button class="primary" id="openPcap">PCAPを読み込む</button>
+        <p class="lidar-info" id="lidarInfo">PCAP未読込</p>
+      </article>
+      <div class="sync-layout">
+        <article class="card gps-sync-card">
+          <div class="card-title"><h3>GPS自動同期</h3><span class="badge accepted">推奨</span></div>
+          <p class="method-desc">GoProのGPMF（動画内蔵GPS）とPCAPのキャプチャ時刻を自動照合し、GoProとVeloViewの時刻差（オフセット）を求めます。<br><small>Step 1で動画を指定し、上でPCAPを読み込んでから実行してください。</small></p>
+          <button class="primary" id="autoSyncGps">GPS自動同期を実行</button>
+          <p id="gpsSyncStatus" class="gps-sync-status"></p>
+        </article>
+        <article class="card offset-card result-offset"><p>適用されるオフセット（VeloView − GoPro）</p><strong id="offsetDisplay">+0.000 秒</strong><span>求めた時刻差をすべての候補へ自動的に適用します</span></article>
+      </div>
+      <article class="card mapped-card"><div class="card-title"><h3>候補のVeloView相当時刻</h3><span>確認済み候補を優先表示</span></div><div id="mappedTimes" class="mapped-list"><p class="empty">候補がありません</p></div></article>
+    </section>
+
+    <section class="panel" id="panel-lidar">
+      <div class="section-heading">
+        <div><span class="section-number">04</span><h2>点群の選択と最終出力</h2></div>
+        <p>読み込み済みPCAPの候補時刻へ移動して、車両の点群を選択・CSV出力します。</p>
+      </div>
+      <div class="lidar-workspace">
+        <article class="card lidar-viewer-card">
+          <div class="card-title lidar-title">
+            <h3>点群ビュー（上面）</h3>
+            <div class="lidar-title-actions">
+              <span>ドラッグ: 選択 / Alt+ドラッグ: 移動 / ホイール: 拡大</span>
+              <button class="secondary compact-btn" id="lidarFullscreen" type="button">フルスクリーン</button>
+            </div>
+          </div>
+          <div class="lidar-canvas-wrap"><canvas id="lidarCanvas"></canvas><div id="lidarLoading" class="lidar-loading" hidden>点群を読込中…</div></div>
+          <div class="lidar-transport">
+            <button class="secondary" id="lidarPrevious" aria-label="前のフレーム">◀</button><button class="primary" id="lidarPlay">再生</button><button class="secondary" id="lidarNext" aria-label="次のフレーム">▶</button>
+            <input id="lidarSlider" type="range" min="0" max="0" value="0">
+            <strong id="lidarTime">00:00:00.000</strong><span id="lidarFrame">0 / 0</span>
+          </div>
+          <div class="lidar-seek-row"><label>時刻へ移動 <input id="lidarSeekTime" placeholder="秒 または HH:MM:SS"></label><button class="secondary" id="lidarSeek">移動</button><label>追い越し候補 <select id="lidarCandidate"><option value="">選択してください</option></select></label><button class="secondary" id="jumpCandidate">候補へ移動</button><label class="track-toggle"><input type="checkbox" id="lidarTrack">枠を車に追尾</label></div>
+        </article>
+        <aside class="lidar-side lidar-side-right">
+          <article class="card overtaking-record-card">
+            <div class="card-title"><h3>追い越し記録</h3><span class="badge" id="recordStatus">未開始</span></div>
+            <p class="record-hint">開始で先頭フレームへ移動し追尾オン。<kbd>←</kbd><kbd>→</kbd>でフレーム送り（自動記録）、<kbd>Enter</kbd>で出力して次の候補へ自動で進みます。</p>
+            <label class="record-candidate">追い越し候補
+              <select id="recordCandidate"><option value="">選択してください</option></select>
+            </label>
+            <div class="record-buttons">
+              <button class="primary" id="recordStart">追い越し開始</button>
+              <button class="secondary" id="recordCancel" disabled>中止</button>
+            </div>
+            <button class="accept record-finish" id="recordFinish" disabled>終了してCSV出力</button>
+            <div class="record-frames" id="recordFrames">記録フレーム: 0</div>
+          </article>
+          <article class="card lidar-export-card">
+            <div class="export-selection"><strong>選択範囲（単発出力）</strong><span id="lidarSelection">点群上をドラッグして車両を囲ってください</span></div>
+            <div class="export-frames">
+              <label>開始フレーム <input id="lidarRangeStart" type="number" min="0" value="0"></label>
+              <label>終了フレーム <input id="lidarRangeEnd" type="number" min="0" value="0"></label>
+            </div>
+            <button class="primary" id="exportLidar">選択範囲をフレーム別CSVへ出力</button>
+          </article>
+        </aside>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-edit">
+      <div class="section-heading">
+        <div><span class="section-number">05</span><h2>軌跡 edit.csv 生成</h2></div>
+        <p>追い越し記録CSVから、フレームごとの最近接点を追跡した edit.csv を生成します。</p>
+      </div>
+      <div class="grid two-column">
+        <article class="card form-card">
+          <div class="card-title"><h3>軌跡 edit.csv 生成</h3><span>VolodyneConverter相当</span></div>
+          <p class="record-hint">追い越し記録CSV（<code>overtaking_*.csv</code>）を選ぶと、各フレームの最近接点を追跡した <code>&lt;名前&gt;_edit.csv</code>（unixtime, X, Y, Z, distance(m), speed(km/h)）を <code>lidar_edit</code> に生成します。フレーム別CSVのフォルダパスを直接指定しても動きます。</p>
+          <label>追い越し記録CSV</label>
+          <div class="path-input"><input id="editSource" readonly><button data-pick="edit_source">選択</button></div>
+          <button class="primary large" id="generateEdit">edit.csv を生成</button>
+        </article>
+        <article class="card form-card">
+          <div class="card-title"><h3>LiDARフォルダを一括生成</h3><span>今回の解析</span></div>
+          <p class="record-hint">現在の出力フォルダ内 <code>lidar</code> にある <code>overtaking_*.csv</code> をすべて読み込み、各CSVごとに <code>lidar_edit</code> へ <code>_edit.csv</code> を生成します。</p>
+          <label>対象フォルダ</label>
+          <div class="path-input"><input readonly value="入力: lidar / 保存: lidar_edit"><button class="secondary" id="generateAllEdits" type="button">一括生成</button></div>
+          <p class="edit-bulk-status" id="editBulkStatus">未実行</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-final">
+      <div class="section-heading">
+        <div><span class="section-number">06</span><h2>最終Excel出力</h2></div>
+        <p>採用済み候補、Step5の分析結果、GPS速度を統合し、共有用Excel形式で出力します。</p>
+      </div>
+      <div class="grid two-column">
+        <article class="card form-card">
+          <div class="card-title"><h3>共有用フォーマット</h3><span>Sheet1</span></div>
+          <p class="record-hint">出力フォルダ内の <code>reviewed_overtaking_events.csv</code> と <code>lidar_edit</code> の分析結果を読み込み、<code>final</code> フォルダへExcelを作成します。レビュー結果は生成前に自動保存します。</p>
+          <div class="final-fields">
+            <label>整理ID<input id="finalId" placeholder="例: 1"></label>
+            <label>データ収集日<input id="finalDate" placeholder="YYYY-MM-DD"></label>
+            <label>被験者名またはID<input id="finalSubject" placeholder="例: ID1"></label>
+          </div>
+          <button class="primary large" id="generateFinal">最終Excelを生成</button>
+        </article>
+        <article class="card form-card">
+          <div class="card-title"><h3>出力状況</h3><span>final/*.xlsx</span></div>
+          <p class="final-status" id="finalStatus">未実行</p>
+          <p class="record-hint">自転車速度はGPSのctsがフェーズ3〜4の範囲に入る場合のみ平均して出力します。該当GPSがない場合は空欄になります。</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <button class="settings-fab" id="openSettings" aria-label="設定" title="設定">⚙</button>
+
+  <div class="modal-backdrop" id="keyModalBackdrop" role="dialog" aria-modal="true" aria-labelledby="keyModalTitle" hidden>
+    <div class="modal key-modal settings-modal">
+      <h3 id="keyModalTitle">設定</h3>
+      <section class="settings-section">
+        <div class="card-title"><h3>ショートカットキー</h3><span>候補確認</span></div>
+        <div class="key-grid">
+          <label>採用<input class="key-field" data-action="accept" maxlength="1" aria-label="採用のキー"></label>
+          <label>除外<input class="key-field" data-action="reject" maxlength="1" aria-label="除外のキー"></label>
+          <label>未確認へ戻す<input class="key-field" data-action="unreview" maxlength="1" aria-label="未確認へ戻すのキー"></label>
+          <label>車種：軽<input class="key-field" data-action="kei" maxlength="1" aria-label="車種 軽のキー"></label>
+          <label>車種：普通<input class="key-field" data-action="normal" maxlength="1" aria-label="車種 普通のキー"></label>
+          <label>車種：大型<input class="key-field" data-action="large" maxlength="1" aria-label="車種 大型のキー"></label>
+        </div>
+      </section>
+      <section class="settings-section">
+        <div class="card-title"><h3>レーザー選択</h3><span id="laserCountLabel" class="num">—</span></div>
+        <div class="button-row"><button class="secondary" id="laserAll">全選択</button><button class="secondary" id="laserNone">全解除</button></div>
+        <div class="laser-grid" id="laserGrid"><p class="empty">PCAP未読込</p></div>
+      </section>
+      <p id="keyModalError" class="key-error"></p>
+      <div class="modal-actions">
+        <button class="secondary" id="keyModalReset">既定に戻す</button>
+        <button class="secondary" id="keyModalCancel">キャンセル</button>
+        <button class="primary" id="keyModalSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
