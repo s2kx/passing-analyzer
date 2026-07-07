@@ -940,9 +940,11 @@ def run_check() -> None:
         with ZipFile(final_path) as book:
             sheet_xml = book.read("xl/worksheets/sheet1.xml").decode("utf-8")
         assert "整理ID" in sheet_xml, sheet_xml
+        assert "通過時間" in sheet_xml, sheet_xml
+        assert "相対速度" in sheet_xml, sheet_xml
         assert _vehicle_speed_kmh(18.36, 10.35) == 28.71
         assert 'sqref="G2:G51"' in sheet_xml, sheet_xml
-        assert 'sqref="M2:M51"' in sheet_xml, sheet_xml
+        assert 'sqref="R2:R51"' in sheet_xml, sheet_xml
     print("Web GUI check OK")
 
 

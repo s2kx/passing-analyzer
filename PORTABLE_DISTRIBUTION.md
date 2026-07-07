@@ -6,7 +6,6 @@ This project uses the Python-bundled portable distribution style.
 
 ```text
 OvertakingToolPortable/
-  run_gui.bat
   run.bat
   web_gui.py
   detect_overtaking.py
@@ -29,7 +28,7 @@ OvertakingToolPortable/
 
 ## Build Input
 
-Before running `build_portable.bat`, prepare:
+Before running `build_portable.ps1`, prepare:
 
 - `portable\python\python.exe`
 - `portable\python\pythonw.exe`
@@ -39,8 +38,8 @@ Before running `build_portable.bat`, prepare:
 
 You can create `portable\python` on the build PC with:
 
-```bat
-prepare_portable_python.bat
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prepare_portable_python.ps1
 ```
 
 By default this installs the normal PyPI PyTorch wheel, which may be CPU-only.
@@ -52,16 +51,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File prepare_portable_python.ps1 
 
 You can place FFmpeg tools under `tools\` with:
 
-```bat
-prepare_ffmpeg_tools.bat
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prepare_ffmpeg_tools.ps1
 ```
 
 The generated package excludes local analysis results such as `output/`, `out/`, and input videos.
 
 ## Build
 
-```bat
-build_portable.bat
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File build_portable.ps1
 ```
 
 The package is created at:
@@ -75,7 +74,7 @@ dist\OvertakingToolPortable
 Users should run:
 
 ```bat
-run_gui.bat
+run.bat
 ```
 
 No system Python install or `.venv` setup is required on the user PC.

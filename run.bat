@@ -3,53 +3,228 @@ chcp 65001 > nul
 setlocal EnableExtensions EnableDelayedExpansion
 
 rem ============================================================
-rem  Overtaking detector launcher (Windows / Python 3.13)
+rem  Passing Analyzer single launcher
 rem
-rem  Double-click : choose a video in the file dialog
-rem  Drag-and-drop: drop a video file onto run.bat
-rem  Command line : run.bat input.mp4 [front^|rear] [options...]
-rem  Environment  : run.bat --check
+rem  Double-click       : update check, first-run setup, launch GUI
+rem  Drag-and-drop      : run detection for the dropped video
+rem  Command line       : run.bat input.mp4 [front|rear] [options...]
+rem  Environment check  : run.bat --check
+rem  Skip update check  : run.bat --no-update
 rem ============================================================
 
 cd /d "%~dp0"
-rem --- Prefer bundled portable Python (USB deployment); fall back to .venv (dev PC). ---
+
+set "APP_NAME=Passing Analyzer"
 set "PY=portable\python\python.exe"
+set "PYW=portable\python\pythonw.exe"
+set "SKIP_UPDATE=0"
+set "CHECK_ONLY=0"
 
-if not exist "%PY%" (
-    if exist ".venv\Scripts\python.exe" (
-        set "PY=.venv\Scripts\python.exe"
-    ) else (
-        echo [ERROR] Python was not found.
-        echo Neither portable\python\python.exe nor .venv\Scripts\python.exe exists.
-        echo Run setup.bat to create .venv, or copy the bundled 'portable' folder.
-        echo.
-        pause
-        exit /b 1
-    )
+:parse_options
+if /i "%~1"=="--no-update" (
+    set "SKIP_UPDATE=1"
+    shift
+    goto parse_options
 )
 
-if /i "%~1"=="--check" goto check
-
-rem --- Resolve input video. With no argument, show a Windows file picker. ---
-set "VIDEO=%~1"
-if not defined VIDEO (
-    for /f "usebackq delims=" %%I in (`powershell.exe -NoProfile -STA -Command "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Title = 'Select GoPro video'; $d.Filter = 'Video files|*.mp4;*.mov;*.avi;*.mkv|All files|*.*'; if ($d.ShowDialog() -eq 'OK') { [Console]::Write($d.FileName) }"`) do set "VIDEO=%%I"
+if /i "%~1"=="--check" (
+    set "CHECK_ONLY=1"
+    shift
+    goto parse_options
 )
 
-if not defined VIDEO (
-    echo [CANCELLED] No video was selected.
-    timeout /t 2 > nul
-    exit /b 1
+echo.
+echo === %APP_NAME% ===
+
+if "%SKIP_UPDATE%"=="0" call :auto_update
+call :ensure_runtime || exit /b 1
+call :ensure_yolo_model || exit /b 1
+call :ensure_ffmpeg
+
+if "%CHECK_ONLY%"=="1" goto check
+if "%~1"=="" goto gui
+
+rem If the first argument is a video file, keep the old drag-and-drop/CLI flow.
+if exist "%~1" goto detect
+
+if /i "%~1"=="--gui" goto gui
+
+echo [ERROR] Unknown argument:
+echo   %~1
+echo.
+echo Usage:
+echo   run.bat
+echo   run.bat --check
+echo   run.bat --no-update
+echo   run.bat input.mp4 [front^|rear] [options...]
+echo.
+pause
+exit /b 1
+
+:auto_update
+where git > nul 2>&1
+if errorlevel 1 (
+    echo [update] Git was not found. Skipping update check.
+    exit /b 0
 )
-if not exist "%VIDEO%" (
-    echo [ERROR] Video was not found:
-    echo   %VIDEO%
-    echo.
+
+if not exist ".git\HEAD" (
+    echo [update] Git repository was not found. Skipping update check.
+    exit /b 0
+)
+
+git remote get-url origin > nul 2>&1
+if errorlevel 1 (
+    echo [update] origin remote is not configured. Skipping update check.
+    exit /b 0
+)
+
+git diff --quiet > nul 2>&1
+if errorlevel 1 (
+    echo [update] Local changes exist. Skipping automatic update.
+    exit /b 0
+)
+
+git diff --cached --quiet > nul 2>&1
+if errorlevel 1 (
+    echo [update] Staged local changes exist. Skipping automatic update.
+    exit /b 0
+)
+
+echo [update] Checking GitHub updates...
+git fetch --quiet origin
+if errorlevel 1 (
+    echo [update] Could not fetch updates. Continuing with the current version.
+    exit /b 0
+)
+
+set "BEHIND=0"
+for /f "usebackq delims=" %%I in (`git rev-list --count HEAD..@{u} 2^>nul`) do set "BEHIND=%%I"
+if "%BEHIND%"=="0" (
+    echo [update] Already up to date.
+    exit /b 0
+)
+
+echo [update] Found %BEHIND% new commit(s). Updating...
+git pull --ff-only
+if errorlevel 1 (
+    echo [update] Automatic update failed. Continuing with the current version.
+    exit /b 0
+)
+
+echo [update] Update completed.
+exit /b 0
+
+:ensure_runtime
+if exist "%PY%" (
+    exit /b 0
+)
+
+echo.
+echo [setup] Portable Python runtime was not found.
+echo [setup] This appears to be the first startup on this PC.
+echo [setup] Installing Python and required libraries into portable\python.
+echo [setup] This can take several minutes and requires internet access.
+echo.
+
+if not exist "prepare_portable_python.ps1" (
+    echo [ERROR] prepare_portable_python.ps1 was not found.
+    echo Re-clone the repository or restore the setup files.
     pause
     exit /b 1
 )
 
-rem --- Camera direction can be the second argument or an interactive choice. ---
+if defined TORCH_INDEX_URL (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" -TorchIndexUrl "%TORCH_INDEX_URL%"
+) else (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1"
+)
+
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Portable Python setup failed.
+    pause
+    exit /b 1
+)
+
+if not exist "%PY%" (
+    echo [ERROR] portable\python\python.exe was still not found after setup.
+    pause
+    exit /b 1
+)
+
+exit /b 0
+
+:ensure_yolo_model
+if exist "yolov8n.pt" (
+    exit /b 0
+)
+
+echo.
+echo [setup] YOLO model yolov8n.pt was not found.
+echo [setup] Downloading it through Ultralytics...
+"%PY%" -c "from ultralytics import YOLO; YOLO('yolov8n.pt'); print('YOLO model is ready')"
+if errorlevel 1 (
+    echo [ERROR] Failed to prepare yolov8n.pt.
+    pause
+    exit /b 1
+)
+
+if not exist "yolov8n.pt" (
+    echo [ERROR] yolov8n.pt was not created in the project folder.
+    pause
+    exit /b 1
+)
+
+exit /b 0
+
+:ensure_ffmpeg
+if exist "tools\ffmpeg.exe" (
+    exit /b 0
+)
+
+where ffmpeg > nul 2>&1
+if not errorlevel 1 (
+    echo [setup] System FFmpeg was found. Bundled FFmpeg is not required.
+    exit /b 0
+)
+
+echo.
+echo [setup] FFmpeg was not found.
+echo [setup] Installing bundled FFmpeg into tools\.
+if not exist "prepare_ffmpeg_tools.ps1" (
+    echo [WARN] prepare_ffmpeg_tools.ps1 was not found. Clip extraction may be unavailable.
+    exit /b 0
+)
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_ffmpeg_tools.ps1"
+if errorlevel 1 (
+    echo [WARN] FFmpeg setup failed. The app can run, but clip extraction may be unavailable.
+    exit /b 0
+)
+
+exit /b 0
+
+:gui
+set "PYTHONUTF8=1"
+set "YOLO_CONFIG_DIR=%CD%\.ultralytics"
+if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
+
+"%PY%" web_gui.py --check
+if errorlevel 1 (
+    echo [ERROR] GUI startup check failed.
+    pause
+    exit /b 1
+)
+
+echo [start] Launching GUI...
+start "Passing Analyzer" "%PYW%" web_gui.py
+exit /b 0
+
+:detect
+set "VIDEO=%~1"
+
+rem Camera direction can be the second argument or an interactive choice.
 set "VIEW="
 if /i "%~2"=="front" set "VIEW=front"
 if /i "%~2"=="rear"  set "VIEW=rear"
@@ -67,18 +242,17 @@ if not defined VIEW (
     )
 )
 
-rem --- Preserve optional arguments after video and optional view. ---
 shift
 if /i "%~1"=="front" shift
 if /i "%~1"=="rear" shift
 set "EXTRA="
 :collect
-if "%~1"=="" goto run
+if "%~1"=="" goto run_detection
 set "EXTRA=!EXTRA! "%~1""
 shift
 goto collect
 
-:run
+:run_detection
 set "PYTHONUTF8=1"
 set "YOLO_CONFIG_DIR=%CD%\.ultralytics"
 if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
@@ -109,7 +283,7 @@ exit /b %RESULT%
 set "PYTHONUTF8=1"
 set "YOLO_CONFIG_DIR=%CD%\.ultralytics"
 if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
-"%PY%" -c "import sys, cv2, numpy, torch, ultralytics; assert (3, 11) <= sys.version_info[:2] <= (3, 13), sys.version; print('Python:', sys.version.split()[0]); print('OpenCV:', cv2.__version__); print('Ultralytics:', ultralytics.__version__); print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+"%PY%" -c "import sys, cv2, numpy, torch, ultralytics, webview; assert (3, 11) <= sys.version_info[:2] <= (3, 13), sys.version; print('Python:', sys.version.split()[0]); print('OpenCV:', cv2.__version__); print('Ultralytics:', ultralytics.__version__); print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
 if errorlevel 1 (
     echo [FAILED] Environment check failed.
     exit /b 1

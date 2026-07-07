@@ -16,8 +16,9 @@ from edit_csv import EditPoint, analyze_edit_points, read_edit_points
 FINAL_HEADERS = [
     "整理ID", "データ収集日", "被験者名またはID", "離隔距離（ｍ）",
     "自転車速度（km/h)", "自動車速度（km/h)", "危険感",
+    "通過時間", "距離p2", "距離p3", "相対速度", "TTC",
     "動画ファイル名", "動画のタイムスタンプ", "LiDARデータファイル名",
-    "日本時間", "LiDARのタイムスタンプ", "車種", "",
+    "日本時間", "LiDARのタイムスタンプ", "車種",
 ]
 VEHICLE_LIST = ["普通", "軽", "大型", "二輪"]
 DANGER_LIST = ["非常に危険", "危険", "やや危険", "なし"]
@@ -228,7 +229,7 @@ def _final_rows(
     pcap_path: str,
     pcap_start_unix: float | None,
 ) -> tuple[list[list[Cell]], list[str]]:
-    rows: list[list[Cell]] = [[Cell(value, 1) for value in FINAL_HEADERS] + [Cell("") for _ in range(6)] + [Cell("危険感", 1)]]
+    rows: list[list[Cell]] = [[Cell(value, 1) for value in FINAL_HEADERS]]
     warnings: list[str] = []
     events = _accepted_events(out_dir)
     gps_rows = _gps_cache(out_dir)
@@ -265,23 +266,23 @@ def _final_rows(
             Cell(_round_or_blank(bike_speed), 4),
             Cell(_round_or_blank(vehicle_speed), 4),
             Cell(DANGER_BY_LEVEL.get(str(event.get("danger_level", "0")), "なし"), 0),
+            Cell(_round_or_blank(metrics.get("passing_time")), 4),
+            Cell(_round_or_blank(metrics.get("distance_p2")), 4),
+            Cell(_round_or_blank(metrics.get("distance_p3")), 4),
+            Cell(_round_or_blank(metrics.get("relative_speed")), 4),
+            Cell(_round_or_blank(metrics.get("ttc")), 4),
             Cell(Path(event.get("source_video", "")).stem, 0),
             Cell(_excel_time_from_seconds(_to_float(event.get("local_t_start_s"))), 3),
             Cell(pcap_name, 0),
             Cell(_excel_jst_time_from_unix(lidar_timestamp if pcap_start_unix is not None else None), 3),
             Cell(_round_or_blank(lidar_timestamp, 6), 5),
             Cell(event.get("class", ""), 0),
-            Cell("", 0),
         ]
-        rows.append(row + [Cell("") for _ in range(7)])
+        rows.append(row)
 
     while len(rows) < 51:
-        rows.append([Cell("") for _ in range(21)])
+        rows.append([Cell("") for _ in range(len(FINAL_HEADERS))])
 
-    for i, value in enumerate(VEHICLE_LIST, start=1):
-        rows[i][19] = Cell(value)
-    for i, value in enumerate(DANGER_LIST, start=1):
-        rows[i][20] = Cell(value)
     return rows, warnings
 
 
@@ -310,15 +311,16 @@ def _xlsx_cell(row: int, col: int, cell: Cell) -> str:
 
 
 def _sheet_xml(rows: list[list[Cell]]) -> str:
+    danger_formula = '"' + ",".join(DANGER_LIST) + '"'
+    vehicle_formula = '"' + ",".join(VEHICLE_LIST) + '"'
     cols = (
         '<cols>'
         '<col min="1" max="1" width="10" customWidth="1"/>'
         '<col min="2" max="3" width="16" customWidth="1"/>'
         '<col min="4" max="6" width="17" customWidth="1"/>'
-        '<col min="7" max="8" width="15" customWidth="1"/>'
-        '<col min="9" max="12" width="22" customWidth="1"/>'
-        '<col min="13" max="14" width="16" customWidth="1"/>'
-        '<col min="20" max="21" width="14" customWidth="1"/>'
+        '<col min="7" max="12" width="14" customWidth="1"/>'
+        '<col min="13" max="15" width="22" customWidth="1"/>'
+        '<col min="16" max="18" width="17" customWidth="1"/>'
         '</cols>'
     )
     row_xml = []
@@ -327,8 +329,8 @@ def _sheet_xml(rows: list[list[Cell]]) -> str:
         row_xml.append(f'<row r="{r_idx}">{cells}</row>')
     validations = (
         '<dataValidations count="2">'
-        '<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" sqref="G2:G51"><formula1>$U$2:$U$5</formula1></dataValidation>'
-        '<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" sqref="M2:M51"><formula1>$T$2:$T$5</formula1></dataValidation>'
+        f'<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" sqref="G2:G51"><formula1>{_xml_escape(danger_formula)}</formula1></dataValidation>'
+        f'<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" sqref="R2:R51"><formula1>{_xml_escape(vehicle_formula)}</formula1></dataValidation>'
         '</dataValidations>'
     )
     return (
@@ -429,5 +431,5 @@ def generate_final_workbook(
     final_dir.mkdir(exist_ok=True)
     out_path = final_dir / f"{out_dir.name}_final.xlsx"
     _write_workbook(out_path, rows)
-    data_rows = sum(1 for row in rows[1:51] if any(str(cell.value or "").strip() for cell in row[:14]))
+    data_rows = sum(1 for row in rows[1:51] if any(str(cell.value or "").strip() for cell in row[:len(FINAL_HEADERS)]))
     return {"path": str(out_path), "rows": data_rows, "warnings": warnings}
