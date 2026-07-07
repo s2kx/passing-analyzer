@@ -7,9 +7,9 @@ rem  Passing Analyzer single launcher
 rem
 rem  Double-click       : update check, first-run setup, launch GUI
 rem  Drag-and-drop      : run detection for the dropped video
-rem  Command line       : run.bat input.mp4 [front|rear] [options...]
-rem  Environment check  : run.bat --check
-rem  Skip update check  : run.bat --no-update
+rem  Command line       : launcher input.mp4 [front|rear] [options...]
+rem  Environment check  : launcher --check
+rem  Skip update check  : launcher --no-update
 rem ============================================================
 
 cd /d "%~dp0"
@@ -57,10 +57,10 @@ echo [ERROR] Unknown argument:
 echo   %~1
 echo.
 echo Usage:
-echo   run.bat
-echo   run.bat --check
-echo   run.bat --no-update
-echo   run.bat input.mp4 [front^|rear] [options...]
+echo   launcher
+echo   launcher --check
+echo   launcher --no-update
+echo   launcher input.mp4 [front^|rear] [options...]
 echo.
 pause
 exit /b 1
@@ -301,5 +301,5 @@ if errorlevel 1 (
     echo [FAILED] Environment check failed.
     exit /b 1
 )
-echo [OK] run.bat is ready.
+echo [OK] Launcher is ready.
 exit /b 0
