@@ -13,6 +13,20 @@ $pythonZip = Join-Path $cache "python-$PythonVersion-embed-amd64.zip"
 $getPip = Join-Path $cache "get-pip.py"
 $pythonUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
 $getPipUrl = "https://bootstrap.pypa.io/get-pip.py"
+$env:YOLO_CONFIG_DIR = Join-Path $root ".ultralytics"
+New-Item -ItemType Directory -Force -Path $env:YOLO_CONFIG_DIR | Out-Null
+
+function Invoke-Checked {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
+    }
+}
 
 if ((Test-Path $runtime) -and -not $Force) {
     throw "portable\python already exists. Re-run with -Force to recreate it."
@@ -61,18 +75,18 @@ if (-not (Test-Path $getPip)) {
 
 $python = Join-Path $runtime "python.exe"
 Write-Host "Installing pip..."
-& $python $getPip --no-warn-script-location
+Invoke-Checked $python @($getPip, "--no-warn-script-location")
 
 Write-Host "Installing project requirements..."
-& $python -m pip install --upgrade pip --no-warn-script-location
-& $python -m pip install -r (Join-Path $root "requirements.txt") --no-warn-script-location
+Invoke-Checked $python @("-m", "pip", "install", "--upgrade", "pip", "--no-warn-script-location")
+Invoke-Checked $python @("-m", "pip", "install", "-r", (Join-Path $root "requirements.txt"), "--no-warn-script-location")
 
 if ($TorchIndexUrl) {
     Write-Host "Installing PyTorch from custom index: $TorchIndexUrl"
-    & $python -m pip install --upgrade torch torchvision --index-url $TorchIndexUrl --no-warn-script-location
+    Invoke-Checked $python @("-m", "pip", "install", "--upgrade", "torch", "torchvision", "--index-url", $TorchIndexUrl, "--no-warn-script-location")
 }
 
 Write-Host "Verifying runtime imports..."
-& $python -c "import sys, cv2, numpy, torch, ultralytics, webview; print('Python:', sys.version.split()[0]); print('OpenCV:', cv2.__version__); print('Ultralytics:', ultralytics.__version__); print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available())"
+Invoke-Checked $python @("-c", "import sys, cv2, numpy, torch, ultralytics, webview; print('Python:', sys.version.split()[0]); print('OpenCV:', cv2.__version__); print('Ultralytics:', ultralytics.__version__); print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available())")
 
 Write-Host "Portable Python is ready: $runtime"

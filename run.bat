@@ -36,6 +36,10 @@ if /i "%~1"=="--check" (
 echo.
 echo === %APP_NAME% ===
 
+set "PYTHONUTF8=1"
+set "YOLO_CONFIG_DIR=%CD%\.ultralytics"
+if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
+
 if "%SKIP_UPDATE%"=="0" call :auto_update
 call :ensure_runtime || exit /b 1
 call :ensure_yolo_model || exit /b 1
@@ -117,7 +121,13 @@ exit /b 0
 
 :ensure_runtime
 if exist "%PY%" (
-    exit /b 0
+    call :verify_runtime
+    if not errorlevel 1 exit /b 0
+    echo.
+    echo [setup] Existing portable Python is incomplete or broken.
+    echo [setup] Recreating portable\python.
+    set "SETUP_FORCE=-Force"
+    goto install_runtime
 )
 
 echo.
@@ -126,7 +136,9 @@ echo [setup] This appears to be the first startup on this PC.
 echo [setup] Installing Python and required libraries into portable\python.
 echo [setup] This can take several minutes and requires internet access.
 echo.
+set "SETUP_FORCE="
 
+:install_runtime
 if not exist "prepare_portable_python.ps1" (
     echo [ERROR] prepare_portable_python.ps1 was not found.
     echo Re-clone the repository or restore the setup files.
@@ -135,9 +147,9 @@ if not exist "prepare_portable_python.ps1" (
 )
 
 if defined TORCH_INDEX_URL (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" -TorchIndexUrl "%TORCH_INDEX_URL%"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" %SETUP_FORCE% -TorchIndexUrl "%TORCH_INDEX_URL%"
 ) else (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" %SETUP_FORCE%
 )
 
 if errorlevel 1 (
@@ -153,7 +165,18 @@ if not exist "%PY%" (
     exit /b 1
 )
 
+call :verify_runtime
+if errorlevel 1 (
+    echo [ERROR] Portable Python setup completed but required libraries are still unavailable.
+    pause
+    exit /b 1
+)
+
 exit /b 0
+
+:verify_runtime
+"%PY%" -c "import sys, cv2, numpy, torch, ultralytics, webview" > nul 2>&1
+exit /b %ERRORLEVEL%
 
 :ensure_yolo_model
 if exist "yolov8n.pt" (
@@ -206,10 +229,6 @@ if errorlevel 1 (
 exit /b 0
 
 :gui
-set "PYTHONUTF8=1"
-set "YOLO_CONFIG_DIR=%CD%\.ultralytics"
-if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
-
 "%PY%" web_gui.py --check
 if errorlevel 1 (
     echo [ERROR] GUI startup check failed.
@@ -253,9 +272,6 @@ shift
 goto collect
 
 :run_detection
-set "PYTHONUTF8=1"
-set "YOLO_CONFIG_DIR=%CD%\.ultralytics"
-if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
 echo.
 echo === Overtaking detection start ===
 echo   input : %VIDEO%
@@ -280,9 +296,6 @@ pause
 exit /b %RESULT%
 
 :check
-set "PYTHONUTF8=1"
-set "YOLO_CONFIG_DIR=%CD%\.ultralytics"
-if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
 "%PY%" -c "import sys, cv2, numpy, torch, ultralytics, webview; assert (3, 11) <= sys.version_info[:2] <= (3, 13), sys.version; print('Python:', sys.version.split()[0]); print('OpenCV:', cv2.__version__); print('Ultralytics:', ultralytics.__version__); print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
 if errorlevel 1 (
     echo [FAILED] Environment check failed.
