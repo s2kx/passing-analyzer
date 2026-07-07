@@ -40,6 +40,8 @@ try {
         "edit_csv.py",
         "extract_telemetry.py",
         "final_export.py",
+        "prepare_portable_python.ps1",
+        "prepare_ffmpeg_tools.ps1",
         "requirements.txt",
         "README.md",
         "PORTABLE_DISTRIBUTION.md"
