@@ -137,6 +137,11 @@ echo [setup] Installing Python and required libraries into portable\python.
 echo [setup] This can take several minutes and requires internet access.
 echo.
 set "SETUP_FORCE="
+if exist "portable\python\" (
+    echo [setup] Incomplete portable\python folder was found.
+    echo [setup] Recreating portable\python.
+    set "SETUP_FORCE=-Force"
+)
 
 :install_runtime
 if not exist "prepare_portable_python.ps1" (
