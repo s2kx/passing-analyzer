@@ -17,31 +17,44 @@
 
 ## セットアップ
 
-このフォルダは外付け SSD 上での運用を想定。仮想環境込みで完結する。
+このプロジェクトは GitHub には軽量なソースだけを置き、初回起動時に必要な実行環境を
+PC上へ自動作成する。利用者が実行するファイルは `run.bat` のみ。
 
 ```powershell
-# 仮想環境を作成 (Python 3.13。3.14 は torch wheel 未対応の場合あり)
-py -3.13 -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+# 初回起動。portable\python、YOLOモデル、FFmpeg が無ければ自動準備する
+.\run.bat
 ```
 
-ffmpeg はクリップ切り出し(`--clip`)で使用。PATH に通っていれば自動利用、無ければその工程のみスキップ。
+初回セットアップでは次を自動で準備する。
+
+- `portable\python` ... Python 本体と `requirements.txt` のライブラリ
+- `yolov8n.pt` ... YOLO の既定モデル
+- `tools\ffmpeg.exe` / `tools\ffprobe.exe` ... クリップ切り出し用。既に PATH 上に ffmpeg がある場合は省略可
+
+セットアップにはインターネット接続が必要。途中で失敗した場合、次回 `run.bat` 実行時に
+壊れた `portable\python` を検出して再作成する。
+
+GitHub から取得した作業フォルダでは、起動時に更新確認も行う。ローカル変更が無い場合だけ
+`git pull --ff-only` で自動更新し、作業中の変更がある場合は自動更新をスキップする。
 
 ## 使い方
 
 ```powershell
-# 基本 (後ろ向き撮影, CSV のみ)
-.venv\Scripts\python.exe detect_overtaking.py 入力動画.mp4 --view rear
+# GUIを起動
+.\run.bat
 
-# 前向き撮影 + クリップ切り出し + 可視化動画つき
-.venv\Scripts\python.exe detect_overtaking.py 入力動画.mp4 --view front --clip --overlay
+# 起動環境だけ確認
+.\run.bat --check
 
-# 精度優先 (モデルを大きく)
-.venv\Scripts\python.exe detect_overtaking.py 入力動画.mp4 --view rear --model yolov8m.pt --conf 0.35
+# 更新確認を省略してGUIを起動
+.\run.bat --no-update
+
+# コマンドラインで動画検出
+.\run.bat 入力動画.mp4 rear
+
+# オプションを追加して検出
+.\run.bat 入力動画.mp4 front --overlay --conf 0.35
 ```
-
-`run.bat` は唯一の起動ファイル。初回起動時に `portable\python`、YOLOモデル、FFmpeg が不足していれば自動準備し、GitHub 版では起動時に更新確認も行う。
 
 - ダブルクリックして GUI を起動する
 - 動画ファイルを`run.bat`へドラッグ＆ドロップする
@@ -140,12 +153,12 @@ GUIを開かず起動環境だけ確認する場合:
 
 1. **GPU版 torch**(最重要)。CPU版だと桁違いに遅い。導入確認:
    ```powershell
-   .venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
+   .\run.bat --check
    ```
-   `False` の場合は CUDA 版を入れ直す:
+   `CUDA: False` の場合は CUDA 版 PyTorch を入れ直す。初回セットアップ前なら次の環境変数を指定してから `run.bat` を実行する:
    ```powershell
-   .venv\Scripts\python.exe -m pip uninstall -y torch torchvision
-   .venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+   $env:TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+   .\run.bat
    ```
 2. **`--imgsz 416`(または 320)** で推論解像度を下げる(精度とのトレードオフ)。
 3. **`--batch`** を VRAM が許す範囲で大きく(既定32)。OOM 時は下げる。
@@ -225,7 +238,8 @@ GoProの向き・画角で変わるため既定では無効になっている。
 ## テスト
 
 ```powershell
-.venv\Scripts\python.exe test_logic.py
+.\portable\python\python.exe test_logic.py
+.\portable\python\python.exe web_gui.py --check
 ```
 
 判定ロジック(`classify_overtaking`)を YOLO/動画なしの合成軌跡で検証する。
