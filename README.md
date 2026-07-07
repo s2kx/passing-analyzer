@@ -28,6 +28,7 @@ PC上へ自動作成する。利用者が実行するファイルは `起動.bat
 初回セットアップでは次を自動で準備する。
 
 - `portable\python` ... Python 本体と `requirements.txt` のライブラリ
+- PyTorch ... CUDA対応GPUを検出した場合はGPU版、検出できない場合はCPU版を自動インストール
 - `yolov8n.pt` ... YOLO の既定モデル
 - `tools\ffmpeg.exe` / `tools\ffprobe.exe` ... クリップ切り出し用。既に PATH 上に ffmpeg がある場合は省略可
 
@@ -151,11 +152,11 @@ GUIを開かず起動環境だけ確認する場合:
 
 優先度の高い高速化:
 
-1. **GPU版 torch**(最重要)。CPU版だと桁違いに遅い。導入確認:
+1. **GPU版 torch**(最重要)。CPU版だと桁違いに遅い。初回セットアップでは CUDA対応GPUを検出した場合にGPU版、検出できない場合にCPU版を自動インストールする。導入確認:
    ```powershell
    .\起動.bat --check
    ```
-   `CUDA: False` の場合は CUDA 版 PyTorch を入れ直す。初回セットアップ前なら次の環境変数を指定してから `起動.bat` を実行する:
+   CUDA対応GPUがあるのに `CUDA: False` になる場合は、NVIDIAドライバを確認する。PyTorch の取得先を手動指定したい場合だけ、初回セットアップ前に次の環境変数を指定してから `起動.bat` を実行する:
    ```powershell
    $env:TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
    .\起動.bat

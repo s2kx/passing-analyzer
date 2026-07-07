@@ -1,6 +1,8 @@
 param(
     [string]$PythonVersion = "3.13.14",
     [string]$TorchIndexUrl = "",
+    [string]$CudaTorchIndexUrl = "https://download.pytorch.org/whl/cu128",
+    [string]$CpuTorchIndexUrl = "https://download.pytorch.org/whl/cpu",
     [switch]$Force
 )
 
@@ -26,6 +28,56 @@ function Invoke-Checked {
     if ($LASTEXITCODE -ne 0) {
         throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
     }
+}
+
+function Get-DetectedGpuNames {
+    $names = @()
+
+    try {
+        $nvidiaSmi = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+        if (-not $nvidiaSmi) {
+            $nvidiaSmi = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+        }
+
+        if ($nvidiaSmi) {
+            $output = & $nvidiaSmi.Source --query-gpu=name --format=csv,noheader 2>$null
+            if ($LASTEXITCODE -eq 0 -and $output) {
+                $names += $output
+            }
+        }
+    } catch {
+        # Fall back to Windows display adapter detection below.
+    }
+
+    if (-not $names) {
+        try {
+            $names += Get-CimInstance Win32_VideoController |
+                Select-Object -ExpandProperty Name |
+                Where-Object { $_ }
+        } catch {
+            try {
+                $names += Get-WmiObject Win32_VideoController |
+                    Select-Object -ExpandProperty Name |
+                    Where-Object { $_ }
+            } catch {
+                # Leave the list empty if Windows GPU detection is unavailable.
+            }
+        }
+    }
+
+    return @($names | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+}
+
+function Test-CudaGpu {
+    param([string[]]$GpuNames)
+
+    foreach ($name in $GpuNames) {
+        if ($name -match "(?i)nvidia|geforce|rtx|gtx|quadro|tesla|titan") {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 if ((Test-Path $runtime) -and -not $Force) {
@@ -77,14 +129,32 @@ $python = Join-Path $runtime "python.exe"
 Write-Host "Installing pip..."
 Invoke-Checked $python @($getPip, "--no-warn-script-location")
 
-Write-Host "Installing project requirements..."
 Invoke-Checked $python @("-m", "pip", "install", "--upgrade", "pip", "--no-warn-script-location")
-Invoke-Checked $python @("-m", "pip", "install", "-r", (Join-Path $root "requirements.txt"), "--no-warn-script-location")
 
-if ($TorchIndexUrl) {
-    Write-Host "Installing PyTorch from custom index: $TorchIndexUrl"
-    Invoke-Checked $python @("-m", "pip", "install", "--upgrade", "torch", "torchvision", "--index-url", $TorchIndexUrl, "--no-warn-script-location")
+$detectedGpuNames = Get-DetectedGpuNames
+if ($detectedGpuNames.Count -gt 0) {
+    Write-Host "Detected GPU/display adapter(s): $($detectedGpuNames -join ', ')"
+} else {
+    Write-Host "No GPU/display adapter information was detected."
 }
+
+$selectedTorchIndexUrl = $TorchIndexUrl
+$torchInstallMode = "custom"
+if (-not $selectedTorchIndexUrl) {
+    if (Test-CudaGpu $detectedGpuNames) {
+        $selectedTorchIndexUrl = $CudaTorchIndexUrl
+        $torchInstallMode = "GPU/CUDA"
+    } else {
+        $selectedTorchIndexUrl = $CpuTorchIndexUrl
+        $torchInstallMode = "CPU"
+    }
+}
+
+Write-Host "Installing PyTorch ($torchInstallMode) from: $selectedTorchIndexUrl"
+Invoke-Checked $python @("-m", "pip", "install", "--upgrade", "torch", "torchvision", "--index-url", $selectedTorchIndexUrl, "--extra-index-url", "https://pypi.org/simple", "--no-warn-script-location")
+
+Write-Host "Installing project requirements..."
+Invoke-Checked $python @("-m", "pip", "install", "-r", (Join-Path $root "requirements.txt"), "--no-warn-script-location")
 
 Write-Host "Verifying runtime imports..."
 Invoke-Checked $python @("-c", "import sys, cv2, numpy, torch, ultralytics, webview; print('Python:', sys.version.split()[0]); print('OpenCV:', cv2.__version__); print('Ultralytics:', ultralytics.__version__); print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available())")
