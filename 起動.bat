@@ -218,8 +218,8 @@ if not errorlevel 1 (
 )
 
 echo.
-echo [setup] FFmpeg was not found.
-echo [setup] Installing bundled FFmpeg into tools\.
+echo [setup] System FFmpeg is not installed.
+echo [setup] Installing bundled FFmpeg into tools\ for clip extraction.
 if not exist "prepare_ffmpeg_tools.ps1" (
     echo [WARN] prepare_ffmpeg_tools.ps1 was not found. Clip extraction may be unavailable.
     exit /b 0
