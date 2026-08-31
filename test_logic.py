@@ -20,7 +20,7 @@ from detect_overtaking import (
     Track, TrackSample, classify_overtaking, classify_vehicle_type,
     yellow_plate_score,
 )
-from edit_csv import EditPoint, analyze_edit_points, classify_phases
+from edit_csv import PHASE2_MAX_ABS_Y, EditPoint, analyze_edit_points, classify_phases
 
 
 def default_args(view="rear"):
@@ -453,6 +453,40 @@ def test_phase2_speed_spike_is_reported():
     assert metrics["phase2"].row_number == 4, metrics   # 一桁速度(8)の点
     assert any("スパイク" in w for w in metrics["warnings"]), metrics
     print("  OK: フェーズ2候補の速度スパイクを除外し警告")
+
+
+def test_phase2_ignores_far_candidates():
+    """遠方の点はフェーズ2候補にしない（距離p2・TTCの系統過大の対策）。
+
+    速度が一桁の点が無い場合の従来規則「速度絶対値が最小の点」は、追跡が長いほど
+    遠い点を拾ってしまう。|Y| <= PHASE2_MAX_ABS_Y の点だけを候補にする。
+    """
+    rows = [
+        (0, 2.0, 20, None),
+        (1, 2.0, 18, 11),      # 速度最小だが遠すぎる → 候補外
+        (2, 2.0, 12, 30),
+        (3, 2.0, 5.0, 28),     # |Y| <= 5.5 の候補
+        (4, 2.5, 2.5, 26),     # フェーズ3
+        (5, 2.0, 3.2, 25),     # フェーズ4
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["phase2"].row_number == 5, metrics     # Y=5.0 の点
+    assert metrics["distance_p2"] == 5.0, metrics
+    assert metrics["warnings"] == [], metrics
+    print(f"  OK: |Y| <= {PHASE2_MAX_ABS_Y:g} m の点だけをフェーズ2候補にする")
+
+
+def test_phase2_far_only_falls_back_with_warning():
+    """|Y| <= 上限 の候補が1点も無ければ制限を外し、警告を残す。"""
+    rows = [
+        (0, 2.0, 20, None), (1, 2.0, 18, 11), (2, 2.0, 12, 30),
+        (3, 2.5, 2.5, 26),     # フェーズ3（直前に近い候補が無い）
+        (4, 2.0, 3.2, 25),     # フェーズ4
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["distance_p2"] == 18.0, metrics        # 速度最小の点に戻る
+    assert any("|Y|" in w for w in metrics["warnings"]), metrics
+    print("  OK: 近い候補が無いときは制限を外して警告")
 
 
 if __name__ == "__main__":

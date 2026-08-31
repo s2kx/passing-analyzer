@@ -28,6 +28,12 @@ PHASE_Y_THRESHOLD = 3.0
 # speed 列にスパイクが出るため、これを超える点は候補から外す。
 PHASE2_MAX_SPEED_KMH = 100.0
 
+# フェーズ2候補として認める |Y| の上限[m]。フェーズ2は「近接区間に入る直前の
+# 基準点」なので、遠方の点まで候補にすると追跡が長いフレームほど遠い点が選ばれ、
+# 距離p2 と TTC が系統的に過大になる。ID1の正解12件との照合では、この上限を
+# 5.2〜5.5m にしたとき距離p2の平均絶対差が最小（1.42m）になる。
+PHASE2_MAX_ABS_Y = 5.5
+
 # XYZ 座標の列位置（0 始まり）。旧プログラムの注記「XYZ座標は9,10,11列目」に対応。
 COL_X, COL_Y, COL_Z = 8, 9, 10
 
@@ -332,6 +338,9 @@ def classify_phases(
     * フェーズ4が無い（フェーズ3以降で |Y| >= 3 に戻らない）
       → 最終有効点をフェーズ4として代用
     * フェーズ3が無い（|Y| < 3 が一度も無い）→ 計算不能なので strict によらず例外
+
+    フェーズ2の候補は ``|Y| <= PHASE2_MAX_ABS_Y`` の点に限る（該当が無ければ制限
+    なしに戻して警告）。この制限は strict の値によらず常に効く。
     """
     notes = warnings if warnings is not None else []
     if not points:
@@ -363,13 +372,26 @@ def classify_phases(
                 f"フェーズ2候補から速度スパイク({PHASE2_MAX_SPEED_KMH:g} km/h超) "
                 f"{len(raw_candidates) - len(sane_candidates)} 点を除外しました"
             )
-        p2 = _pick_phase2(sane_candidates)
+        # 近接区間に入る直前の点だけを候補にする。上限を外すと追跡が長いほど遠い点が
+        # 選ばれ、距離p2 と TTC が系統的に過大になる。候補が空になる場合は制限しない。
+        near_candidates = [
+            point for point in sane_candidates if abs(point.y) <= PHASE2_MAX_ABS_Y
+        ]
+        if not near_candidates:
+            notes.append(
+                f"フェーズ2候補が |Y| <= {PHASE2_MAX_ABS_Y:g} m に1点もないため、"
+                "距離の制限なしで選びました（距離p2・TTCが過大になる可能性）"
+            )
+        p2 = _pick_phase2(near_candidates or sane_candidates)
     elif raw_candidates:
         notes.append(
             f"フェーズ2候補の速度がすべて {PHASE2_MAX_SPEED_KMH:g} km/h を超えています"
             "（最近接点が車体上を移り変わっている可能性）"
         )
-        p2 = _pick_phase2(raw_candidates)
+        near_candidates = [
+            point for point in raw_candidates if abs(point.y) <= PHASE2_MAX_ABS_Y
+        ]
+        p2 = _pick_phase2(near_candidates or raw_candidates)
     elif strict:
         raise ValueError("フェーズ2候補が見つかりません（|Y| < 3 になる前にspeed値がありません）")
     else:
