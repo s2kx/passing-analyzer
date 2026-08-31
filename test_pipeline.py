@@ -202,11 +202,16 @@ def scripted_tracker(vehicles: dict[str, list[dict]], calls: list | None = None,
 
 
 def car(track_key: str, pass_time: float, lc_estimate: float = 1.2,
-        score: float = 0.9, confidence: float = 0.9) -> dict:
-    """``scripted_tracker`` へ渡す 1 台分の車の定義。"""
+        score: float = 0.9, confidence: float = 0.9,
+        length: float = 4.4, width: float = 1.8, height: float = 1.5) -> dict:
+    """``scripted_tracker`` へ渡す 1 台分の車の定義。
+
+    寸法の既定は普通車（4.4m × 1.8m × 1.5m）。段階6aの車種判定で使う。
+    """
     return {"track_key": track_key, "pass_time": pass_time, "score": score,
             "lc_estimate": lc_estimate, "median_x": lc_estimate,
-            "confidence": confidence}
+            "confidence": confidence, "length": length, "width": width,
+            "height": height, "near_length": length, "points": 5000}
 
 
 def read_reviewed(out_dir: Path) -> list[dict]:
@@ -934,6 +939,53 @@ def test_low_confidence_track_is_flagged_for_review():
         reviewed = read_reviewed(out_dir)
         assert [row["review_status"] for row in reviewed] == ["未確認"], reviewed
         print("  OK: 確信度 < 0.5 は未確認としてレポートの人手項目へ")
+
+
+def test_vehicle_class_comes_from_the_lidar_size():
+    """車種は点群で測った寸法（側面積・軽規格）で決める。"""
+    classify = run_pipeline.lidar_vehicle_class
+    # 大型: 側面積（車体長 × 車高）が 9m^2 以上
+    assert classify({"length": 6.5, "width": 2.5, "height": 2.6}) == "大型"
+    # 軽: 軽自動車の規格（3.40m × 1.48m）に点群のふくらみを足した範囲に収まる
+    assert classify({"length": 3.3, "width": 1.65, "height": 1.6}) == "軽"
+    # 普通: どちらでもない
+    assert classify({"length": 4.4, "width": 1.8, "height": 1.5}) == "普通"
+    # 規格より小さすぎる測定値は「車の全体を測れていない」ので軽とは呼ばない
+    assert classify({"length": 1.7, "width": 0.7, "height": 1.6}) == "普通"
+    # 寸法が無い（旧プラグイン・追跡失敗）なら判定しない
+    assert classify({"length": None, "width": None, "height": None}) == ""
+    assert classify({}) == ""
+    print("  OK: 点群寸法から 大型 / 軽 / 普通 を判定")
+
+
+def test_vehicle_class_is_rewritten_from_the_assigned_track():
+    """動画側の車種を、割り当てた車の点群寸法による判定へ差し替える。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        # 候補CSVの車種は「普通」（event_row の既定）
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        cars = [car("f10x+1.8", 1.0, lc_estimate=1.1,
+                    length=3.3, width=1.65, height=1.6)]
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(config, tracker=scripted_tracker(cars))
+        assert report.to_dict()["info"].get("点群の寸法で直した車種") == 1, report.to_dict()["info"]
+        assert [row["class"] for row in read_reviewed(out_dir)] == ["軽"]
+        print("  OK: 動画の車種を点群寸法の判定へ差し替え（普通→軽）")
+
+
+def test_vehicle_class_keeps_a_reviewed_value():
+    """人がレビューで直した車種（class_reviewed）は点群判定で上書きしない。"""
+    events = [{"event_id": "001", "class": "大型", "class_reviewed": "True"},
+              {"event_id": "002", "class": "大型", "class_reviewed": "False"},
+              {"event_id": "003", "class": "", "lidar_extra": True}]
+    small = {"ok": True, "length": 3.3, "width": 1.65, "height": 1.6}
+    tracking = {"001": small, "002": small, "003": small}
+    changes = run_pipeline.refine_vehicle_classes(events, tracking)
+    assert [event["class"] for event in events] == ["大型", "軽", ""], events
+    assert changes == [("002", "大型", "軽")], changes
+    print("  OK: 人が直した車種とLiDAR発の行はそのまま残す")
 
 
 def test_danger_level_is_blank_unless_reviewed():

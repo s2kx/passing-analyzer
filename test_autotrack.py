@@ -552,7 +552,10 @@ def test_candidates_list_every_passing_vehicle():
     times = sorted(candidate["pass_time"] for candidate in result["candidates"])
     assert abs(times[0] - 1.9) < 0.3 and abs(times[1] - 4.9) < 0.3, times
     for candidate in result["candidates"]:
-        assert set(candidate) == {"track_key", "pass_time", "score", "median_x", "lc_estimate"}
+        assert set(candidate) == {
+            "track_key", "pass_time", "score", "median_x", "lc_estimate",
+            "length", "width", "height", "near_length", "points",
+        }
         assert 0.5 < candidate["lc_estimate"] < 2.0, candidate
     print(f"  OK: 車列の2台を候補として列挙 (通過 {times[0]:.1f}s / {times[1]:.1f}s)")
 
@@ -633,7 +636,8 @@ def _zone_track(centers: list[tuple[float, float]]) -> Track:
     clusters = [
         Cluster(frame=index, timestamp=index * FRAME_INTERVAL,
                 center_x=x, center_y=y, min_x=x - 0.9, max_x=x + 0.9,
-                min_y=y - 2.0, max_y=y + 2.0, count=200, top_z=GROUND_Z + 1.5)
+                min_y=y - 2.0, max_y=y + 2.0, count=200,
+                top_z=GROUND_Z + 1.5, ground_z=GROUND_Z)
         for index, (x, y) in enumerate(centers)
     ]
     return Track(track_id=1, clusters=clusters)

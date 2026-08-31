@@ -252,6 +252,19 @@ class Cluster:
     max_y: float
     count: int
     top_z: float = 0.0
+    # このかたまりの足元の地面高（``detect_clusters`` が平面から埋める）。
+    # 車高を「地面からの高さ」で測るために持つ。平面が無いフレームでは 0。
+    ground_z: float = 0.0
+
+    @property
+    def top_height(self) -> float:
+        """地面からの車体上端高（車高の目安、m）。
+
+        ``filter_points`` が地面 + ``HEIGHT_LIMIT`` より上を捨てているため、この値は
+        ``HEIGHT_LIMIT`` で頭打ちになる。乗用車と大型車を分けるには十分だが、
+        大型車どうしの高さの差は測れない。
+        """
+        return self.top_z - self.ground_z
 
     @property
     def length(self) -> float:
@@ -377,15 +390,22 @@ def cluster_points(points, frame: int = 0, timestamp: float = 0.0,
 
 def detect_clusters(points, frame: int = 0, timestamp: float = 0.0, **options) -> list[Cluster]:
     """1 フレーム分の生点群から、地面除去とクラスタリングまでをまとめて行う。"""
+    plane = options.pop("plane", None)
     filtered = filter_points(
         points,
-        plane=options.pop("plane", None),
+        plane=plane,
         ground_margin=options.pop("ground_margin", GROUND_MARGIN),
         height_limit=options.pop("height_limit", HEIGHT_LIMIT),
         max_abs_x=options.pop("max_abs_x", ROI_MAX_ABS_X),
         max_abs_y=options.pop("max_abs_y", ROI_MAX_ABS_Y),
     )
-    return cluster_points(filtered, frame=frame, timestamp=timestamp, **options)
+    clusters = cluster_points(filtered, frame=frame, timestamp=timestamp, **options)
+    if plane is not None:
+        # 車高は「地面からの高さ」で測る。地面は路面のカントや自転車の傾きで
+        # 場所ごとに違うので、かたまりの重心位置の平面高を足元とみなす。
+        for cluster in clusters:
+            cluster.ground_z = float(ground_height(plane, cluster.center_x, cluster.center_y))
+    return clusters
 
 
 # --- 3. トラッキング ----------------------------------------------------------
@@ -556,6 +576,11 @@ class TrackSummary:
     pass_frame: int | None = None
     # 通過区間にいる間の最小 |X|（離隔距離 LC の目安、m）。隣車線の車を弾くのに使う。
     lateral_min: float = float("inf")
+    # 車高の目安（地面からの上端高の 80 パーセンタイル、m）。車種の推定に使う。
+    height: float = 0.0
+    # 真横（|Y| <= PASS_ZONE）を通っている間の車体長の最大値（m）。遠方では車体の
+    # 一部しか見えないため、車種の推定には真横の値のほうが素直に効く。
+    near_length: float = 0.0
 
     @property
     def track_key(self) -> str:
@@ -633,14 +658,17 @@ def summarize_track(track: Track) -> TrackSummary:
     # 1本のトラックが区間へ2回以上入ることがある（乗り移り）ので、どの滞在を
     # 通過とみなすかは _passing_visit が決める。
     visit = _passing_visit(inside, gap)
+    heights = np.array([c.top_height for c in track.clusters], dtype=float)
     pass_time = pass_frame = None
     lateral_min = float("inf")
+    near_length = 0.0
     passed = False
     if visit is not None:
         start, stop = visit
         passed = bool(np.any(gap[start + 1:] >= PASS_ZONE))
         pass_time = float(times[start])
         pass_frame = int(track.clusters[start].frame)
+        near_length = float(np.max(lengths[start:stop]))
         # 通過区間にいる間の最小 |X|。矩形が原点を跨ぐフレームは 0 とみなす。
         lateral_min = min(
             0.0 if c.min_x <= 0 <= c.max_x else min(abs(c.min_x), abs(c.max_x))
@@ -657,6 +685,8 @@ def summarize_track(track: Track) -> TrackSummary:
         entered_zone=entered, passed_zone=passed,
         points=int(sum(c.count for c in track.clusters)),
         pass_time=pass_time, pass_frame=pass_frame, lateral_min=lateral_min,
+        height=float(np.percentile(heights, 80)) if heights.size else 0.0,
+        near_length=near_length,
     )
 
 
@@ -751,7 +781,11 @@ def score_track(summary: TrackSummary, forward: int, ego_speed_y: float,
 
 
 def candidate_summary(summary: TrackSummary, score: float) -> dict:
-    """呼び出し側の割り当て・診断用に、トラック 1 本の要約を辞書で返す。"""
+    """呼び出し側の割り当て・診断用に、トラック 1 本の要約を辞書で返す。
+
+    ``length`` / ``width`` / ``height`` / ``near_length`` は点群から測った車体寸法で、
+    呼び出し側が車種を推定するのに使う（キーを足すだけなので既存の利用側は無改造）。
+    """
     return {
         "track_key": summary.track_key,
         "pass_time": summary.pass_time,
@@ -759,6 +793,11 @@ def candidate_summary(summary: TrackSummary, score: float) -> dict:
         "median_x": round(float(summary.median_x), 3),
         "lc_estimate": (None if summary.lateral_min == float("inf")
                         else round(float(summary.lateral_min), 3)),
+        "length": round(float(summary.length), 3),
+        "width": round(float(summary.width), 3),
+        "height": round(float(summary.height), 3),
+        "near_length": round(float(summary.near_length), 3),
+        "points": int(summary.points),
     }
 
 
@@ -974,7 +1013,8 @@ def track_overtaking(pcap, first_frame: int, last_frame: int, side: str = "right
         {"ok": bool, "frames": [{"index": int, "bounds": {...}}],
          "confidence": float, "warnings": [str],
          "pass_time": float | None, "track_key": str | None,
-         "candidates": [{"track_key", "pass_time", "score", "median_x", "lc_estimate"}]}
+         "candidates": [{"track_key", "pass_time", "score", "median_x", "lc_estimate",
+                         "length", "width", "height", "near_length", "points"}]}
 
     ``expected_pass_time``（pcap 相対秒）を渡すと、必須条件を満たすトラックのうち
     通過時刻（``|Y| < 3m`` を横断する時刻）がその時刻に最も近いものを選ぶ。省略時は

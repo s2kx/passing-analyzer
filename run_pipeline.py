@@ -135,6 +135,20 @@ ORPHAN_MIN_SCORE = 0.85
 # 衝突しないよう L001 から振る。行は必ず「未確認」で、最終Excel（採用のみ）には出ない。
 LIDAR_EXTRA_PREFIX = "L"
 LIDAR_EXTRA_STATUS = "未確認"
+# 追跡側（lidar_autotrack.candidate_summary）が返す車体寸法のキー。
+# 割り当てた車の寸法を段階6の車種判定へ運ぶために使う。
+LIDAR_SIZE_KEYS = ("length", "width", "height", "near_length", "points")
+# 車種の判定（段階6a）。動画側の判定は YOLO のクラス投票（大型）と黄色ナンバーの
+# 検出（軽）で決めているが、実データでは
+#   * ミニバン・ワゴンを YOLO が truck と呼ぶ（普通→大型の誤り）
+#   * トラック後部の黄色い標示・反射板を黄色ナンバーと見る（大型→軽の誤り）
+# で外れる。点群で測った寸法のほうが素直なので、車を割り当てられた行はこちらで
+# 決め直す。しきい値は下の calibrate 節（docs/計算方法.md 8）の実測から決めた。
+VEHICLE_LARGE_SIDE_AREA = 9.0     # 側面積(車体長×車高, m^2) これ以上は大型
+VEHICLE_KEI_MAX_LENGTH = 3.50     # 軽自動車の全長上限 3.40m + 点群のふくらみ
+VEHICLE_KEI_MAX_WIDTH = 1.80      # 軽自動車の全幅上限 1.48m + 点群のふくらみ
+VEHICLE_MIN_LENGTH = 2.50         # これ未満は車の全体を測れていないとみなす(m)
+VEHICLE_MIN_WIDTH = 1.20          # 同上(m)
 # 出力直前の重複チェック。同じフレームで矩形の中心がこの距離以内なら同じ車とみなす（m）。
 SAME_VEHICLE_DISTANCE = 2.0
 SAME_VEHICLE_MIN_FRAMES = 3
@@ -1038,6 +1052,7 @@ def assign_events(expected: dict[str, float], candidate_sets: dict[str, list[dic
             "score": candidate.get("score"),
             "vehicle": vehicle,
             "delta": round(delta, 3),
+            **{key: candidate.get(key) for key in LIDAR_SIZE_KEYS},
         }
     return assignment
 
@@ -1558,6 +1573,7 @@ def _export_tracks(config: PipelineConfig, pcap: VelodynePcap, events: list[dict
             "track_key": track_key,
             "lc_estimate": (chosen or target).get("lc_estimate"),
             "path": str(path),
+            **{key: (chosen or target).get(key) for key in LIDAR_SIZE_KEYS},
         })
         want = expected.get(event_id)
         pass_time = result.get("pass_time")
@@ -1652,6 +1668,60 @@ def run_edit_csv(config: PipelineConfig, report: PipelineReport) -> dict[str, di
     return generated
 
 
+# ── 段階6a: 点群の寸法で車種を決め直す ──────────────────────────────────────
+
+def lidar_vehicle_class(track: dict,
+                        large_side_area: float = VEHICLE_LARGE_SIDE_AREA,
+                        kei_length: float = VEHICLE_KEI_MAX_LENGTH,
+                        kei_width: float = VEHICLE_KEI_MAX_WIDTH,
+                        min_length: float = VEHICLE_MIN_LENGTH,
+                        min_width: float = VEHICLE_MIN_WIDTH) -> str:
+    """割り当てた車の点群寸法から車種を返す。寸法が無ければ空文字。
+
+    ``track`` は ``_export_tracks`` が返す要約（``LIDAR_SIZE_KEYS`` を含む）で、
+    ``length`` は追跡中のクラスタの Y 方向の広がりの 80 パーセンタイル（車体長）、
+    ``width`` は X 方向の同値（車幅）、``height`` は地面からの上端高の同値（車高）。
+
+    * **大型**: 側面積（車体長 × 車高）で見る。大型車は長さと高さの両方が大きい
+      ので、片方だけのしきい値より素直に分かれる。
+    * **軽**: 車体長・車幅が軽自動車の規格（3.40m × 1.48m）に収まる。
+      規格より小さすぎる測定値は「車の全体を測れていない」ので軽とは呼ばない。
+    * それ以外は **普通**。
+    """
+    values = [track.get(key) for key in ("length", "width", "height")]
+    if not all(isinstance(value, (int, float)) for value in values):
+        return ""
+    length, width, height = (float(value) for value in values)
+    if length * height >= large_side_area:
+        return "大型"
+    if min_length <= length <= kei_length and min_width <= width <= kei_width:
+        return "軽"
+    return "普通"
+
+
+def refine_vehicle_classes(events: list[dict], tracking: dict[str, dict]) -> list[tuple[str, str, str]]:
+    """動画由来の車種を、点群で測った寸法による判定へ差し替える。
+
+    人がレビューで直した車種（``class_reviewed``）と、車種を空欄で起票する
+    LiDAR 発の行はそのままにする。戻り値は ``(候補ID, 変更前, 変更後)`` の一覧。
+    """
+    changes: list[tuple[str, str, str]] = []
+    for event in events:
+        if event.get("lidar_extra"):
+            continue
+        if str(event.get("class_reviewed", "")).strip().lower() in {"true", "1"}:
+            continue
+        track = tracking.get(str(event.get("event_id", ""))) or {}
+        if not track.get("ok"):
+            continue
+        kind = lidar_vehicle_class(track)
+        before = str(event.get("class", ""))
+        if kind and kind != before:
+            event["class"] = kind
+            changes.append((str(event.get("event_id", "")), before, kind))
+    return changes
+
+
 # ── 段階6: 自動レビュー ───────────────────────────────────────────────────────
 
 def _analysis_metric(analysis: dict | None, key: str) -> float | None:
@@ -1737,6 +1807,9 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
 def run_review(config: PipelineConfig, events: list[dict], tracking: dict[str, dict],
                analyses: dict[str, dict], offset: float,
                report: PipelineReport) -> list[dict]:
+    changes = refine_vehicle_classes(events, tracking)
+    if changes:
+        report.info["点群の寸法で直した車種"] = len(changes)
     reviewed = auto_review_events(events, config, tracking, analyses)
     counts = {status: [e for e in reviewed if e.get("review_status") == status]
               for status in ("採用", "未確認", "除外")}
