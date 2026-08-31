@@ -612,6 +612,21 @@ def test_tracker_handles_empty_frames():
     print("  OK: 空フレームを含んでも追跡を継続")
 
 
+def test_cluster_split_separates_a_vehicle_that_touches_the_rider():
+    """車としてありえない幅に繋がったかたまりは、細い連結でほどき直す。"""
+    rng = _rng()
+    rider = box_points(rng, -1.0, 0.0, 2.0, 1.6, 1.0, count=900)
+    vehicle = box_points(rng, 2.0, 0.0, 4.4, 1.8, 1.5, count=900)
+    clusters = cluster_points(np.vstack([rider, vehicle]), frame=0)
+    assert len(clusters) == 2, [(c.min_x, c.max_x) for c in clusters]
+    left, right = sorted(clusters, key=lambda c: c.center_x)
+    assert left.max_x < 0.0 < right.min_x, (left.max_x, right.min_x)
+    # 1 台の車としてありえる大きさなら分けない（従来どおり）
+    single = cluster_points(box_points(rng, 2.0, 0.0, 4.4, 1.8, 1.5, count=900), frame=0)
+    assert len(single) == 1, single
+    print("  OK: 幅4mを超えて繋がったかたまりを車と搭乗者へ分離")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"[test] {len(tests)} 件実行")

@@ -66,6 +66,16 @@ GROUND_Z_RANGE = (-4.0, 0.0)
 CELL_SIZE = 0.4
 LINK_CELLS = 2
 MIN_CLUSTER_POINTS = 6
+# 連結しすぎたかたまりを細い連結でほどく条件（XY の外接矩形、m）。
+# 追い越し車が真横に並ぶと、車体と自転車・搭乗者の隙間が 0.8m まで詰まり、
+# 連結幅（0.4m × LINK_CELLS）を跨いで 1 つのかたまりになる。かたまりは大きい方
+# （＝自車側）のトラックに取られるので車のトラックがそこで切れ、通過区間を抜ける
+# 前に追跡が終わってフェーズ4が代用点になる（距離p3・相対速度・TTC が壊れる。
+# 260701/ID3 の 545.4s・634.2s・842.8s・870.6s がこれ）。1 台の車としてありえない
+# 大きさのかたまりに限り、連結を 1 セル狭めてほどき直す。値は score_track が
+# 「車両らしくない」と判定する寸法（WIDTH_RANGE・LENGTH_RANGE の上限）に合わせる。
+SPLIT_MAX_WIDTH = 4.0
+SPLIT_MAX_LENGTH = 20.0
 
 # トラッキング。VLP-16 は約 10Hz なので 1 フレーム約 0.1 秒。
 GATE_DISTANCE = 3.0
@@ -309,11 +319,17 @@ def _label_grid(cell_ids: np.ndarray, shape: tuple[int, int], link_cells: int) -
 
 def cluster_points(points, frame: int = 0, timestamp: float = 0.0,
                    cell_size: float = CELL_SIZE, link_cells: int = LINK_CELLS,
-                   min_points: int = MIN_CLUSTER_POINTS) -> list[Cluster]:
+                   min_points: int = MIN_CLUSTER_POINTS,
+                   max_width: float = SPLIT_MAX_WIDTH,
+                   max_length: float = SPLIT_MAX_LENGTH) -> list[Cluster]:
     """XY 平面のグリッド連結成分で点群をクラスタに分ける。
 
     セル 0.3〜0.5m 程度の占有グリッドを作り、隣接セルを同じ物体としてまとめる。
     点数が ``min_points`` 未満のかたまりはノイズとして捨てる。
+
+    1 台の車としてありえない大きさ（``max_width`` × ``max_length`` の外接矩形を
+    超える）になったかたまりは、連結を 1 セル狭めてほどき直す。2 つ以上に分かれた
+    ときだけ採用するので、本当に大きな 1 物体はそのまま残る。
     """
     xyz = _as_xyz(points)
     if len(xyz) == 0:
@@ -339,6 +355,16 @@ def cluster_points(points, frame: int = 0, timestamp: float = 0.0,
             continue
         member = xyz[group]
         mx, my = member[:, 0], member[:, 1]
+        span_x = float(mx.max() - mx.min())
+        span_y = float(my.max() - my.min())
+        if link_cells > 1 and (span_x > max_width or span_y > max_length):
+            parts = cluster_points(member, frame=frame, timestamp=timestamp,
+                                   cell_size=cell_size, link_cells=link_cells - 1,
+                                   min_points=min_points, max_width=max_width,
+                                   max_length=max_length)
+            if len(parts) > 1:
+                clusters.extend(parts)
+                continue
         clusters.append(Cluster(
             frame=frame, timestamp=timestamp,
             center_x=float(mx.mean()), center_y=float(my.mean()),
