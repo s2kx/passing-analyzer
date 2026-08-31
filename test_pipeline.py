@@ -556,6 +556,28 @@ def test_auto_review_classifies_by_lidar_result():
     print("  OK: LiDAR結果で採用・未確認・除外を判定（実測LC優先）")
 
 
+def test_non_advancing_analysis_is_flagged_for_review():
+    """フェーズ3→4で車が前進していない解析は採用せず人手確認へ回す。
+
+    通過区間を抜けるまで追えず、代用のフェーズ4が後方の点になると距離p3・
+    相対速度・TTC がすべて負になる。最終Excelへ「TTC が負の行」を入れないよう
+    「未確認」にする（実データ260701/ID1の281.9s、ID3の869.1sがこの型）。
+    """
+    config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                            pcap_path=Path("."), view="front")
+    events = [{"event_id": "1"}, {"event_id": "2"}]
+    tracking = {"1": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2},
+                "2": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
+    analyses = {
+        "1": {"metrics": {"lc": 1.27, "relative_speed": -0.32, "ttc": -40.31}},
+        "2": {"metrics": {"lc": 1.30, "relative_speed": 15.6, "ttc": 1.2}},
+    }
+    reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses)
+    assert [row["review_status"] for row in reviewed] == ["未確認", "採用"], reviewed
+    assert "前進していません" in reviewed[0]["review_reason"], reviewed[0]
+    print("  OK: 車が前進していない解析を「未確認」にする")
+
+
 def test_pass_anchor_rounds_a_late_peak_toward_the_visible_edge():
     """トラック開始から離れすぎた bbox 面積のピークは期待通過時刻の基準にしない。
 

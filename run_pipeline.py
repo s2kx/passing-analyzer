@@ -1464,11 +1464,15 @@ def run_edit_csv(config: PipelineConfig, report: PipelineReport) -> dict[str, di
 
 # ── 段階6: 自動レビュー ───────────────────────────────────────────────────────
 
+def _analysis_metric(analysis: dict | None, key: str) -> float | None:
+    """edit 解析から指標を1つ取り出す（解析できていなければ ``None``）。"""
+    value = ((analysis or {}).get("metrics") or {}).get(key)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def _analysis_lc(analysis: dict | None) -> float | None:
     """edit 解析から離隔距離 LC を取り出す（解析できていなければ None）。"""
-    metrics = (analysis or {}).get("metrics") or {}
-    value = metrics.get("lc")
-    return float(value) if isinstance(value, (int, float)) else None
+    return _analysis_metric(analysis, "lc")
 
 
 def auto_review_events(events: list[dict], config: PipelineConfig,
@@ -1515,6 +1519,19 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
             event["review_status"] = "除外"
             event["review_reason"] = (
                 f"離隔距離 {lc:.2f}m が {limit}m を超えます（隣車線の通過）"
+            )
+            continue
+        # フェーズ3→4で車が前進していない解析は成り立たない。通過区間の途中で追跡が
+        # 切れ、代用のフェーズ4が後方の点になった場合に起きる（距離p3・相対速度・TTC
+        # がすべて負になる）。値を採用すると最終Excelへ TTC が負の行が入るので、
+        # 除外はせず人手確認へ回す。
+        speed = _analysis_metric(analyses.get(event_id), "relative_speed")
+        if speed is not None and speed <= 0:
+            event["review_status"] = "未確認"
+            event["review_reason"] = (
+                f"フェーズ3→4で車が前進していません（相対速度 {speed:.1f} km/h）。"
+                "通過区間を抜けるまで追えておらず、通過時間・距離p3・TTCが"
+                "成り立たないため目視確認が必要です"
             )
             continue
         confidence = float(track.get("confidence") or 0.0)
