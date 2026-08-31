@@ -492,6 +492,105 @@ def test_phase2_far_only_falls_back_with_warning():
     print("  OK: 近い候補が無いときは制限を外して警告")
 
 
+def test_negative_relative_speed_is_warned():
+    """フェーズ4がフェーズ3より手前（相対速度が0以下）なら警告を出す。"""
+    rows = [
+        (0, 2.0, 8, None), (1, 2.0, 5.0, 20),
+        (2, 2.0, 2.5, 20),      # フェーズ3
+        (3, 2.0, 1.0, 20),
+        (4, 2.0, -3.2, 20),     # フェーズ4（フェーズ3より手前）
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["relative_speed"] < 0, metrics
+    assert any("相対速度" in w and "0以下" in w for w in metrics["warnings"]), metrics
+    print("  OK: 相対速度が0以下のフェーズ崩壊を警告する")
+
+
+def _write_frames_csv(path, frames):
+    """``frames`` = [(time, [(X, Y, Z), ...]), ...] から VeloView 形式CSVを書く。"""
+    header = ",".join((
+        "Frame", "Time", "Laser ID", "Intensity", "Distance",
+        "Azimuth", "Elevation", "Selected", "Points:0", "Points:1", "Points:2",
+    ))
+    lines = [header]
+    for index, (t, points) in enumerate(frames):
+        for x, y, z in points:
+            lines.append(f"{index},{t:.6f},0,5,5,0,0,1,{x},{y},{z}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+
+
+# 自車構造物: センサ架台の環(0.48m)と、通過側と反対側にある搭乗者(1.05m)。
+# どちらも実データ(ID3候補056・ID4候補011)でフェーズ判定を壊した張本人。
+_EGO_POINTS = [(0.15, 0.46, -0.13), (-0.15, 0.46, -0.13), (-1.05, 0.05, -0.13)]
+
+
+def test_trajectory_ignores_ego_structure():
+    """自車構造物に乗り移らず追い越し車を追い続ける（ID3候補056・ID4候補011の再現）。
+
+    車が横を通り過ぎると、車より近い自車構造物（架台の環 0.48m、搭乗者 1.05m）が
+    最近接点になって軌跡を乗っ取り、|Y| が 3 に戻らないためフェーズ4が作れなくなる。
+    その結果、通過時間が数秒に伸び TTC と相対速度が壊れる。
+    """
+    import tempfile
+    from pathlib import Path
+
+    frames = []
+    for i in range(20):
+        # 追い越し車: X=1.2 一定、Y は -6.0 から 0.7m/フレームで前へ抜けていく
+        points = [(1.2, -6.0 + 0.7 * i, -0.2)]
+        if i >= 6:
+            points += _EGO_POINTS          # 車が近づくと矩形が原点をまたぐ
+        frames.append((100.0 + 0.1 * i, points))
+
+    with tempfile.TemporaryDirectory() as temp_value:
+        path = Path(temp_value) / "overtaking_901.csv"
+        _write_frames_csv(path, frames)
+        rows = build_edit_rows_from_file(path)
+
+    xs = [float(r[1]) for r in rows[1:] if r[1]]
+    assert xs and all(abs(x - 1.2) < 1e-6 for x in xs), rows
+    metrics = analyze_edit_points(edit_points_from_rows(rows))
+    assert abs(metrics["passing_time"] - 0.8) < 1e-6, metrics
+    assert abs(metrics["distance_p3"] - 5.6) < 1e-6, metrics
+    assert metrics["relative_speed"] > 0 and metrics["ttc"] > 0, metrics
+    print("  OK: 自車構造物に乗り移らず追い越し車を追い続ける")
+
+
+def test_trajectory_stops_when_vehicle_is_lost():
+    """車を見失った後に矩形へ入り込む別物体は軌跡に入れない。"""
+    import tempfile
+    from pathlib import Path
+
+    frames = []
+    for i in range(12):
+        if i < 8:
+            points = [(1.2, -4.0 + 0.6 * i, -0.2)]      # 追い越し車
+        else:
+            points = [(2.0, -8.0 + 0.2 * (i - 8), -0.2)]  # 遠くの別物体
+        frames.append((200.0 + 0.1 * i, points))
+
+    with tempfile.TemporaryDirectory() as temp_value:
+        path = Path(temp_value) / "overtaking_902.csv"
+        _write_frames_csv(path, frames)
+        rows = build_edit_rows_from_file(path)
+
+    assert all(r[1] for r in rows[1:9]), rows            # 車の 8 フレームは残る
+    assert not any(r[1] for r in rows[9:]), rows         # 別物体のフレームは空
+    print("  OK: 追跡が途切れた後の別物体を軌跡に入れない")
+
+
+def edit_points_from_rows(rows):
+    """``build_edit_rows_from_file`` の戻り値を EditPoint の列に変換する。"""
+    return [
+        EditPoint(
+            row_number=index, unixtime_text=r[0], unixtime=float(r[0]),
+            x=float(r[1]), y=float(r[2]), z_text=r[3], distance=float(r[4]),
+            speed=float(r[5]) if r[5] else None, raw=list(r),
+        )
+        for index, r in enumerate(rows[1:], start=2) if r[1]
+    ]
+
+
 def test_nearest_point_skips_ground_points():
     """路面付近の点は最近接点にしない（矩形の余裕で入り込む路面点のLC過小対策）。"""
     import tempfile

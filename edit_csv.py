@@ -42,6 +42,28 @@ GROUND_PERCENTILE = 0.02
 GROUND_MARGIN = 0.10
 GROUND_MIN_POINTS = 30
 
+# 自車構造物（センサ架台・搭乗者）の除去。LiDARは自転車に載っているので、
+# 原点のごく近傍に「ほぼ同じ位置に留まり続ける点の環」が常時返ってくる。実データ
+# （ID1〜ID5の全 edit CSV 計10418点）ではこの環は 0.48〜0.50m に密集し、次に近い
+# 点は 1.0m 以上で、0.5〜1.0m には1点も無い。追い越し車がセンサ横を通り過ぎて
+# しまうと、この環がフレーム内の最近接点になって軌跡を乗っ取り、フェーズ3〜4が
+# 作れなくなる（ID3候補056・ID4候補011の崩壊原因）。環と実車の間のギャップに
+# しきい値を置き、これより近い点は最近接点の候補から外す。
+EGO_MIN_DISTANCE = 0.8
+
+# 自車構造物の第2層。搭乗者の体・自転車のフレームは 0.8〜2m にも点を返す。こちらは
+# 距離だけでは追い越し車（LC 1.0m 前後もある）と区別できないが、通過側の反対側にしか
+# 出ない。追い越し車は車体まるごと通過側にあるので、通過側でない点は候補にしない。
+# 通過側は遠方フレームのXの符号の多数決で決め、多数派がこの比率に満たない（＝どちらの
+# 側とも言えない）ときは側による除去をしない。
+PASSING_SIDE_MIN_RATIO = 0.6
+
+# 最近接点が1フレームで動ける上限速度[m/s]。最近接点は車体上を移り変わるので車速より
+# ずっと速く動くことがある（実データの approach 区間で最大 75km/h ≒ 21m/s）。ここを
+# 超える移動は別物体への乗り移りなので、その時点で追跡は失われたとみなし、以降の
+# フレームは空行にする（1台の車の軌跡が途中で別物体にすり替わるのを防ぐ）。
+MAX_STEP_SPEED_MPS = 30.0
+
 # XYZ 座標の列位置（0 始まり）。旧プログラムの注記「XYZ座標は9,10,11列目」に対応。
 COL_X, COL_Y, COL_Z = 8, 9, 10
 
@@ -146,6 +168,78 @@ def _drop_ground_points(points: list[list[str]], col_z: int) -> list[list[str]]:
     return kept or points
 
 
+def _nearest_point(points: list[list[str]], col_x: int, col_y: int, col_z: int,
+                   accept=None) -> tuple[float, float, float, list[str]] | None:
+    """1フレームの点から最近接点を選び ``(距離, X, Y, 点)`` を返す。該当なしは None。
+
+    ``points`` は路面点を落とした後の1フレーム分の点。``accept(x, y, dist)`` を渡すと、
+    それが偽を返す点は候補から外す。自車構造物や軌跡の飛びを弾くのに使う。距離
+    ``EGO_MIN_DISTANCE`` 未満の点は常に外す。
+    """
+    best: tuple[float, float, float, list[str]] | None = None
+    for p in points:
+        if len(p) <= col_z:
+            continue
+        try:
+            x = float(p[col_x])
+            y = float(p[col_y])
+        except ValueError:
+            continue                 # 数値でない点（空欄・見出し行など）はスキップ
+        dist = math.sqrt(x * x + y * y)
+        if dist < EGO_MIN_DISTANCE:
+            continue                 # センサ架台・搭乗者そのもの
+        if accept is not None and not accept(x, y, dist):
+            continue
+        if best is None or dist < best[0]:
+            best = (dist, x, y, p)
+    return best
+
+
+def _passing_side(bests) -> float:
+    """最近接点の列から車が通過した側（+1: X>0 / -1: X<0 / 0: 判定不能）を返す。
+
+    自車構造物は原点のごく近くにしか無いので、|Y| が ``PHASE_Y_THRESHOLD`` 以上の
+    フレーム（＝遠方＝汚染されない区間）の X の符号だけで判定する。多数派が
+    ``PASSING_SIDE_MIN_RATIO`` に満たないときは 0（＝側による除去をしない）。
+    """
+    xs = [best[1] for best in bests if best is not None and abs(best[2]) >= PHASE_Y_THRESHOLD]
+    if not xs:
+        return 0.0
+    positives = sum(1 for x in xs if x > 0)
+    negatives = sum(1 for x in xs if x < 0)
+    if max(positives, negatives) < PASSING_SIDE_MIN_RATIO * len(xs):
+        return 0.0
+    if positives == negatives:
+        return 1.0 if sum(xs) >= 0 else -1.0
+    return 1.0 if positives > negatives else -1.0
+
+
+def _anchor_frame(frames, bests) -> int | None:
+    """追跡の起点にするフレーム番号を返す。有効な点が1つも無ければ None。
+
+    フレーム毎の最近接点を並べ、隣り合うフレームの移動が ``MAX_STEP_SPEED_MPS`` に
+    収まる区間（＝同じ物体を見続けている区間）に切り分け、最長の区間の最接近フレームを
+    起点にする。単純に「一番近いフレーム」を起点にすると、車が通り過ぎた後に残る
+    自車構造物（数フレームだけ最近接になる）を掴んでしまう。
+    """
+    runs: list[list[int]] = []
+    for i, best in enumerate(bests):
+        if best is None:
+            continue
+        prev = bests[i - 1] if i > 0 else None
+        if runs and prev is not None and runs[-1][-1] == i - 1:
+            step = math.hypot(best[1] - prev[1], best[2] - prev[2])
+            if step <= MAX_STEP_SPEED_MPS * abs(frames[i][0] - frames[i - 1][0]):
+                runs[-1].append(i)
+                continue
+        runs.append([i])
+    if not runs:
+        return None
+    # 長さ優先、同じ長さならより近くまで寄った区間を選ぶ
+    run = max(runs, key=lambda r: (len(r), -min(bests[i][0] for i in r)))
+    return min(run, key=lambda i: bests[i][0])
+
+
 def _trajectory_rows(frames, col_x: int = COL_X, col_y: int = COL_Y, col_z: int = COL_Z) -> list[list[str]]:
     """フレーム列から edit.csv 行（ヘッダ込み）を作る共通ロジック。
 
@@ -156,48 +250,76 @@ def _trajectory_rows(frames, col_x: int = COL_X, col_y: int = COL_Y, col_z: int 
       * 先頭フレームの速度は空欄
       * 有効点が無いフレームは時刻のみ、X..speed は空欄
 
-    旧実装との違いは、最近接点を選ぶ前に ``_drop_ground_points`` で路面付近の点を
-    落とす点だけである（車体の外側に残る路面点が最近接点になるとLCが小さめに出る）。
+    旧実装に対して足したのは次の3つで、どれも「最近接点が追い越し車以外へ乗り移る」
+    のを防ぐためのものである（``docs/計算方法.md`` 7.2）。
+      * ``_drop_ground_points``: 車体の外側に残る路面点（LCが小さめに出る）
+      * 自車構造物の除去: ``EGO_MIN_DISTANCE`` 未満の点と、通過側でない側の点
+      * 連続性ゲート: 最接近フレームを起点に前後へ、1フレームで
+        ``MAX_STEP_SPEED_MPS`` を超えて飛ばない範囲だけ軌跡を伸ばす
     """
     out: list[list[str]] = [list(EDIT_HEADER)]
     if not frames:
         return out
+
+    # 路面点の除去はフレームごとに一度だけ行い、以降はその結果を使い回す。
+    cleaned = [_drop_ground_points(points, col_z) for _, _, points in frames]
+
+    # 1回目: 自車構造物（近すぎる点）だけを外して最近接点を求め、通過側を決める。
+    side = _passing_side([_nearest_point(points, col_x, col_y, col_z)
+                          for points in cleaned])
+
+    def accept(x: float, y: float, dist: float) -> bool:
+        # 通過側と反対側の点は搭乗者・自転車・対向物。追い越し車ではありえない。
+        return not (side and x * side < 0)
+
+    # 2回目: 通過側に限って最近接点を求め、それが連続している最長の区間（＝追い越し車。
+    # 自車構造物や矩形に紛れ込んだ物体は短い区間にしかならない）の最接近フレームを
+    # 追跡の起点にする。
+    bests = [_nearest_point(points, col_x, col_y, col_z, accept) for points in cleaned]
+    anchor = _anchor_frame(frames, bests)
+    chain: dict[int, tuple[float, float, float, list[str]]] = {}
+    if anchor is not None:
+        chain[anchor] = bests[anchor]
+        # 起点から前後へ、連続性を保てる間だけ伸ばす。途切れたらそこで打ち切る
+        # （追い越し車は途中で消えないので、その先に現れるのは別物体）。
+        for step in (1, -1):
+            prev = (frames[anchor][0], chain[anchor][1], chain[anchor][2])
+            i = anchor + step
+            while 0 <= i < len(frames):
+                t = frames[i][0]
+                base_t, base_x, base_y = prev
+                limit = MAX_STEP_SPEED_MPS * abs(t - base_t)
+                best = _nearest_point(
+                    cleaned[i], col_x, col_y, col_z,
+                    lambda x, y, dist: (accept(x, y, dist)
+                                        and math.hypot(x - base_x, y - base_y) <= limit),
+                )
+                if best is None:
+                    break
+                chain[i] = best
+                prev = (t, best[1], best[2])
+                i += step
 
     prev_t = frames[0][0]           # 直前フレームの時刻（最初のフレームで初期化）
     prev_x = 0.0                    # 直前フレーム最近接点 X
     prev_y = 0.0                    # 直前フレーム最近接点 Y
 
     for i, (t, time_text, points) in enumerate(frames):
-        best_dist = 99999999.0       # このフレームの最小距離
         row = [time_text, "", "", "", "", ""]
-
-        speed_text = ""
-        for p in _drop_ground_points(points, col_z):
-            if len(p) <= col_z:
-                continue
-            try:
-                x = float(p[col_x])
-                y = float(p[col_y])
-            except ValueError:
-                continue             # 数値でない点（空欄・見出し行など）はスキップ
-            dist = math.sqrt(x * x + y * y)
-
-            # 2 フレーム目以降は前フレーム最近接点との移動から速度を算出
+        best = chain.get(i)
+        if best is not None:
+            dist, x, y, p = best
+            row[1] = p[col_x]                     # X（元の文字列をそのまま）
+            row[2] = p[col_y]                     # Y
+            row[3] = p[col_z]                     # Z
+            row[4] = _fmt(dist)                   # distance(m)
             if i > 0 and (t - prev_t) != 0:
                 speed = math.sqrt((x - prev_x) ** 2 + (y - prev_y) ** 2) / (t - prev_t) * 3600.0 / 1000.0
-                speed_text = _fmt(speed)
-
-            if dist < best_dist:
-                best_dist = dist
-                row[1] = p[col_x]                 # X（元の文字列をそのまま）
-                row[2] = p[col_y]                 # Y
-                row[3] = p[col_z]                 # Z
-                row[4] = _fmt(dist)               # distance(m)
-                row[5] = "" if i == 0 else speed_text  # speed(km/h)
+                row[5] = _fmt(speed)              # speed(km/h)
 
         out.append(row)
 
-        # 次フレームの速度計算用に「直前」を更新
+        # 次フレームの速度計算用に「直前」を更新（旧実装どおり、空行は原点扱い）
         prev_t = t
         prev_x = float(row[1]) if row[1] != "" else 0.0
         prev_y = float(row[2]) if row[2] != "" else 0.0
@@ -498,6 +620,14 @@ def analyze_edit_points(
     distance_p3 = p4.y - p3.y
     relative_speed = distance_p3 / passing_time * 3.6
     ttc = abs(p2.y) / (relative_speed / 3.6) if relative_speed != 0 else float("nan")
+    if relative_speed <= 0:
+        # 追い越し車ならフェーズ3→4で Y は必ず増える。負や0になるのは軌跡が
+        # 別物体へ乗り移った証拠で、TTC・相対速度も符号ごと壊れている。
+        warnings.append(
+            f"相対速度が {relative_speed:.2f} km/h（0以下）です。フェーズ4がフェーズ3より"
+            "手前にあり、追い越し車以外を追跡している可能性が高いので点群を目視で"
+            "確認してください"
+        )
     return {
         **phases,
         "lc": lc,
