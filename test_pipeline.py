@@ -556,6 +556,30 @@ def test_auto_review_classifies_by_lidar_result():
     print("  OK: LiDAR結果で採用・未確認・除外を判定（実測LC優先）")
 
 
+def test_pass_anchor_rounds_a_late_peak_toward_the_visible_edge():
+    """トラック開始から離れすぎた bbox 面積のピークは期待通過時刻の基準にしない。
+
+    front 撮影では追い越し車は自転車を抜いた直後に画角へ入るので、開始時刻が
+    横に並んだ時刻に最も近い。検出が別の車へ乗り移ると peak_t_s が開始の十数秒後
+    まで流れ、そのままだと期待通過時刻が数秒ずれる。
+    """
+    late = {"event_id": "001", "t_start_s": 100.0, "peak_t_s": 114.0, "t_end_s": 116.0}
+    normal = {"event_id": "002", "t_start_s": 200.0, "peak_t_s": 200.7, "t_end_s": 208.0}
+
+    # front: 開始から PEAK_ANCHOR_LIMIT 秒より後の peak は開始側へ丸める
+    assert run_pipeline.pass_anchor(late, "front") == 103.0
+    assert run_pipeline.pass_anchor(normal, "front") == 200.7
+    # rear: 抜かれる直前まで映るので終了時刻側が基準
+    assert run_pipeline.pass_anchor(late, "rear") == 114.0
+    assert run_pipeline.pass_anchor(normal, "rear") == 205.0
+    # 撮影方向が分からなければ従来どおり peak をそのまま使う
+    assert run_pipeline.pass_anchor(late, "") == 114.0
+
+    expected = run_pipeline.expected_pass_times([late, normal], offset=-10.0, view="front")
+    assert expected == {"001": 93.0, "002": 190.7}, expected
+    print("  OK: 遅すぎる bbox ピークを期待通過時刻の基準から外す")
+
+
 def test_unassigned_vehicle_is_reported_as_a_detection_gap():
     """どの候補にも割り当たらない車は、動画検出の取りこぼしとしてレポートへ挙げる。
 

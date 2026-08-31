@@ -97,6 +97,14 @@ MAX_LANE_CLEARANCE = 3.5
 MIN_TRACK_CONFIDENCE = 0.5
 
 # イベントと車両の割り当て。
+# 期待通過時刻の基準にする動画側の時刻。front 撮影では追い越し車は「自転車を抜いた
+# 直後」に画角へ入るので、検出トラックの開始時刻が横に並んだ時刻にいちばん近い。
+# bbox 面積が最大になる peak_t_s も普通はその直後に来るが、検出が途中で別の車へ
+# 乗り移ったり、遠方で一度小さくなってから膨らんだりすると開始の十数秒後になり、
+# 期待通過時刻が数秒ずれて隣車線の車を掴む。開始からこの秒数より後の peak は信用せず
+# 開始時刻側へ丸める（rear 撮影は「抜かれる直前」まで映るので終了時刻側が基準）。
+# 実データ5セッションでは 1〜5 秒のどこに取っても成績が同じで、3秒はその中央。
+PEAK_ANCHOR_LIMIT = 3.0
 # 期待通過時刻からこれ以上離れた車は、そのイベントの車とみなさない（秒）。
 PASS_MATCH_TOLERANCE = 6.0
 # 通過時刻がこれ以内なら、別イベントの走査で見つかった同じ車とみなす（秒）。
@@ -692,15 +700,33 @@ def event_window(config: PipelineConfig, event: dict, offset: float) -> tuple[fl
             _event_seconds(event, "t_end_s") + offset + end_margin)
 
 
-def expected_pass_times(events: list[dict], offset: float, bias: float = 0.0) -> dict[str, float]:
+def pass_anchor(event: dict, view: str = "", limit: float = PEAK_ANCHOR_LIMIT) -> float:
+    """1 候補について、車が横に並んだ時刻の目安になる動画側の秒を返す。
+
+    基本は最接近時刻 ``peak_t_s`` だが、これは bbox 面積が最大のフレームなので、
+    検出が別の車へ乗り移るとトラック開始のはるか後ろへずれる。追い越し車が
+    自転車の横に並ぶのは、front 撮影なら画角へ入る瞬間（``t_start_s``）、rear 撮影
+    なら画角から消える瞬間（``t_end_s``）なので、そこから ``limit`` 秒より離れた
+    peak は採らずに端の時刻へ丸める。撮影方向が分からない場合は従来どおり peak。
+    """
+    peak = _event_seconds(event, "peak_t_s")
+    kind = str(view).lower()
+    if kind == "front":
+        return min(peak, _event_seconds(event, "t_start_s") + limit)
+    if kind == "rear":
+        return max(peak, _event_seconds(event, "t_end_s") - limit)
+    return peak
+
+
+def expected_pass_times(events: list[dict], offset: float, bias: float = 0.0,
+                        view: str = "") -> dict[str, float]:
     """候補ごとの「車が横に並ぶはずの時刻」（pcap 相対秒）を返す。
 
-    動画の最接近時刻 ``peak_t_s`` を時刻オフセットで pcap 時刻へ移し、系統ずれ
+    動画側の基準時刻（``pass_anchor``）を時刻オフセットで pcap 時刻へ移し、系統ずれ
     ``bias`` を足す。この時刻に最も近い車をそのイベントの車とみなす。
     """
     return {
-        str(event.get("event_id", "")):
-            _event_seconds(event, "peak_t_s") + offset + bias
+        str(event.get("event_id", "")): pass_anchor(event, view) + offset + bias
         for event in events
     }
 
@@ -1043,7 +1069,9 @@ def run_autotrack(config: PipelineConfig, pcap: VelodynePcap, events: list[dict]
         return {}, []
 
     ordered = sorted(events, key=lambda event: _event_seconds(event, "peak_t_s"))
-    raw_expected = expected_pass_times(ordered, offset)
+    # 撮影方向が確定していないときは、向き依存の丸め（pass_anchor）を効かせない
+    anchor_view = "" if config.view_source == "fallback" else config.view
+    raw_expected = expected_pass_times(ordered, offset, view=anchor_view)
 
     # 1回目: 窓ごとに走査して候補を集める
     results: dict[str, dict] = {}
