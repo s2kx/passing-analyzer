@@ -51,7 +51,9 @@ from web_gui import (
 
 APP_DIR = Path(__file__).resolve().parent
 VIDEO_SUFFIXES = {".mp4", ".mov"}
-DEFAULT_TRACK_MARGIN = 1.5
+# 実データ検証(260701/ID1)より: 1.5秒では接近区間が窓に入らずフェーズ2が
+# フォールバックになりやすい。5秒で追跡成功が大きく増える(5/66→15/66相当)。
+DEFAULT_TRACK_MARGIN = 5.0
 DEFAULT_VIEW = "rear"
 
 STATUS_LABELS = {
