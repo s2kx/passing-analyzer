@@ -40,3 +40,6 @@ Ultralytics/
 dist/
 tools/ffmpeg.exe
 tools/ffprobe.exe
+
+# 検証エージェントの作業用出力
+out_j/
