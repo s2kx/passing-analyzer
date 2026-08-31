@@ -829,6 +829,44 @@ def unassigned_vehicles(candidate_sets: dict[str, list[dict]], assignment: dict[
     return sorted(orphans, key=lambda candidate: candidate["pass_time"])
 
 
+def dump_assignment_debug(path: Path, offset: float, bias: float,
+                          events: list[dict], results: dict[str, dict],
+                          raw_expected: dict[str, float], expected: dict[str, float],
+                          candidate_sets: dict[str, list[dict]],
+                          assignment: dict[str, dict]) -> None:
+    """割り当ての入力と結果を JSON へ書き出す（診断用）。
+
+    点群の走査は 1 セッション数分かかるため、割り当てだけを試行錯誤したいときに
+    走査をやり直さずに済むよう、候補一覧と期待通過時刻をそのまま残す。
+    パイプラインの動作には影響しない。
+    """
+    payload = {
+        "offset": offset,
+        "bias": bias,
+        "events": [
+            {
+                "event_id": str(event.get("event_id", "")),
+                "peak_t_s": _event_seconds(event, "peak_t_s"),
+                "t_start_s": _event_seconds(event, "t_start_s"),
+                "t_end_s": _event_seconds(event, "t_end_s"),
+                "class": event.get("class", ""),
+                "first_frame": (results.get(str(event.get("event_id", ""))) or {}).get("first_frame"),
+                "last_frame": (results.get(str(event.get("event_id", ""))) or {}).get("last_frame"),
+                "raw_expected": raw_expected.get(str(event.get("event_id", ""))),
+                "expected": expected.get(str(event.get("event_id", ""))),
+                "candidates": candidate_sets.get(str(event.get("event_id", "")), []),
+                "assigned": assignment.get(str(event.get("event_id", ""))),
+            }
+            for event in events
+        ],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:  # 診断用なので書けなくても続行する
+        pass
+
+
 def keys_before(candidates: list[dict], track_key: str) -> list[str]:
     """``candidates`` の採用順で ``track_key`` より前にあるキーを返す。
 
@@ -1038,6 +1076,9 @@ def run_autotrack(config: PipelineConfig, pcap: VelodynePcap, events: list[dict]
     assignment = assign_events(expected, candidate_sets)
     if bias:
         report.info["期待通過時刻の系統ずれ(秒)"] = round(bias, 2)
+    dump_assignment_debug(config.out_dir / "lidar" / "autotrack_candidates.json",
+                          offset, bias, ordered, results, raw_expected, expected,
+                          candidate_sets, assignment)
     # 割り当て先の無い車（動画検出の取りこぼし候補）を洗い出し、必要なら起票する
     orphans = unassigned_vehicles(candidate_sets, assignment, config.max_lane_clearance)
     events_by_id = {str(event.get("event_id", "")): event for event in ordered}
