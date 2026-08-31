@@ -41,7 +41,13 @@
           <label>出力フォルダ</label>
           <div class="path-input"><input id="outPath" readonly><button data-pick="out">選択</button></div>
           <div class="field-row">
-            <fieldset><legend>カメラ方向</legend><label class="radio"><input type="radio" name="view" value="front">前方</label><label class="radio"><input type="radio" name="view" value="rear" checked>後方</label></fieldset>
+            <fieldset><legend>カメラ方向</legend><label class="radio"><input type="radio" name="view" value="front">前方</label><label class="radio"><input type="radio" name="view" value="rear" checked>後方</label>
+              <div class="view-detect-row">
+                <button class="secondary small" id="detectView">自動判定</button>
+                <button class="secondary small" id="detectViewCancel" hidden>中止</button>
+              </div>
+              <p class="detect-view-status" id="detectViewStatus"></p>
+            </fieldset>
             <fieldset><legend>追加設定</legend><label class="check"><input id="overlay" type="checkbox">検出枠動画</label><label class="check"><input id="roadRoi" type="checkbox">道路ROI</label></fieldset>
           </div>
           <div class="button-row">
@@ -148,6 +154,8 @@
               <select id="recordCandidate"><option value="">選択してください</option></select>
             </label>
             <button class="primary record-autotrack" id="recordAutoTrack">自動追跡（点群から車両を検出）</button>
+            <button class="secondary record-autotrack" id="autoTrackCancel" hidden>自動追跡を中止</button>
+            <div class="progress-track auto-track-progress" id="autoTrackProgress" hidden><div id="autoTrackBar"></div></div>
             <p class="auto-track-status" id="autoTrackStatus"></p>
             <div class="record-buttons">
               <button class="secondary" id="recordStart">追い越し開始（手動）</button>

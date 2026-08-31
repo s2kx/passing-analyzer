@@ -2,6 +2,9 @@
   lidar: { loaded:false, frameCount:0, frameTimes:[], index:0, timestamp:0, points:[], selection:null, drag:null, scale:8, panX:0, panY:0, playing:false, request:0, playStartWall:0, playStartSensor:0, tracking:false, vel:{x:0,y:0}, laserCount:0, lasers:new Set(), savedLasers:null, selSet:null } };
 state.record = { active:false, eventId:null, eventIndex:-1, frames:new Map(), auto:false };  // 追い越し記録セッション
 state.autoTrackKeys = new Map();  // event_id -> 自動追跡で割り当てた車両キー（他候補の除外に使う）
+// 進捗表示＋中止つきの重い処理（run: 実行中の通し番号 / token: Python側のジョブ番号）
+state.autoTrack = { seq:0, run:0, token:0, cancelled:false };
+state.detectView = { seq:0, run:0, token:0, cancelled:false };
 state.exported = new Set();  // CSV出力済みの event_id
 const TRACK_MARGIN = 1.2;       // 探索ウィンドウの余白 (m)
 const TRACK_MIN_POINTS = 8;     // これ未満なら見失いとして枠を動かさない
@@ -27,12 +30,19 @@ const demoApi = {
   async export_lidar_roi() { return { ok: false, error: 'PCAPが読み込まれていません' }; },
   async export_overtaking() { return { ok: false, error: 'PCAPが読み込まれていません' }; },
   async auto_track_candidate() { return { ok: false, error: '点群の自動追跡はデスクトップアプリでのみ利用できます' }; },
+  async get_auto_track_progress() { return { ok: true, running: false, elapsed: 0, token: 0, message: '' }; },
+  async cancel_auto_track() { return { ok: false, running: false, error: '実行中の処理はありません' }; },
+  async detect_view_auto() { return { ok: false, error: '撮影方向の自動判定はデスクトップアプリでのみ利用できます' }; },
+  async get_detect_view_progress() { return { ok: true, running: false, elapsed: 0, token: 0, message: '' }; },
+  async cancel_detect_view() { return { ok: false, running: false, error: '実行中の処理はありません' }; },
   async generate_all_edit_csv() { return { ok: false, error: 'edit.csv一括生成はデスクトップアプリでのみ利用できます' }; },
   async generate_final_excel() { return { ok: false, error: '最終Excel生成はデスクトップアプリでのみ利用できます' }; },
   async auto_sync_gps() { return { ok: false, error: 'GPS自動同期はデスクトップアプリでのみ利用できます' }; }
 };
 const api = () => window.pywebview?.api || demoApi;
 const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const VIEW_LABELS = { front: '前方', rear: '後方' };
 
 function toast(message, error=false) {
   const el = $('toast'); el.textContent = message; el.className = `toast show${error ? ' error' : ''}`;
@@ -152,6 +162,70 @@ function clearVideos() {
   if (!state.videos.length) return;
   state.videos = [];
   renderVideoList(); saveSettings();
+}
+
+function setDetectViewStatus(message, error=false) {
+  const el = $('detectViewStatus'); if (!el) return;
+  el.textContent = message || ''; el.className = `detect-view-status${error ? ' error' : ''}`;
+}
+function setDetectViewRunning(running) {
+  if ($('detectView')) $('detectView').disabled = running;
+  const cancel = $('detectViewCancel');
+  if (cancel) { cancel.hidden = !running; cancel.disabled = false; }
+}
+async function pollDetectView(run) {
+  while (state.detectView.run === run) {
+    let info = null;
+    try { info = await api().get_detect_view_progress?.(); } catch (err) { info = null; }
+    if (state.detectView.run !== run) break;
+    if (info && info.running) {
+      if (info.token) state.detectView.token = info.token;
+      const head = state.detectView.cancelled ? '中止しています（測定の終了待ち）' : (info.message || '判定中');
+      setDetectViewStatus(`${head} — ${Number(info.elapsed || 0).toFixed(1)}秒経過`, state.detectView.cancelled);
+    }
+    await sleep(300);
+  }
+}
+async function cancelDetectView() {
+  const task = state.detectView;
+  if (!task.run || task.cancelled) return;
+  task.cancelled = true;
+  if ($('detectViewCancel')) $('detectViewCancel').disabled = true;
+  setDetectViewStatus('中止しています（測定の終了待ち）', true);
+  try { await api().cancel_detect_view?.(task.token || 0); } catch (err) { /* 結果側で片付ける */ }
+}
+// Step1: 開いている動画の背景オプティカルフローから前方／後方を判定してラジオへ反映する。
+// 失敗・判定不能のときはラジオを触らず、手動選択のまま残す。
+async function autoDetectView() {
+  if (!state.videos.length) { toast('先にGoPro動画を追加してください', true); return; }
+  if (state.detectView.run) { toast('撮影方向を判定中です', true); return; }
+  const run = ++state.detectView.seq;
+  Object.assign(state.detectView, { run, token: 0, cancelled: false });
+  setDetectViewRunning(true); setStatus('撮影方向を自動判定中', true);
+  setDetectViewStatus('動画を読み込んでいます…');
+  pollDetectView(run);
+  let result;
+  try { result = await api().detect_view_auto({ videos: state.videos }); }
+  catch (err) { result = { ok: false, error: String(err && err.message || err) }; }
+  finally {
+    if (state.detectView.run === run) { state.detectView.run = 0; setDetectViewRunning(false); setStatus('準備完了'); }
+  }
+  if (state.detectView.cancelled || (result && result.cancelled)) {
+    state.detectView.cancelled = false;
+    setDetectViewStatus('自動判定を中止しました。手動で選んでください', true);
+    return;
+  }
+  if (!result || !result.ok || !VIEW_LABELS[result.view]) {
+    const message = (result && result.error) || '撮影方向を判定できませんでした';
+    setDetectViewStatus(`${message}`, true); toast(message, true);
+    return;
+  }
+  const radio = document.querySelector(`[name=view][value="${result.view}"]`);
+  if (radio) radio.checked = true;
+  await saveSettings();
+  const confidence = Number(result.confidence || 0), elapsed = Number(result.elapsed || 0);
+  setDetectViewStatus(`自動判定: ${VIEW_LABELS[result.view]}（確信度 ${confidence.toFixed(2)}${elapsed > 0 ? ` / ${elapsed.toFixed(1)}秒` : ''}）`);
+  toast(`カメラ方向を「${VIEW_LABELS[result.view]}」に設定しました（確信度 ${confidence.toFixed(2)}）`);
 }
 
 async function startDetection() {
@@ -552,6 +626,48 @@ function setAutoTrackStatus(message, error=false){
 function otherTrackKeys(eventId){
   return [...state.autoTrackKeys].filter(([id,key])=>id!==eventId&&key).map(([,key])=>key);
 }
+function setAutoTrackProgress(ratio){
+  const track=$('autoTrackProgress'), bar=$('autoTrackBar');
+  if(!track||!bar)return;
+  if(ratio===null||ratio===undefined){ track.hidden=true; bar.style.width='0%'; return; }
+  track.hidden=false; bar.style.width=`${Math.max(0,Math.min(100,ratio*100)).toFixed(0)}%`;
+}
+function setAutoTrackRunning(running){
+  $('recordAutoTrack').disabled=running;
+  const cancel=$('autoTrackCancel');
+  if(cancel){ cancel.hidden=!running; cancel.disabled=false; }
+  if(!running)setAutoTrackProgress(null);
+}
+// track_overtaking は進捗を通知しないので、経過時間とフレーム数からの目安で見せる。
+// pywebview は js_api の呼び出しごとに別スレッドを起こすため、追跡中でもポーリングが通る。
+async function pollAutoTrack(run){
+  while(state.autoTrack.run===run){
+    let info=null;
+    try{ info=await api().get_auto_track_progress?.(); }catch(err){ info=null; }
+    if(state.autoTrack.run!==run)break;
+    if(info&&info.running){
+      if(info.token)state.autoTrack.token=info.token;
+      const elapsed=Number(info.elapsed||0), expect=Number(info.expected_seconds||0);
+      const head=state.autoTrack.cancelled?'中止しています（計算の終了待ち）':`${info.message||'自動追跡中'}`;
+      setAutoTrackStatus(`${head} — ${elapsed.toFixed(1)}秒経過${expect>0?` / 目安 ${expect.toFixed(0)}秒`:''}`,
+        state.autoTrack.cancelled);
+      setAutoTrackProgress(state.autoTrack.cancelled||expect<=0?null:Math.min(0.97,elapsed/expect));
+    }
+    await sleep(300);
+  }
+}
+// 中止: Python側に中断フラグを立てて結果を破棄する。track_overtaking 自体は
+// 止められないので計算はバックグラウンドで終わるが、GUIは手動フローへ戻れる。
+async function cancelAutoTrack(){
+  const auto=state.autoTrack;
+  if(!auto.run||auto.cancelled)return;
+  auto.cancelled=true;
+  const cancel=$('autoTrackCancel'); if(cancel)cancel.disabled=true;
+  setAutoTrackStatus('中止しています（計算の終了待ち）— 「追い越し開始（手動）」はすぐ使えます',true);
+  setAutoTrackProgress(null);
+  try{ await api().cancel_auto_track?.(auto.token||0); }catch(err){ /* 状態は結果側で片付ける */ }
+  toast('自動追跡を中止しました。結果は破棄されます');
+}
 // 半自動モード: 候補の時刻窓を lidar_autotrack にかけ、返ったフレーム別矩形を
 // 記録済みフレームの初期値として取り込む。人はこれを確認・微修正して出力する。
 async function autoTrackCandidate(){
@@ -560,8 +676,14 @@ async function autoTrackCandidate(){
   if(sel===''||!event)return toast('追い越し候補を選択してください',true);
   if(event.review_status==='除外')return toast('除外した候補は使用できません',true);
   if(!state.synced&&Math.abs(state.offset)<0.001)return toast('先にStep 3でGPS自動同期を実行してください',true);
-  const button=$('recordAutoTrack');
-  button.disabled=true; stopLidarPlay(); setStatus('点群を自動追跡中',true); setAutoTrackStatus('自動追跡中…');
+  if(state.autoTrack.run)return toast(state.autoTrack.cancelled
+    ?'中止した計算の終了待ちです。数秒お待ちください（手動記録はすぐ使えます）'
+    :'自動追跡はすでに実行中です',true);
+  const run=++state.autoTrack.seq;
+  Object.assign(state.autoTrack,{ run, token:0, cancelled:false });
+  stopLidarPlay(); setStatus('点群を自動追跡中',true);
+  setAutoTrackRunning(true); setAutoTrackStatus('自動追跡を開始しました…'); setAutoTrackProgress(0);
+  pollAutoTrack(run);
   let result;
   try{
     result=await api().auto_track_candidate({
@@ -571,7 +693,15 @@ async function autoTrackCandidate(){
       exclude_track_keys:otherTrackKeys(event.event_id)
     });
   }catch(err){ result={ ok:false, error:String(err&&err.message||err) }; }
-  finally{ button.disabled=false; setStatus('準備完了'); }
+  finally{
+    if(state.autoTrack.run===run){ state.autoTrack.run=0; setAutoTrackRunning(false); setStatus('準備完了'); }
+  }
+  if(state.autoTrack.cancelled||(result&&result.cancelled)){
+    // 中止済み。返ってきた結果は使わず、手動フローのまま残す
+    state.autoTrack.cancelled=false;
+    setAutoTrackStatus('自動追跡を中止しました → 「追い越し開始（手動）」で記録できます',true);
+    return;
+  }
   if(!result||!result.ok){
     // 自動が外れても止まらない。従来の手動記録フローへ落とす
     const message=(result&&result.error)||'自動追跡に失敗しました';
@@ -591,7 +721,8 @@ async function autoTrackCandidate(){
   updateRecordStatus();
   await loadLidarFrame(result.frames[0].index);
   const notes=(result.warnings&&result.warnings.length)?` / ${result.warnings.join(' / ')}`:'';
-  setAutoTrackStatus(`${result.frames.length} フレーム ・ 確度 ${Number(result.confidence||0).toFixed(2)}${notes}`);
+  const took=Number(result.elapsed||0)>0?` ・ ${Number(result.elapsed).toFixed(1)}秒`:'';
+  setAutoTrackStatus(`${result.frames.length} フレーム ・ 確度 ${Number(result.confidence||0).toFixed(2)}${took}${notes}`);
   toast(`自動追跡で ${result.frames.length} フレームを記録しました。←→で確認・修正し、終了してCSV出力（Enter）で確定します`);
 }
 function nextUnexportedCandidate(currentIndex){
@@ -708,12 +839,14 @@ async function initialize() {
   document.addEventListener('keydown', handleShortcut); document.addEventListener('keydown', handleLidarShortcut);
   $('addVideos').addEventListener('click', addVideos); $('clearVideos').addEventListener('click', clearVideos);
   $('startDetection').addEventListener('click', startDetection); $('loadExisting').addEventListener('click', chooseAndLoadEvents); $('autoSyncGps').addEventListener('click', autoSyncGps);
+  $('detectView').addEventListener('click', autoDetectView); $('detectViewCancel').addEventListener('click', cancelDetectView);
+  document.querySelectorAll('[name=view]').forEach(x => x.addEventListener('change', () => { setDetectViewStatus(''); saveSettings(); }));
   $('saveReviews').addEventListener('click', () => saveReviews(true));
   $('openSettings').addEventListener('click', openKeyConfig); $('keyModalCancel').addEventListener('click', closeKeyConfig); $('keyModalSave').addEventListener('click', saveKeyConfig); $('keyModalReset').addEventListener('click', resetKeyConfig);
   $('keyModalBackdrop').addEventListener('click', e => { if (e.target === $('keyModalBackdrop')) closeKeyConfig(); });
   $('keyModalBackdrop').addEventListener('keydown', e => { if (e.key === 'Escape') closeKeyConfig(); });
   document.querySelectorAll('.key-field').forEach(f => f.addEventListener('input', () => { f.value = f.value.slice(-1).toUpperCase(); }));
-  $('openPcap').addEventListener('click',openPcap);$('lidarPrevious').addEventListener('click',()=>loadLidarFrame(state.lidar.index-1));$('lidarNext').addEventListener('click',()=>loadLidarFrame(state.lidar.index+1));$('lidarPlay').addEventListener('click',toggleLidarPlay);$('lidarSlider').addEventListener('input',e=>previewLidarFrame(e.target.value));$('lidarSeek').addEventListener('click',()=>seekLidar($('lidarSeekTime').value));$('jumpCandidate').addEventListener('click',jumpToCandidate);$('exportLidar').addEventListener('click',exportLidar);$('lidarFullscreen').addEventListener('click',toggleLidarFullscreen);$('generateEdit').addEventListener('click',generateEditCsv);$('generateAllEdits').addEventListener('click',generateAllEditCsv);$('generateFinal').addEventListener('click',generateFinalExcel);$('recordAutoTrack').addEventListener('click',autoTrackCandidate);$('recordStart').addEventListener('click',recordStart);$('recordCancel').addEventListener('click',recordCancel);$('recordFinish').addEventListener('click',recordFinish);$('lidarTrack').addEventListener('change',e=>{const l=state.lidar;l.tracking=e.target.checked;l.vel={x:0,y:0};l.selSet=null;if(l.tracking){if(!l.selection)toast('先に点群上で車を矩形選択してください',true);else trackSelection(l.points);}drawLidar();});$('laserAll').addEventListener('click',()=>setAllLasers(true));$('laserNone').addEventListener('click',()=>setAllLasers(false));setupLidarCanvas();
+  $('openPcap').addEventListener('click',openPcap);$('lidarPrevious').addEventListener('click',()=>loadLidarFrame(state.lidar.index-1));$('lidarNext').addEventListener('click',()=>loadLidarFrame(state.lidar.index+1));$('lidarPlay').addEventListener('click',toggleLidarPlay);$('lidarSlider').addEventListener('input',e=>previewLidarFrame(e.target.value));$('lidarSeek').addEventListener('click',()=>seekLidar($('lidarSeekTime').value));$('jumpCandidate').addEventListener('click',jumpToCandidate);$('exportLidar').addEventListener('click',exportLidar);$('lidarFullscreen').addEventListener('click',toggleLidarFullscreen);$('generateEdit').addEventListener('click',generateEditCsv);$('generateAllEdits').addEventListener('click',generateAllEditCsv);$('generateFinal').addEventListener('click',generateFinalExcel);$('recordAutoTrack').addEventListener('click',autoTrackCandidate);$('autoTrackCancel').addEventListener('click',cancelAutoTrack);$('recordStart').addEventListener('click',recordStart);$('recordCancel').addEventListener('click',recordCancel);$('recordFinish').addEventListener('click',recordFinish);$('lidarTrack').addEventListener('change',e=>{const l=state.lidar;l.tracking=e.target.checked;l.vel={x:0,y:0};l.selSet=null;if(l.tracking){if(!l.selection)toast('先に点群上で車を矩形選択してください',true);else trackSelection(l.points);}drawLidar();});$('laserAll').addEventListener('click',()=>setAllLasers(true));$('laserNone').addEventListener('click',()=>setAllLasers(false));setupLidarCanvas();
   setStatus(window.pywebview ? '準備完了' : 'ブラウザプレビュー');
 }
 

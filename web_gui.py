@@ -247,6 +247,11 @@ AUTOTRACK_VIEW_MARGINS = {"front": (8.0, 3.0), "rear": (3.0, 8.0)}
 # 撮影方向が未確定のときは、非対称マージンの向きを誤ると接近または離脱の区間が
 # 窓から切れるため、両側とも広い方の値で対称に取る。
 AUTOTRACK_FALLBACK_MARGIN = 8.0
+# 進捗バーの目安に使う所要時間の見積り。track_overtaking は進捗を通知しないので、
+# 「窓のフレーム数 × 1フレームあたりの実測秒」で残り時間の目安だけを出す。
+# 実測（ID1の候補001〜005、120〜202フレームの窓）は 33〜47ms/フレームだった。
+AUTOTRACK_SECONDS_PER_FRAME = 0.05
+AUTOTRACK_MIN_ESTIMATE = 3.0
 
 
 def autotrack_margins(view: str) -> tuple[float, float]:
@@ -297,6 +302,108 @@ def load_autotracker():
     return track_overtaking, ""
 
 
+def load_view_detector():
+    """``detect_view.detect_view`` を遅延importする（cv2を起動時に巻き込まない）。"""
+    try:
+        from detect_view import DetectViewError, detect_view
+    except Exception as exc:  # noqa: BLE001 - 判定が使えなくても手動選択で進める
+        return None, None, f"detect_view を読み込めません: {exc}"
+    return detect_view, DetectViewError, ""
+
+
+def estimate_autotrack_seconds(first_frame: int, last_frame: int) -> float:
+    """自動追跡の所要時間の目安（秒）。進捗バーの分母にだけ使う。"""
+    frames = max(0, int(last_frame) - int(first_frame) + 1)
+    return round(max(AUTOTRACK_MIN_ESTIMATE, frames * AUTOTRACK_SECONDS_PER_FRAME), 1)
+
+
+class TaskCancelled(Exception):
+    """利用者が中止した（協調中断できる処理の脱出用）。"""
+
+
+class BackgroundTask:
+    """進捗表示と中止に対応した単発ジョブの状態。
+
+    pywebview は js_api の呼び出しごとに別スレッドを起こすので、重い処理は
+    呼び出しスレッドでそのまま実行し、GUIは別の呼び出しで ``snapshot()`` を
+    ポーリングして経過秒を表示する。``cancel()`` は中断フラグを立てるだけで、
+    協調中断の口が無い処理（``track_overtaking``）は最後まで走ってしまうが、
+    ``finish()`` が False を返すので結果は破棄され、GUIは即座に解放できる。
+    協調中断できる処理（``detect_view`` の progress コールバック）は
+    ``raise_if_cancelled()`` でその場で抜ける。
+    """
+
+    def __init__(self, label: str = "") -> None:
+        self._lock = threading.Lock()
+        self._label = label
+        self._token = 0
+        self._running = False
+        self._cancelled = False
+        self._started = 0.0
+        self._elapsed = 0.0
+        self._message = ""
+        self._detail: dict = {}
+
+    def start(self, message: str = "", detail: dict | None = None) -> int:
+        """ジョブを開始してトークンを返す。すでに実行中なら 0 を返す。"""
+        with self._lock:
+            if self._running:
+                return 0
+            self._token += 1
+            self._running = True
+            self._cancelled = False
+            self._started = time.monotonic()
+            self._elapsed = 0.0
+            self._message = message
+            self._detail = dict(detail or {})
+            return self._token
+
+    def note(self, message: str = "", **detail) -> None:
+        """進捗メッセージ・付随情報を更新する。"""
+        with self._lock:
+            if message:
+                self._message = str(message)
+            self._detail.update(detail)
+
+    def cancelled(self, token: int = 0) -> bool:
+        with self._lock:
+            if token and int(token) != self._token:
+                return True
+            return self._cancelled
+
+    def raise_if_cancelled(self, token: int = 0) -> None:
+        if self.cancelled(token):
+            raise TaskCancelled()
+
+    def cancel(self, token: int = 0) -> dict:
+        with self._lock:
+            if not self._running:
+                return {"ok": False, "running": False, "cancelled": self._cancelled,
+                        "token": self._token, "error": "実行中の処理はありません"}
+            if token and int(token) != self._token:
+                return {"ok": False, "running": True, "cancelled": self._cancelled,
+                        "token": self._token, "error": "対象の処理はすでに終了しています"}
+            self._cancelled = True
+            return {"ok": True, "running": True, "cancelled": True, "token": self._token}
+
+    def finish(self, token: int) -> bool:
+        """終了処理。結果を採用してよければ True（中止済みなら False）。"""
+        with self._lock:
+            keep = self._token == int(token) and not self._cancelled
+            if self._token == int(token) and self._running:
+                self._running = False
+                self._elapsed = time.monotonic() - self._started
+            return keep
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            elapsed = (time.monotonic() - self._started) if self._running else self._elapsed
+            return {"ok": True, "running": self._running, "cancelled": self._cancelled,
+                    "token": self._token, "label": self._label,
+                    "elapsed": round(max(0.0, elapsed), 1),
+                    "message": self._message, **self._detail}
+
+
 def _tracker_accepts(tracker, name: str) -> bool:
     """プラグインが指定の任意引数を受け取れるか調べる（後方互換のため）。"""
     try:
@@ -321,11 +428,14 @@ def normalize_track_frames(raw) -> list[dict]:
 
 
 def autotrack_candidate_frames(pcap, event: dict, offset: float, view: str = "",
-                               tracker=None, exclude_track_keys=None) -> dict:
+                               tracker=None, exclude_track_keys=None, progress=None) -> dict:
     """1候補分の自動追跡を実行し、記録済みフレーム機構へ流し込める矩形列を返す。
 
     ``tracker`` を渡すとその関数を使う（テスト用の差し替え口）。失敗時は必ず
     ``{"ok": False, "error": ...}`` を返し、呼び出し側は従来の手動フローへ戻す。
+    ``progress`` を渡すと、追跡を始める直前に窓の情報（フレーム範囲と所要時間の
+    目安）を1度だけ通知する。``track_overtaking`` 自体は進捗を通知しないため、
+    GUI側は以降を経過時間で表示する。
     """
     if pcap is None:
         return {"ok": False, "error": "先にPCAPを開いてください"}
@@ -346,6 +456,9 @@ def autotrack_candidate_frames(pcap, event: dict, offset: float, view: str = "",
               "first_frame": first, "last_frame": last}
     if last <= first:
         return {"ok": False, "error": "追跡窓に含まれるフレームが足りません", **window}
+    if progress is not None:
+        progress({"first_frame": first, "last_frame": last,
+                  "expected_seconds": estimate_autotrack_seconds(first, last)})
     options: dict = {}
     if _tracker_accepts(tracker, "expected_pass_time"):
         options["expected_pass_time"] = expected
@@ -379,6 +492,9 @@ class AppApi:
         self._lock = threading.Lock()
         self._process: subprocess.Popen | None = None
         self._pcap: VelodynePcap | None = None
+        # 進捗表示と中止に対応する重い処理（Step4の自動追跡・Step1の撮影方向判定）
+        self._autotrack_task = BackgroundTask("自動追跡")
+        self._view_task = BackgroundTask("撮影方向の自動判定")
         self._state = {
             "running": False, "progress": 0, "log": "", "message": "準備完了", "exit_code": None
         }
@@ -674,12 +790,125 @@ class AppApi:
             offset = float(payload.get("offset") or 0.0)
         except (TypeError, ValueError):
             offset = 0.0
-        result = autotrack_candidate_frames(
-            self._pcap, event, offset, str(payload.get("view") or ""),
-            exclude_track_keys=payload.get("exclude_track_keys"),
+        event_id = str(event.get("event_id", "") or "")
+        token = self._autotrack_task.start(
+            "点群を読み込んで車両を探しています",
+            {"event_id": event_id, "expected_seconds": 0.0},
         )
-        result["event_id"] = str(event.get("event_id", "") or "")
+        if not token:
+            snapshot = self._autotrack_task.snapshot()
+            return {"ok": False, "busy": True, "event_id": event_id, "error": (
+                "自動追跡がまだ実行中です（"
+                f"{snapshot['elapsed']:.0f}秒経過）。完了か中止をお待ちください"
+            )}
+        try:
+            result = autotrack_candidate_frames(
+                self._pcap, event, offset, str(payload.get("view") or ""),
+                exclude_track_keys=payload.get("exclude_track_keys"),
+                progress=lambda info: self._autotrack_task.note(
+                    "車両を追跡しています", **info),
+            )
+        except Exception as exc:  # noqa: BLE001 - ここで固まらせない（保険）
+            result = {"ok": False, "error": f"点群の自動追跡でエラー: {exc}"}
+        elapsed = round(self._autotrack_task.snapshot()["elapsed"], 1)
+        if not self._autotrack_task.finish(token):
+            # 中止済み。計算結果は捨てて、GUIは手動フローへ戻す
+            return {"ok": False, "cancelled": True, "token": token, "elapsed": elapsed,
+                    "event_id": event_id, "error": "自動追跡を中止しました"}
+        result["event_id"] = event_id
+        result["token"] = token
+        result["elapsed"] = elapsed
         return result
+
+    def get_auto_track_progress(self) -> dict:
+        """実行中の自動追跡の経過秒・目安時間を返す（GUIがポーリングする）。"""
+        return self._autotrack_task.snapshot()
+
+    def cancel_auto_track(self, token: int = 0) -> dict:
+        """自動追跡を中止する。
+
+        ``track_overtaking`` には中断の口が無いので計算自体は最後まで走るが、
+        結果は破棄されるためGUIは即座に手動フローへ戻れる。
+        """
+        try:
+            token = int(token or 0)
+        except (TypeError, ValueError):
+            token = 0
+        return self._autotrack_task.cancel(token)
+
+    def detect_view_auto(self, payload: dict | None = None) -> dict:
+        """開いているGoPro動画から撮影方向(front/rear)を自動判定する（Step1）。
+
+        背景オプティカルフローの放射方向で判定する ``detect_view`` を遅延importで
+        呼ぶ。判定不能・失敗のときは ``ok=False`` を返すだけで、GUIはラジオを
+        触らず手動選択のままにする。
+        """
+        payload = dict(payload or {})
+        videos = self._payload_videos(payload)
+        if not videos:
+            return {"ok": False, "error": "先にGoPro動画を追加してください"}
+        missing = [video.name for video in videos if not video.is_file()]
+        if missing:
+            return {"ok": False, "error": "動画が見つかりません: " + ", ".join(missing)}
+        detector, detect_error, load_error = load_view_detector()
+        if detector is None:
+            return {"ok": False, "error": load_error}
+        token = self._view_task.start(f"{len(videos)} 本の動画から背景の動きを測っています")
+        if not token:
+            return {"ok": False, "busy": True, "error": "撮影方向の判定がすでに実行中です"}
+
+        def progress(message) -> None:
+            self._view_task.raise_if_cancelled(token)
+            self._view_task.note(str(message).replace("[view] ", ""))
+
+        options: dict = {}
+        for key, cast in (("samples", int), ("sample_seconds", float)):
+            if payload.get(key) not in (None, ""):
+                try:
+                    options[key] = cast(payload[key])
+                except (TypeError, ValueError):
+                    pass
+        try:
+            with tempfile.TemporaryDirectory() as work_value:
+                result = detector(videos, Path(work_value), progress=progress, **options) or {}
+        except TaskCancelled:
+            self._view_task.finish(token)
+            return {"ok": False, "cancelled": True, "token": token,
+                    "error": "撮影方向の判定を中止しました"}
+        except detect_error as exc:
+            self._view_task.finish(token)
+            return {"ok": False, "token": token, "error": f"撮影方向を判定できません: {exc}"}
+        except Exception as exc:  # noqa: BLE001 - 判定の失敗でGUIを止めない
+            self._view_task.finish(token)
+            return {"ok": False, "token": token,
+                    "error": f"撮影方向の判定で予期しないエラー: {exc}"}
+        elapsed = round(self._view_task.snapshot()["elapsed"], 1)
+        if not self._view_task.finish(token):
+            return {"ok": False, "cancelled": True, "token": token, "elapsed": elapsed,
+                    "error": "撮影方向の判定を中止しました"}
+        detail = dict(result.get("detail") or {})
+        view = result.get("view")
+        common = {"token": token, "elapsed": elapsed, "reason": str(detail.get("reason") or ""),
+                  "radial_ratio": detail.get("radial_ratio"),
+                  "moving_pairs": detail.get("moving_pairs"),
+                  "samples_used": detail.get("samples_used")}
+        if view not in ("front", "rear"):
+            return {"ok": False, "undecided": True, "view": None,
+                    "leaning": detail.get("leaning"), **common, "error": (
+                        "撮影方向を判定できませんでした（背景の動きが足りません）。"
+                        "手動で前方／後方を選んでください")}
+        return {"ok": True, "view": str(view),
+                "confidence": float(result.get("confidence") or 0.0), **common}
+
+    def get_detect_view_progress(self) -> dict:
+        return self._view_task.snapshot()
+
+    def cancel_detect_view(self, token: int = 0) -> dict:
+        try:
+            token = int(token or 0)
+        except (TypeError, ValueError):
+            token = 0
+        return self._view_task.cancel(token)
 
     def export_lidar_roi(self, payload: dict) -> dict:
         if self._pcap is None:
@@ -958,6 +1187,70 @@ def check_autotrack_real_pcap() -> None:
         f"フレーム {result['first_frame']}〜{result['last_frame']} / "
         f"矩形 {len(frames)} 枚 / 確度 {result['confidence']} / "
         f"通過時刻 {result['pass_time']} / {elapsed:.1f}秒"
+    )
+
+    # 進捗表示と中止（実データ）。中止は即座に返り、走り切った結果は破棄される。
+    box: dict = {}
+    worker = threading.Thread(
+        target=lambda: box.update(result=api.auto_track_candidate(
+            {"event": event, "offset": offset, "view": view})),
+        daemon=True,
+    )
+    worker.start()
+    progress: dict = {}
+    for _ in range(100):
+        progress = api.get_auto_track_progress()
+        if progress["running"] and progress.get("expected_seconds"):
+            break
+        time.sleep(0.05)
+    assert progress.get("running") and progress.get("expected_seconds"), progress
+    assert progress["message"] and progress["event_id"] == result["event_id"], progress
+    busy = api.auto_track_candidate({"event": event, "offset": offset, "view": view})
+    assert busy["ok"] is False and busy.get("busy") is True, busy
+    time.sleep(0.5)
+    later = api.get_auto_track_progress()
+    assert later["running"] and later["elapsed"] > progress["elapsed"], (progress, later)
+    cancel_started = time.perf_counter()
+    cancelled = api.cancel_auto_track(progress["token"])
+    cancel_elapsed = time.perf_counter() - cancel_started
+    assert cancelled["ok"] and cancel_elapsed < 0.2, (cancelled, cancel_elapsed)
+    worker.join(120)
+    assert not worker.is_alive(), "自動追跡スレッドが終了しません"
+    assert box["result"]["ok"] is False and box["result"]["cancelled"] is True, box
+    assert api.get_auto_track_progress()["running"] is False
+    print(
+        f"実PCAP中止スモークOK: 進捗 {later['elapsed']:.1f}秒経過 / "
+        f"目安 {later['expected_seconds']:.1f}秒 / "
+        f"中止応答 {cancel_elapsed * 1000:.0f}ms（結果は破棄）"
+    )
+
+
+def check_detect_view_real_video() -> None:
+    """実動画に対する ``detect_view_auto`` のスモークテスト（任意実行）。
+
+        WEBGUI_DETECT_VIEW_VIDEO  … 対象動画（必須。未設定ならこの検査は省略）。
+                                    複数本は ``os.pathsep``（Windowsは ;）で区切る
+        WEBGUI_DETECT_VIEW_EXPECT … 期待する方向 front / rear（指定時のみ照合）
+    """
+    raw = os.environ.get("WEBGUI_DETECT_VIEW_VIDEO", "").strip()
+    if not raw:
+        return
+    videos = [Path(value).expanduser() for value in raw.split(os.pathsep) if value.strip()]
+    for video in videos:
+        assert video.is_file(), f"動画が見つかりません: {video}"
+    api = AppApi()
+    started = time.perf_counter()
+    result = api.detect_view_auto({"videos": [str(video) for video in videos]})
+    elapsed = time.perf_counter() - started
+    assert result["ok"], result
+    assert result["view"] in ("front", "rear") and result["confidence"] > 0, result
+    expected = os.environ.get("WEBGUI_DETECT_VIEW_EXPECT", "").strip().lower()
+    if expected:
+        assert result["view"] == expected, (result, expected)
+    assert api.get_detect_view_progress()["running"] is False
+    print(
+        f"実動画の撮影方向スモークOK: {result['view']} / 確信度 {result['confidence']:.2f} / "
+        f"{elapsed:.1f}秒 / {result['reason']}"
     )
 
 
@@ -1280,7 +1573,196 @@ def run_check() -> None:
     assert "$('recordAutoTrack').addEventListener('click',autoTrackCandidate);" in app_js
     assert "async auto_track_candidate()" in app_js  # デモ(ブラウザ)用スタブ
 
+    # ── 自動追跡の進捗表示と中止 ───────────────────────────────────────────
+    assert estimate_autotrack_seconds(100, 100) == AUTOTRACK_MIN_ESTIMATE
+    assert estimate_autotrack_seconds(0, 199) == round(200 * AUTOTRACK_SECONDS_PER_FRAME, 1)
+    # 進捗フックは追跡開始の直前に窓の情報を1度だけ通知する
+    notes: list[dict] = []
+    autotrack_candidate_frames(_FakePcap(), sample_event, -58.827, "front",
+                               tracker=fake_tracker, progress=notes.append)
+    assert notes == [{"first_frame": 332, "last_frame": 482,
+                      "expected_seconds": estimate_autotrack_seconds(332, 482)}], notes
+    # 窓が範囲外なら追跡を始めないので進捗の通知も出ない
+    notes.clear()
+    autotrack_candidate_frames(_FakePcap(), sample_event, -500.0, "front",
+                               tracker=fake_tracker, progress=notes.append)
+    assert notes == [], notes
+
+    task = BackgroundTask("試験")
+    assert task.snapshot()["running"] is False
+    token = task.start("開始しました", {"event_id": "007"})
+    assert token == 1 and task.start("二重起動") == 0
+    task.note("追跡しています", expected_seconds=12.5)
+    running = task.snapshot()
+    assert running["running"] and running["message"] == "追跡しています", running
+    assert running["expected_seconds"] == 12.5 and running["event_id"] == "007", running
+    assert running["elapsed"] >= 0.0 and running["cancelled"] is False, running
+    assert task.cancelled(token) is False
+    assert task.cancel(token + 5)["ok"] is False       # 別ジョブの中止は効かない
+    assert task.cancel(token)["ok"] is True and task.cancelled(token) is True
+    assert task.finish(token) is False                 # 中止済みなので結果は捨てる
+    assert task.snapshot()["running"] is False
+    assert task.cancel(0)["ok"] is False               # 実行中でなければ何もしない
+    token2 = task.start("次のジョブ")
+    assert token2 == token + 1 and task.finish(token2) is True
+    try:
+        token3 = task.start("中断できる処理")
+        task.cancel(token3)
+        task.raise_if_cancelled(token3)
+        raise AssertionError("TaskCancelled が送出されません")
+    except TaskCancelled:
+        task.finish(token3)
+
+    # 実行中の自動追跡は進捗を返し、中止すると結果を捨てて即座にGUIを解放する
+    idle = AppApi()
+    assert idle.get_auto_track_progress()["running"] is False
+    assert idle.cancel_auto_track()["ok"] is False
+    assert idle.get_detect_view_progress()["running"] is False
+    assert idle.cancel_detect_view()["ok"] is False
+
+    api_check = AppApi()
+    api_check._pcap = _FakePcap()
+    entered = threading.Event()
+
+    def slow_tracker(pcap, first, last, side="right", **_kwargs):
+        entered.set()
+        time.sleep(0.5)
+        return {"ok": True, "frames": [{"index": first + 1, "bounds": {
+            "min_x": 1.0, "max_x": 2.0, "min_y": 3.0, "max_y": 4.0}}],
+            "confidence": 0.7, "track_key": "slow"}
+
+    original_loader = globals()["load_autotracker"]
+    globals()["load_autotracker"] = lambda: (slow_tracker, "")
+    try:
+        box: dict = {}
+        worker = threading.Thread(target=lambda: box.update(result=api_check.auto_track_candidate(
+            {"event": sample_event, "offset": -58.827, "view": "front"})), daemon=True)
+        worker.start()
+        assert entered.wait(5.0), "自動追跡が始まりません"
+        snapshot = api_check.get_auto_track_progress()
+        assert snapshot["running"] and snapshot["event_id"] == "007", snapshot
+        assert snapshot["expected_seconds"] == estimate_autotrack_seconds(332, 482), snapshot
+        # 実行中の二重起動は弾く（中止か完了を待つ）
+        busy = api_check.auto_track_candidate({"event": sample_event})
+        assert busy["ok"] is False and busy.get("busy") is True, busy
+        cancel_started = time.perf_counter()
+        cancelled = api_check.cancel_auto_track(snapshot["token"])
+        assert cancelled["ok"] and time.perf_counter() - cancel_started < 0.2, cancelled
+        worker.join(10)
+        assert box["result"]["ok"] is False and box["result"]["cancelled"] is True, box
+        assert api_check.get_auto_track_progress()["running"] is False
+        # 中止後もそのまま次の候補を自動追跡できる
+        retried = api_check.auto_track_candidate(
+            {"event": sample_event, "offset": -58.827, "view": "front"})
+        assert retried["ok"] and retried["token"] == snapshot["token"] + 1, retried
+        assert retried["elapsed"] >= 0.0 and retried["event_id"] == "007", retried
+    finally:
+        globals()["load_autotracker"] = original_loader
+
+    # ── Step1 撮影方向の自動判定 ──────────────────────────────────────────
+    assert 'id="detectView"' in index_html and 'id="detectViewStatus"' in index_html
+    assert 'id="detectViewCancel"' in index_html
+    assert index_html.index('name="view"') < index_html.index('id="detectView"')
+    assert index_html.index('id="detectView"') < index_html.index('id="startDetection"')
+    assert 'id="autoTrackCancel"' in index_html and 'id="autoTrackProgress"' in index_html
+    assert index_html.index('id="recordAutoTrack"') < index_html.index('id="autoTrackCancel"')
+    assert "async function autoDetectView()" in app_js
+    assert "api().detect_view_auto(" in app_js
+    assert "async function pollAutoTrack(run)" in app_js
+    assert "api().get_auto_track_progress?.()" in app_js
+    assert "api().cancel_auto_track?.(" in app_js
+    assert "api().get_detect_view_progress?.()" in app_js
+    assert "api().cancel_detect_view?.(" in app_js
+    assert "$('autoTrackCancel').addEventListener('click',cancelAutoTrack);" in app_js
+    assert "$('detectView').addEventListener('click', autoDetectView);" in app_js
+    assert "async detect_view_auto()" in app_js          # デモ(ブラウザ)用スタブ
+    assert "async get_auto_track_progress()" in app_js
+    # 判定成功時だけラジオへ反映する（失敗時は手動選択のまま）
+    assert 'const radio = document.querySelector(`[name=view][value="${result.view}"]`);' in app_js
+
+    detector, detect_error, load_error = load_view_detector()
+    assert callable(detector) and issubclass(detect_error, Exception), load_error
+
+    view_api = AppApi()
+    assert view_api.detect_view_auto({})["ok"] is False           # 動画未選択
+    assert "動画" in view_api.detect_view_auto({})["error"]
+    missing = view_api.detect_view_auto({"videos": [str(APP_DIR / "no-such-movie.mp4")]})
+    assert missing["ok"] is False and "見つかりません" in missing["error"], missing
+
+    with tempfile.TemporaryDirectory() as temp_value:
+        movie = Path(temp_value) / "GX010001.MP4"
+        movie.write_bytes(b"dummy")
+        seen: list[str] = []
+
+        def fake_detector(videos, work_dir, progress=None, **kwargs):
+            assert [Path(v).name for v in videos] == ["GX010001.MP4"], videos
+            if progress:
+                progress("[view] サンプル1: 放射成分 +0.62")
+            seen.append("done")
+            return {"view": "front", "confidence": 0.97,
+                    "detail": {"reason": "背景フローは外向き", "radial_ratio": 0.62,
+                               "moving_pairs": 120, "samples_used": 1}}
+
+        def undecided_detector(videos, work_dir, progress=None, **kwargs):
+            return {"view": None, "confidence": 0.0,
+                    "detail": {"reason": "判定材料不足", "leaning": "front"}}
+
+        def broken_detector(videos, work_dir, progress=None, **kwargs):
+            raise RuntimeError("cv2が壊れています")
+
+        def slow_detector(videos, work_dir, progress=None, **kwargs):
+            for _ in range(200):
+                if progress:
+                    progress("[view] 測定中")
+                time.sleep(0.02)
+            return {"view": "rear", "confidence": 0.9, "detail": {"reason": "測り切った"}}
+
+        original_view_loader = globals()["load_view_detector"]
+        try:
+            payload = {"videos": [str(movie)]}
+            globals()["load_view_detector"] = lambda: (fake_detector, RuntimeError, "")
+            decided = view_api.detect_view_auto(payload)
+            assert decided["ok"] and decided["view"] == "front", decided
+            assert decided["confidence"] == 0.97 and seen == ["done"], decided
+            assert decided["reason"] == "背景フローは外向き" and decided["elapsed"] >= 0.0, decided
+            assert view_api.get_detect_view_progress()["running"] is False
+
+            globals()["load_view_detector"] = lambda: (undecided_detector, RuntimeError, "")
+            undecided = view_api.detect_view_auto(payload)
+            assert undecided["ok"] is False and undecided["undecided"] is True, undecided
+            assert undecided["view"] is None and undecided["leaning"] == "front", undecided
+
+            globals()["load_view_detector"] = lambda: (broken_detector, ValueError, "")
+            broken_view = view_api.detect_view_auto(payload)
+            assert broken_view["ok"] is False and "cv2が壊れています" in broken_view["error"], broken_view
+
+            globals()["load_view_detector"] = lambda: (None, None, "detect_view を読み込めません: 試験")
+            unavailable = view_api.detect_view_auto(payload)
+            assert unavailable["ok"] is False and "読み込めません" in unavailable["error"], unavailable
+
+            # 中止は progress コールバックで協調的に効く（測定を打ち切る）
+            globals()["load_view_detector"] = lambda: (slow_detector, RuntimeError, "")
+            view_box: dict = {}
+            view_worker = threading.Thread(
+                target=lambda: view_box.update(result=view_api.detect_view_auto(payload)),
+                daemon=True)
+            view_worker.start()
+            for _ in range(100):
+                view_progress = view_api.get_detect_view_progress()
+                if view_progress["running"] and view_progress["message"]:
+                    break
+                time.sleep(0.02)
+            assert view_progress["running"] and "測定中" in view_progress["message"], view_progress
+            assert view_api.cancel_detect_view(view_progress["token"])["ok"] is True
+            view_worker.join(10)
+            assert view_box["result"]["ok"] is False, view_box
+            assert view_box["result"]["cancelled"] is True, view_box
+            assert view_api.get_detect_view_progress()["running"] is False
+        finally:
+            globals()["load_view_detector"] = original_view_loader
+
     check_autotrack_real_pcap()
+    check_detect_view_real_video()
     print("Web GUI check OK")
 
 
@@ -1335,13 +1817,24 @@ def run_ui_smoke(api: AppApi, server: UiServer, url: str) -> None:
                 (() => {
                   goStep('lidar');
                   window.__realApi = window.pywebview.api;
+                  window.__progressCalls = 0;
                   window.pywebview.api = {
                     async auto_track_candidate(payload) {
                       window.__autoTrackPayload = payload;
+                      if (window.__slowAutoTrack) await new Promise(r => setTimeout(r, 900));
                       return { ok:true, event_id:'001', first_frame:4, last_frame:9,
-                        confidence:0.91, warnings:[], track_key:'trk-1', pass_time:43.2,
+                        confidence:0.91, warnings:[], track_key:'trk-1', pass_time:43.2, elapsed:1.4,
                         frames:[{index:5, bounds:{min_x:1, max_x:2, min_y:3, max_y:4}},
                                 {index:6, bounds:{min_x:1.1, max_x:2.1, min_y:3.1, max_y:4.1}}] };
+                    },
+                    async get_auto_track_progress() {
+                      window.__progressCalls += 1;
+                      return { ok:true, running:true, token:7, elapsed:1.5, expected_seconds:13.5,
+                        message:'車両を追跡しています', event_id:'001' };
+                    },
+                    async cancel_auto_track(token) {
+                      window.__cancelToken = token;
+                      return { ok:true, running:true, cancelled:true, token };
                     },
                     async get_lidar_frame(index) { return { ok:true, timestamp:index*0.1, points:[] }; },
                     async seek_lidar_time(seconds) { return { ok:true, index:5 }; }
@@ -1370,7 +1863,104 @@ def run_ui_smoke(api: AppApi, server: UiServer, url: str) -> None:
                 if auto != "pending":
                     break
             result_box["auto"] = auto
-            window.evaluate_js("window.pywebview.api = window.__realApi; 'restored'")
+
+            # 中止: 走り切った結果を捨てて手動フローへ戻し、ボタンを解放する
+            window.evaluate_js("""
+                (() => {
+                  recordCancel();
+                  window.__slowAutoTrack = true;
+                  state.events = [{event_id:'002', class:'普通', t_start_s:'100', peak_t_s:'102', t_end_s:'104', review_status:'未確認'}];
+                  renderMapped();
+                  document.getElementById('recordCandidate').value = '0';
+                  window.__cancelCase = 'pending';
+                  autoTrackCandidate().then(() => {
+                    window.__cancelCase = { active:state.record.active, frames:state.record.frames.size,
+                      status:document.getElementById('autoTrackStatus').textContent,
+                      buttonDisabled:document.getElementById('recordAutoTrack').disabled,
+                      cancelHidden:document.getElementById('autoTrackCancel').hidden,
+                      progressBarHidden:document.getElementById('autoTrackProgress').hidden,
+                      progressCalls:window.__progressCalls, cancelToken:window.__cancelToken,
+                      trackKey:state.autoTrackKeys.get('002') || '' };
+                  }).catch(err => { window.__cancelCase = { error:String(err) }; });
+                  setTimeout(() => {
+                    window.__whileRunning = { status:document.getElementById('autoTrackStatus').textContent,
+                      buttonDisabled:document.getElementById('recordAutoTrack').disabled,
+                      cancelHidden:document.getElementById('autoTrackCancel').hidden };
+                    document.getElementById('autoTrackCancel').click();
+                  }, 400);
+                  return 'started';
+                })()
+            """)
+            cancel_case = "pending"
+            for _ in range(60):
+                time.sleep(0.1)
+                cancel_case = window.evaluate_js("window.__cancelCase")
+                if cancel_case != "pending":
+                    break
+            result_box["cancel"] = cancel_case
+            result_box["while_running"] = window.evaluate_js("window.__whileRunning")
+
+            # Step1 撮影方向の自動判定
+            window.evaluate_js("""
+                (() => {
+                  goStep('detect');
+                  window.pywebview.api = Object.assign({}, window.pywebview.api, {
+                    async detect_view_auto(payload) {
+                      window.__viewPayload = payload;
+                      return { ok:true, view:'front', confidence:0.99, elapsed:1.3,
+                        reason:'背景フローは外向き', radial_ratio:0.62 };
+                    },
+                    async get_detect_view_progress() {
+                      return { ok:true, running:true, token:3, elapsed:0.5, message:'背景の動きを測っています' };
+                    },
+                    async save_settings() { return { ok:true }; }
+                  });
+                  state.videos = ['C:/dummy/GX010001.MP4'];
+                  document.querySelector('[name=view][value="rear"]').checked = true;
+                  window.__viewCase = 'pending';
+                  autoDetectView().then(() => {
+                    const button = document.getElementById('detectView').getBoundingClientRect();
+                    const field = document.getElementById('detectView').closest('fieldset').getBoundingClientRect();
+                    window.__viewCase = { checked:document.querySelector('[name=view]:checked').value,
+                      layout:{ width:button.width, height:button.height,
+                        inside: button.right <= field.right + 0.5 && button.bottom <= field.bottom + 0.5 },
+                      status:document.getElementById('detectViewStatus').textContent,
+                      buttonDisabled:document.getElementById('detectView').disabled,
+                      cancelHidden:document.getElementById('detectViewCancel').hidden,
+                      payload:window.__viewPayload };
+                  }).catch(err => { window.__viewCase = { error:String(err) }; });
+                  return 'started';
+                })()
+            """)
+            view_case = "pending"
+            for _ in range(60):
+                time.sleep(0.1)
+                view_case = window.evaluate_js("window.__viewCase")
+                if view_case != "pending":
+                    break
+            result_box["view"] = view_case
+
+            # 差し替えを戻し、新しいAPIが本物のjs_apiブリッジ越しに呼べることを見る
+            window.evaluate_js("""
+                (() => {
+                  window.pywebview.api = window.__realApi;
+                  window.__bridge = 'pending';
+                  Promise.all([
+                    api().get_auto_track_progress(), api().cancel_auto_track(0),
+                    api().get_detect_view_progress(), api().cancel_detect_view(0),
+                    api().detect_view_auto({videos: []})
+                  ]).then(values => { window.__bridge = values; })
+                    .catch(err => { window.__bridge = { error:String(err) }; });
+                  return 'started';
+                })()
+            """)
+            bridge = "pending"
+            for _ in range(60):
+                time.sleep(0.1)
+                bridge = window.evaluate_js("window.__bridge")
+                if bridge != "pending":
+                    break
+            result_box["bridge"] = bridge
         except Exception as exc:
             result_box["error"] = repr(exc)
         finally:
@@ -1398,6 +1988,37 @@ def run_ui_smoke(api: AppApi, server: UiServer, url: str) -> None:
     payload = auto.get("payload") or {}
     assert payload.get("offset") == -58.827 and payload.get("view") in ("front", "rear"), payload
     assert (payload.get("event") or {}).get("event_id") == "001", payload
+
+    # 実行中は経過秒を表示し、中止ボタンを出してボタンを二重押しさせない
+    while_running = result_box.get("while_running") or {}
+    assert while_running.get("buttonDisabled") is True, while_running
+    assert while_running.get("cancelHidden") is False, while_running
+    assert "秒経過" in (while_running.get("status") or ""), while_running
+    # 中止したら、あとから返ってきた結果は捨てて手動フローのまま残す
+    cancel_case = result_box.get("cancel") or {}
+    assert cancel_case.get("active") is False and cancel_case.get("frames") == 0, cancel_case
+    assert cancel_case.get("trackKey") == "", cancel_case
+    assert "中止" in (cancel_case.get("status") or ""), cancel_case
+    assert cancel_case.get("buttonDisabled") is False, cancel_case
+    assert cancel_case.get("cancelHidden") is True, cancel_case
+    assert cancel_case.get("progressBarHidden") is True, cancel_case
+    assert cancel_case.get("progressCalls", 0) >= 1, cancel_case
+    assert cancel_case.get("cancelToken") == 7, cancel_case
+    # Step1 撮影方向の自動判定はラジオへ反映される
+    view_case = result_box.get("view") or {}
+    assert view_case.get("checked") == "front", view_case
+    assert "前方" in (view_case.get("status") or "") and "0.99" in (view_case.get("status") or ""), view_case
+    assert view_case.get("buttonDisabled") is False and view_case.get("cancelHidden") is True, view_case
+    assert (view_case.get("payload") or {}).get("videos") == ["C:/dummy/GX010001.MP4"], view_case
+    layout = view_case.get("layout") or {}
+    assert layout.get("width", 0) > 0 and layout.get("height", 0) > 0, layout
+    assert layout.get("inside") is True, layout      # カメラ方向の枠から食み出さない
+    # 本物の js_api ブリッジ越しでも新しいAPIが呼べる（引数の受け渡しを含む）
+    bridge = result_box.get("bridge")
+    assert isinstance(bridge, list) and len(bridge) == 5, bridge
+    assert bridge[0]["running"] is False and bridge[1]["ok"] is False, bridge
+    assert bridge[2]["running"] is False and bridge[3]["ok"] is False, bridge
+    assert bridge[4]["ok"] is False and "動画" in bridge[4]["error"], bridge
     print("WebView review UI smoke test OK")
 
 
