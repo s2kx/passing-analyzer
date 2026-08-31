@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import mimetypes
 import os
@@ -236,6 +237,138 @@ def save_reviewed_events(out_dir: Path, events: list[dict], offset: float,
             row["veloview_t_end"] = format_timecode(float(row.get("t_end_s", 0)) + offset)
             writer.writerow(row)
     return path
+
+
+# ── 点群の自動追跡（半自動モード） ───────────────────────────────────────────
+# 追跡窓のマージン（秒）。run_pipeline.VIEW_TRACK_MARGINS と同じ値。run_pipeline が
+# web_gui を import しているため循環を避けてここに複製し、値のずれは run_check で
+# run_pipeline.py の記述と突き合わせて検出する。
+AUTOTRACK_VIEW_MARGINS = {"front": (8.0, 3.0), "rear": (3.0, 8.0)}
+# 撮影方向が未確定のときは、非対称マージンの向きを誤ると接近または離脱の区間が
+# 窓から切れるため、両側とも広い方の値で対称に取る。
+AUTOTRACK_FALLBACK_MARGIN = 8.0
+
+
+def autotrack_margins(view: str) -> tuple[float, float]:
+    """撮影方向から追跡窓の (開始側, 終了側) マージン秒を返す。"""
+    return AUTOTRACK_VIEW_MARGINS.get(
+        str(view or "").strip().lower(),
+        (AUTOTRACK_FALLBACK_MARGIN, AUTOTRACK_FALLBACK_MARGIN),
+    )
+
+
+def event_seconds(event: dict, key: str, fallback_key: str = "peak_t_s") -> float:
+    """候補CSVの秒フィールドを取り出す（空欄なら fallback_key）。app.js と同じ規則。"""
+    for name in (key, fallback_key):
+        raw = event.get(name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def autotrack_window(event: dict, offset: float, view: str) -> tuple[float, float, float]:
+    """候補1件の (追跡窓の開始秒, 終了秒, 期待通過時刻) を pcap 相対秒で返す。
+
+    ``offset`` は ``pcap時刻 = gopro時刻 + offset``（Step 3 のGPS同期で求まる値）。
+    """
+    start_margin, end_margin = autotrack_margins(view)
+    start_s = event_seconds(event, "t_start_s") + offset - start_margin
+    end_s = event_seconds(event, "t_end_s") + offset + end_margin
+    if end_s < start_s:
+        start_s, end_s = end_s, start_s
+    expected = event_seconds(event, "peak_t_s", "t_start_s") + offset
+    return start_s, end_s, expected
+
+
+def load_autotracker():
+    """``lidar_autotrack.track_overtaking`` を遅延importする。
+
+    GUI起動時に numpy などを巻き込まないよう、また当モジュールが欠けていても
+    手動フローは動かせるよう、import は使う直前に行い失敗は文字列で返す。
+    """
+    try:
+        from lidar_autotrack import track_overtaking
+    except Exception as exc:  # noqa: BLE001 - 壊れていてもGUIは動かし続ける
+        return None, f"lidar_autotrack を読み込めません: {exc}"
+    return track_overtaking, ""
+
+
+def _tracker_accepts(tracker, name: str) -> bool:
+    """プラグインが指定の任意引数を受け取れるか調べる（後方互換のため）。"""
+    try:
+        return name in inspect.signature(tracker).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_track_frames(raw) -> list[dict]:
+    """``track_overtaking`` の frames をGUI／JSON安全な形へ正規化する。"""
+    frames: list[dict] = []
+    for item in raw or []:
+        try:
+            index = int(item["index"])
+            bounds = item.get("bounds") or {}
+            box = {key: float(bounds[key]) for key in ("min_x", "max_x", "min_y", "max_y")}
+        except (KeyError, TypeError, ValueError):
+            continue
+        frames.append({"index": index, "bounds": box})
+    frames.sort(key=lambda frame: frame["index"])
+    return frames
+
+
+def autotrack_candidate_frames(pcap, event: dict, offset: float, view: str = "",
+                               tracker=None, exclude_track_keys=None) -> dict:
+    """1候補分の自動追跡を実行し、記録済みフレーム機構へ流し込める矩形列を返す。
+
+    ``tracker`` を渡すとその関数を使う（テスト用の差し替え口）。失敗時は必ず
+    ``{"ok": False, "error": ...}`` を返し、呼び出し側は従来の手動フローへ戻す。
+    """
+    if pcap is None:
+        return {"ok": False, "error": "先にPCAPを開いてください"}
+    if tracker is None:
+        tracker, load_error = load_autotracker()
+        if tracker is None:
+            return {"ok": False, "error": load_error}
+    start_s, end_s, expected = autotrack_window(event, offset, view)
+    duration = float(getattr(pcap, "duration", 0.0) or 0.0)
+    if end_s < 0 or start_s > duration:
+        return {"ok": False, "error": (
+            f"追跡窓 {start_s:.1f}〜{end_s:.1f}秒 がPCAPの収録範囲"
+            f"(0〜{duration:.1f}秒)から外れています。時刻オフセットを確認してください"
+        )}
+    first = int(pcap.nearest_frame(start_s))
+    last = int(pcap.nearest_frame(end_s))
+    window = {"start_s": start_s, "end_s": end_s, "expected_pass_time": expected,
+              "first_frame": first, "last_frame": last}
+    if last <= first:
+        return {"ok": False, "error": "追跡窓に含まれるフレームが足りません", **window}
+    options: dict = {}
+    if _tracker_accepts(tracker, "expected_pass_time"):
+        options["expected_pass_time"] = expected
+    if exclude_track_keys and _tracker_accepts(tracker, "exclude_track_keys"):
+        options["exclude_track_keys"] = [str(key) for key in exclude_track_keys if str(key)]
+    try:
+        # 通過側は日本では常に右(+X)。検出CSVの side 列はカメラの見え方
+        # (front=left / rear=right) であって物理的な通過側ではないため渡さない。
+        result = tracker(pcap, first, last, side="right", **options) or {}
+    except Exception as exc:  # noqa: BLE001 - 自動追跡の失敗でGUIを固めない
+        return {"ok": False, "error": f"点群の自動追跡でエラー: {exc}", **window}
+    warnings = [str(item) for item in (result.get("warnings") or [])]
+    frames = normalize_track_frames(result.get("frames"))
+    if not result.get("ok") or not frames:
+        return {"ok": False, "warnings": warnings, **window, "error":
+                "追い越し車両を自動で見つけられませんでした。手動で矩形を選択してください"}
+    pass_time = result.get("pass_time")
+    return {
+        "ok": True, "frames": frames, "warnings": warnings, **window,
+        "confidence": float(result.get("confidence") or 0.0),
+        "pass_time": None if pass_time is None else float(pass_time),
+        "track_key": None if result.get("track_key") is None else str(result["track_key"]),
+    }
 
 
 class AppApi:
@@ -516,6 +649,38 @@ class AppApi:
             return {"ok": False, "error": "先にPCAPを開いてください"}
         return {"ok": True, "index": self._pcap.nearest_frame(float(seconds))}
 
+    def auto_track_candidate(self, payload: dict) -> dict:
+        """開いているPCAPで候補の車両を自動追跡し、フレーム別の矩形を返す（半自動モード）。
+
+        GUIは返った ``frames`` を「記録済みフレーム」の初期値として取り込み、人が
+        点群ビュー上で微修正してから ``export_overtaking`` で出力する。
+        ``ok=False`` のときはGUI側が従来の手動フローへ戻す。
+
+        payload::
+
+            {"event": {"event_id", "t_start_s", "peak_t_s", "t_end_s"},
+             "offset": float,           # pcap時刻 = gopro時刻 + offset
+             "view": "front" | "rear",  # 未指定なら前後対称の広い窓
+             "exclude_track_keys": [str]}  # 他候補へ割り当て済みの車両
+        """
+        payload = dict(payload or {})
+        if self._pcap is None:
+            return {"ok": False, "error": "先にPCAPを開いてください"}
+        event = dict(payload.get("event") or {})
+        if not event:
+            event = {key: payload.get(key)
+                     for key in ("event_id", "t_start_s", "peak_t_s", "t_end_s")}
+        try:
+            offset = float(payload.get("offset") or 0.0)
+        except (TypeError, ValueError):
+            offset = 0.0
+        result = autotrack_candidate_frames(
+            self._pcap, event, offset, str(payload.get("view") or ""),
+            exclude_track_keys=payload.get("exclude_track_keys"),
+        )
+        result["event_id"] = str(event.get("event_id", "") or "")
+        return result
+
     def export_lidar_roi(self, payload: dict) -> dict:
         if self._pcap is None:
             return {"ok": False, "error": "先にPCAPを開いてください"}
@@ -737,6 +902,65 @@ def start_server(api: AppApi, port: int = 0) -> tuple[UiServer, str]:
     return server, base_url
 
 
+def check_autotrack_real_pcap() -> None:
+    """実PCAPに対する ``auto_track_candidate`` のスモークテスト（任意実行）。
+
+    実データはリポジトリに置けないので、環境変数で指示されたときだけ走らせる::
+
+        WEBGUI_AUTOTRACK_PCAP    … 対象PCAP（必須。未設定ならこの検査は省略）
+        WEBGUI_AUTOTRACK_EVENTS  … overtaking_events.csv（候補の時刻をここから取る）
+        WEBGUI_AUTOTRACK_EVENT_ID… 使う候補のID（既定: CSVの先頭）
+        WEBGUI_AUTOTRACK_OFFSET  … 時刻オフセット秒（pcap時刻 = gopro時刻 + offset）
+        WEBGUI_AUTOTRACK_VIEW    … front / rear（既定 front）
+        WEBGUI_AUTOTRACK_START / _PEAK / _END … CSVを使わず時刻を直接指定する場合
+    """
+    pcap_value = os.environ.get("WEBGUI_AUTOTRACK_PCAP", "").strip()
+    if not pcap_value:
+        return
+    pcap_path = Path(pcap_value).expanduser()
+    assert pcap_path.is_file(), f"PCAPが見つかりません: {pcap_path}"
+    offset = float(os.environ.get("WEBGUI_AUTOTRACK_OFFSET", "0") or 0)
+    view = os.environ.get("WEBGUI_AUTOTRACK_VIEW", "front").strip()
+    events_value = os.environ.get("WEBGUI_AUTOTRACK_EVENTS", "").strip()
+    if events_value:
+        events = read_events_csv(Path(events_value).expanduser(), {}, "")
+        assert events, f"候補がありません: {events_value}"
+        wanted = os.environ.get("WEBGUI_AUTOTRACK_EVENT_ID", "").strip()
+        event = next((e for e in events if str(e.get("event_id")) == wanted), events[0]) if wanted else events[0]
+    else:
+        event = {
+            "event_id": os.environ.get("WEBGUI_AUTOTRACK_EVENT_ID", "smoke"),
+            "t_start_s": os.environ.get("WEBGUI_AUTOTRACK_START", "0"),
+            "peak_t_s": os.environ.get("WEBGUI_AUTOTRACK_PEAK", "0"),
+            "t_end_s": os.environ.get("WEBGUI_AUTOTRACK_END", "0"),
+        }
+    api = AppApi()
+    opened = api.open_pcap(str(pcap_path))
+    assert opened["ok"], opened
+    started = time.perf_counter()
+    result = api.auto_track_candidate({"event": event, "offset": offset, "view": view})
+    elapsed = time.perf_counter() - started
+    assert result["ok"], result
+    frames = result["frames"]
+    assert frames and all(
+        set(frame["bounds"]) == {"min_x", "max_x", "min_y", "max_y"} for frame in frames
+    ), result
+    assert result["first_frame"] <= frames[0]["index"] <= frames[-1]["index"] <= result["last_frame"], result
+    # 返った矩形がそのまま記録済みフレーム機構（export_overtaking）へ渡せることを確認する。
+    with tempfile.TemporaryDirectory() as temp_value:
+        path, count, written, points = api._pcap.export_overtaking(
+            Path(temp_value), event.get("event_id", "smoke"), frames,
+        )
+        assert path.is_file() and count == len(frames) and written > 0 and points > 0, (
+            path, count, written, points)
+    print(
+        f"実PCAP自動追跡スモークOK: 候補 {result['event_id']} / "
+        f"フレーム {result['first_frame']}〜{result['last_frame']} / "
+        f"矩形 {len(frames)} 枚 / 確度 {result['confidence']} / "
+        f"通過時刻 {result['pass_time']} / {elapsed:.1f}秒"
+    )
+
+
 def run_check() -> None:
     from gpmf_sync import offset_from_unix_starts
 
@@ -955,6 +1179,108 @@ def run_check() -> None:
         assert _vehicle_speed_kmh(18.36, 10.35) == 28.71
         assert 'sqref="G2:G51"' in sheet_xml, sheet_xml
         assert 'sqref="R2:R51"' in sheet_xml, sheet_xml
+    # Step4 半自動モード: 追跡窓の組み立てと track_overtaking プラグインの扱い。
+    assert autotrack_margins("front") == (8.0, 3.0)
+    assert autotrack_margins("rear") == (3.0, 8.0)
+    # 撮影方向が未確定なら前後対称の広い窓（run_pipeline の fallback と同じ考え方）
+    assert autotrack_margins("") == (8.0, 8.0)
+    assert autotrack_margins("unknown") == (8.0, 8.0)
+    # run_pipeline 側の値と食い違ったら気付けるようにソースを突き合わせる
+    pipeline_source = (APP_DIR / "run_pipeline.py").read_text(encoding="utf-8")
+    margins_line = re.search(r"^VIEW_TRACK_MARGINS = (.+)$", pipeline_source, re.MULTILINE)
+    assert margins_line and eval(margins_line.group(1)) == AUTOTRACK_VIEW_MARGINS, margins_line
+
+    sample_event = {"event_id": "007", "t_start_s": "100", "peak_t_s": "102", "t_end_s": "104"}
+    assert autotrack_window(sample_event, -58.827, "front") == (33.173, 48.173, 43.173)
+    assert autotrack_window(sample_event, 0.0, "rear") == (97.0, 112.0, 102.0)
+    assert autotrack_window(sample_event, 0.0, "") == (92.0, 112.0, 102.0)
+    # 空欄の時刻は peak_t_s で埋める（app.js の eventSeconds と同じ規則）
+    assert autotrack_window({"t_start_s": "", "peak_t_s": "50", "t_end_s": ""}, 0.0, "front") == (42.0, 53.0, 50.0)
+    assert event_seconds({"t_end_s": "x", "peak_t_s": "3"}, "t_end_s") == 3.0
+    assert normalize_track_frames([
+        {"index": "2", "bounds": {"min_x": "1", "max_x": 2, "min_y": 3, "max_y": 4}},
+        {"index": 1, "bounds": {"min_x": 0, "max_x": 1, "min_y": 2, "max_y": 3}},
+        {"index": 3, "bounds": {"min_x": 0}},   # 壊れた矩形は捨てる
+    ]) == [{"index": 1, "bounds": {"min_x": 0.0, "max_x": 1.0, "min_y": 2.0, "max_y": 3.0}},
+           {"index": 2, "bounds": {"min_x": 1.0, "max_x": 2.0, "min_y": 3.0, "max_y": 4.0}}]
+
+    class _FakePcap:
+        duration = 200.0
+
+        def nearest_frame(self, seconds: float) -> int:
+            return max(0, min(1999, int(round(float(seconds) * 10))))
+
+    calls: list[dict] = []
+
+    def fake_tracker(pcap, first, last, side="right", expected_pass_time=None,
+                     exclude_track_keys=None):
+        calls.append({"first": first, "last": last, "side": side,
+                      "expected": expected_pass_time, "exclude": exclude_track_keys})
+        return {"ok": True, "frames": [{"index": first + 1, "bounds": {
+            "min_x": 1.0, "max_x": 2.0, "min_y": 3.0, "max_y": 4.0}}],
+            "confidence": 0.83, "warnings": ["注意"], "pass_time": 43.2,
+            "track_key": "t7", "candidates": []}
+
+    tracked = autotrack_candidate_frames(
+        _FakePcap(), sample_event, -58.827, "front", tracker=fake_tracker,
+        exclude_track_keys=["t1", ""],
+    )
+    assert tracked["ok"] and tracked["track_key"] == "t7", tracked
+    assert tracked["frames"] == [{"index": 333, "bounds": {
+        "min_x": 1.0, "max_x": 2.0, "min_y": 3.0, "max_y": 4.0}}], tracked
+    assert (tracked["first_frame"], tracked["last_frame"]) == (332, 482), tracked
+    assert tracked["warnings"] == ["注意"] and tracked["confidence"] == 0.83, tracked
+    # side は常に right（検出CSVの side 列はカメラの見え方で物理の通過側ではない）
+    assert calls[0]["side"] == "right", calls
+    assert abs(calls[0]["expected"] - 43.173) < 1e-9, calls
+    assert calls[0]["exclude"] == ["t1"], calls
+
+    # 見つからない・窓が範囲外・例外は、いずれも ok=False で手動フローへ返す
+    def empty_tracker(pcap, first, last, side="right", **_kwargs):
+        return {"ok": False, "frames": [], "warnings": ["見つかりません"]}
+
+    missed = autotrack_candidate_frames(_FakePcap(), sample_event, 0.0, "front", tracker=empty_tracker)
+    assert missed["ok"] is False and missed["warnings"] == ["見つかりません"], missed
+    assert "手動" in missed["error"], missed
+    outside = autotrack_candidate_frames(_FakePcap(), sample_event, -500.0, "front", tracker=fake_tracker)
+    assert outside["ok"] is False and "収録範囲" in outside["error"], outside
+
+    def broken_tracker(pcap, first, last, side="right", **_kwargs):
+        raise RuntimeError("追跡失敗")
+
+    broken = autotrack_candidate_frames(_FakePcap(), sample_event, 0.0, "front", tracker=broken_tracker)
+    assert broken["ok"] is False and "追跡失敗" in broken["error"], broken
+    assert autotrack_candidate_frames(None, sample_event, 0.0, "front")["ok"] is False
+
+    # 古いプラグイン（任意引数なし）でも呼べる
+    def legacy_tracker(pcap, first, last, side="right"):
+        return {"ok": True, "frames": [{"index": first, "bounds": {
+            "min_x": 0.0, "max_x": 1.0, "min_y": 0.0, "max_y": 1.0}}], "confidence": 0.5}
+
+    legacy = autotrack_candidate_frames(_FakePcap(), sample_event, 0.0, "front",
+                                        tracker=legacy_tracker, exclude_track_keys=["t1"])
+    assert legacy["ok"] and legacy["track_key"] is None, legacy
+
+    # PCAP未読込ならAPIはエラーを返すだけ（GUIは手動フローのまま）
+    assert AppApi().auto_track_candidate({"event": sample_event})["ok"] is False
+    # 遅延importが実際に解決できること（GUI起動時には読み込まない）
+    tracker, load_error = load_autotracker()
+    assert callable(tracker), load_error
+
+    # Step4 のUIに自動追跡の導線があること
+    assert 'id="recordAutoTrack"' in index_html
+    assert 'id="autoTrackStatus"' in index_html
+    assert index_html.index('id="recordAutoTrack"') < index_html.index('id="recordFinish"')
+    assert "async function autoTrackCandidate()" in app_js
+    assert "api().auto_track_candidate(" in app_js
+    assert "function applyRecordedBounds(index)" in app_js
+    # 自動追跡の矩形は記録済みフレーム機構へ入り、フレーム移動で選択枠として復元される
+    assert "state.record={ active:true, eventId:event.event_id, eventIndex:index, frames, auto:true };" in app_js
+    assert "if(!applyRecordedBounds(index)&&l.tracking)trackSelection(l.points);" in app_js
+    assert "$('recordAutoTrack').addEventListener('click',autoTrackCandidate);" in app_js
+    assert "async auto_track_candidate()" in app_js  # デモ(ブラウザ)用スタブ
+
+    check_autotrack_real_pcap()
     print("Web GUI check OK")
 
 
@@ -1003,6 +1329,48 @@ def run_ui_smoke(api: AppApi, server: UiServer, url: str) -> None:
                   };
                 })()
             """)
+            # Step4 半自動モード: 自動追跡の結果が記録済みフレームへ入るか確かめる。
+            # PCAPを開かずに済ませるため、window.pywebview.api を一時的に差し替える。
+            window.evaluate_js("""
+                (() => {
+                  goStep('lidar');
+                  window.__realApi = window.pywebview.api;
+                  window.pywebview.api = {
+                    async auto_track_candidate(payload) {
+                      window.__autoTrackPayload = payload;
+                      return { ok:true, event_id:'001', first_frame:4, last_frame:9,
+                        confidence:0.91, warnings:[], track_key:'trk-1', pass_time:43.2,
+                        frames:[{index:5, bounds:{min_x:1, max_x:2, min_y:3, max_y:4}},
+                                {index:6, bounds:{min_x:1.1, max_x:2.1, min_y:3.1, max_y:4.1}}] };
+                    },
+                    async get_lidar_frame(index) { return { ok:true, timestamp:index*0.1, points:[] }; },
+                    async seek_lidar_time(seconds) { return { ok:true, index:5 }; }
+                  };
+                  state.events = [{event_id:'001', class:'普通', t_start_s:'100', peak_t_s:'102', t_end_s:'104', review_status:'未確認'}];
+                  state.offset = -58.827;
+                  renderMapped();
+                  document.getElementById('recordCandidate').value = '0';
+                  Object.assign(state.lidar, {loaded:true, frameCount:100, frameTimes:[], index:0,
+                    laserCount:0, lasers:new Set(), selection:null});
+                  window.__autoTrack = 'pending';
+                  autoTrackCandidate().then(() => {
+                    window.__autoTrack = { active:state.record.active, auto:state.record.auto,
+                      eventId:state.record.eventId, frames:state.record.frames.size,
+                      index:state.lidar.index, selection:state.lidar.selection,
+                      trackKey:state.autoTrackKeys.get('001'),
+                      status:document.getElementById('autoTrackStatus').textContent,
+                      payload:window.__autoTrackPayload };
+                  }).catch(err => { window.__autoTrack = { error:String(err) }; });
+                  return 'started';
+                })()
+            """)
+            for _ in range(40):
+                time.sleep(0.1)
+                auto = window.evaluate_js("window.__autoTrack")
+                if auto != "pending":
+                    break
+            result_box["auto"] = auto
+            window.evaluate_js("window.pywebview.api = window.__realApi; 'restored'")
         except Exception as exc:
             result_box["error"] = repr(exc)
         finally:
@@ -1020,6 +1388,16 @@ def run_ui_smoke(api: AppApi, server: UiServer, url: str) -> None:
     assert before.get("previewWidth", 0) > before.get("tableWidth", 9999), result
     assert result.get("afterDecision") == {"selected": 1, "firstStatus": "採用", "firstClass": "軽"}, result
     assert result.get("afterShortcut") == {"selected": 2, "secondStatus": "除外"}, result
+    auto = result_box.get("auto") or {}
+    assert auto.get("active") is True and auto.get("auto") is True, auto
+    assert auto.get("eventId") == "001" and auto.get("frames") == 2, auto
+    assert auto.get("trackKey") == "trk-1", auto
+    # 先頭フレームへ移動し、その矩形が選択枠として復元されている
+    assert auto.get("index") == 5, auto
+    assert auto.get("selection") == {"min_x": 1, "max_x": 2, "min_y": 3, "max_y": 4}, auto
+    payload = auto.get("payload") or {}
+    assert payload.get("offset") == -58.827 and payload.get("view") in ("front", "rear"), payload
+    assert (payload.get("event") or {}).get("event_id") == "001", payload
     print("WebView review UI smoke test OK")
 
 

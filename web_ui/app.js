@@ -1,6 +1,7 @@
 ﻿const state = { settings: {}, videos: [], events: [], selected: -1, offset: 0, playbackRate: 1, polling: false, initialized: false,
   lidar: { loaded:false, frameCount:0, frameTimes:[], index:0, timestamp:0, points:[], selection:null, drag:null, scale:8, panX:0, panY:0, playing:false, request:0, playStartWall:0, playStartSensor:0, tracking:false, vel:{x:0,y:0}, laserCount:0, lasers:new Set(), savedLasers:null, selSet:null } };
-state.record = { active:false, eventId:null, eventIndex:-1, frames:new Map() };  // 追い越し記録セッション
+state.record = { active:false, eventId:null, eventIndex:-1, frames:new Map(), auto:false };  // 追い越し記録セッション
+state.autoTrackKeys = new Map();  // event_id -> 自動追跡で割り当てた車両キー（他候補の除外に使う）
 state.exported = new Set();  // CSV出力済みの event_id
 const TRACK_MARGIN = 1.2;       // 探索ウィンドウの余白 (m)
 const TRACK_MIN_POINTS = 8;     // これ未満なら見失いとして枠を動かさない
@@ -25,6 +26,7 @@ const demoApi = {
   async seek_lidar_time() { return { ok: false, error: 'PCAPが読み込まれていません' }; },
   async export_lidar_roi() { return { ok: false, error: 'PCAPが読み込まれていません' }; },
   async export_overtaking() { return { ok: false, error: 'PCAPが読み込まれていません' }; },
+  async auto_track_candidate() { return { ok: false, error: '点群の自動追跡はデスクトップアプリでのみ利用できます' }; },
   async generate_all_edit_csv() { return { ok: false, error: 'edit.csv一括生成はデスクトップアプリでのみ利用できます' }; },
   async generate_final_excel() { return { ok: false, error: '最終Excel生成はデスクトップアプリでのみ利用できます' }; },
   async auto_sync_gps() { return { ok: false, error: 'GPS自動同期はデスクトップアプリでのみ利用できます' }; }
@@ -465,7 +467,7 @@ function updateLidarPositionDisplay(index, timestamp=null){
   $('lidarFrame').textContent=l.frameCount?`${index+1} / ${l.frameCount}`:'0 / 0';
 }
 async function openPcap(){ const path=$('pcapPath').value;if(!path)return toast('PCAPファイルを選択してください',true);setStatus('PCAPを読み込み中',true);const result=await api().open_pcap(path);setStatus('準備完了');if(!result.ok)return toast(result.error,true);const l=state.lidar;l.loaded=true;l.frameCount=result.frame_count;l.frameTimes=result.frame_times||[];l.index=0;l.laserCount=result.laser_count||0;const savedLasers=Array.isArray(l.savedLasers)?l.savedLasers.filter(i=>i>=0&&i<l.laserCount):[];l.lasers=new Set(savedLasers.length?savedLasers:Array.from({length:l.laserCount},(_,i)=>i));renderLaserGrid();$('lidarSlider').max=Math.max(0,l.frameCount-1);$('lidarRangeStart').max=$('lidarRangeEnd').max=Math.max(0,l.frameCount-1);$('lidarInfo').textContent=`${result.model} ・ ${result.frame_count} フレーム ・ ${result.duration.toFixed(3)}秒`;resizeLidarCanvas();await loadLidarFrame(0);toast('PCAPを読み込みました'); }
-async function loadLidarFrame(index, options={}){ const l=state.lidar;if(!l.loaded)return;index=Math.max(0,Math.min(l.frameCount-1,Number(index)));if(state.record.active&&index!==l.index)recordSnapshot();const request=++l.request,loading=$('lidarLoading'),showLoading=options.showLoading!==false,maxPoints=options.maxPoints||45000;loading.hidden=true;const loadingTimer=showLoading?setTimeout(()=>{if(request===l.request)loading.hidden=false;},180):null;const resultPromise=api().get_lidar_frame(index,maxPoints);const wait=Math.max(0,Number(options.notBefore||0)-performance.now());const [result]=await Promise.all([resultPromise,new Promise(resolve=>setTimeout(resolve,wait))]);if(loadingTimer)clearTimeout(loadingTimer);if(request!==l.request)return;loading.hidden=true;if(!result.ok)return toast(result.error,true);l.index=index;l.timestamp=Number(result.timestamp||0);l.points=result.points||[];if(l.tracking)trackSelection(l.points);$('lidarSlider').value=index;updateLidarPositionDisplay(index,result.timestamp);$('lidarRangeEnd').value=index;drawLidar(); }
+async function loadLidarFrame(index, options={}){ const l=state.lidar;if(!l.loaded)return;index=Math.max(0,Math.min(l.frameCount-1,Number(index)));if(state.record.active&&index!==l.index)recordSnapshot();const request=++l.request,loading=$('lidarLoading'),showLoading=options.showLoading!==false,maxPoints=options.maxPoints||45000;loading.hidden=true;const loadingTimer=showLoading?setTimeout(()=>{if(request===l.request)loading.hidden=false;},180):null;const resultPromise=api().get_lidar_frame(index,maxPoints);const wait=Math.max(0,Number(options.notBefore||0)-performance.now());const [result]=await Promise.all([resultPromise,new Promise(resolve=>setTimeout(resolve,wait))]);if(loadingTimer)clearTimeout(loadingTimer);if(request!==l.request)return;loading.hidden=true;if(!result.ok)return toast(result.error,true);l.index=index;l.timestamp=Number(result.timestamp||0);l.points=result.points||[];if(!applyRecordedBounds(index)&&l.tracking)trackSelection(l.points);$('lidarSlider').value=index;updateLidarPositionDisplay(index,result.timestamp);$('lidarRangeEnd').value=index;drawLidar(); }
 function previewLidarFrame(index){ if(!state.lidar.loaded)return toast('先にPCAPを読み込んでください',true);stopLidarPlay();updateLidarPositionDisplay(index);loadLidarFrame(index); }
 async function seekLidar(value){ if(!state.lidar.loaded)return toast('先にPCAPを読み込んでください',true);let seconds;try{seconds=parseTime(value)}catch(e){return toast(e.message,true)}const result=await api().seek_lidar_time(seconds);result.ok?loadLidarFrame(result.index):toast(result.error,true); }
 async function jumpToCandidate(){
@@ -486,6 +488,25 @@ function handleLidarShortcut(event){
   if(!['ArrowLeft','ArrowRight'].includes(event.key))return;
   event.preventDefault();if(event.repeat)return;stopLidarPlay();loadLidarFrame(state.lidar.index+(event.key==='ArrowRight'?1:-1));
 }
+function updateSelectionLabel(){
+  const s=state.lidar.selection;
+  $('lidarSelection').textContent = s
+    ? `X ${s.min_x.toFixed(2)}-${s.max_x.toFixed(2)} m / Y ${s.min_y.toFixed(2)}-${s.max_y.toFixed(2)} m`
+    : '点群上をドラッグして車両を囲ってください';
+}
+// 自動追跡で作った記録セッションでは、そのフレームの矩形を選択枠として復元する。
+// 人が枠を直すと、フレーム移動時の recordSnapshot が同じキーを上書きするので編集は残る。
+function applyRecordedBounds(index){
+  const r=state.record, l=state.lidar;
+  if(!r.active||!r.auto)return false;
+  const frame=r.frames.get(index);
+  if(!frame||!frame.bounds)return false;
+  const b=frame.bounds;
+  l.selection={ min_x:Number(b.min_x), max_x:Number(b.max_x), min_y:Number(b.min_y), max_y:Number(b.max_y) };
+  l.selSet=null; l.vel={x:0,y:0};
+  updateSelectionLabel();
+  return true;
+}
 function recordSnapshot(){
   const r=state.record, l=state.lidar;
   if(!r.active||!l.selection)return;
@@ -504,8 +525,9 @@ async function recordStart(){
   if(sel===''||!event)return toast('追い越し候補を選択してください',true);
   if(event.review_status==='除外')return toast('除外した候補は使用できません',true);
   if(!state.synced&&Math.abs(state.offset)<0.001)return toast('先にStep 3でGPS自動同期を実行してください',true);
+  setAutoTrackStatus('');
   await seekLidar(String(candidatePcapTime(event)));
-  state.record={ active:true, eventId:event.event_id, eventIndex:index, frames:new Map() };
+  state.record={ active:true, eventId:event.event_id, eventIndex:index, frames:new Map(), auto:false };
   // 開始フレームで車に枠を引き直してもらうため、古い選択枠はクリアする
   const l=state.lidar; l.tracking=true; $('lidarTrack').checked=true; l.vel={x:0,y:0}; l.selection=null; l.selSet=null;
   drawLidar();
@@ -515,13 +537,63 @@ async function recordStart(){
   toast('開始フレームで車を枠で囲ってください。以降は枠が追尾し、進めるたびに自動記録します');
 }
 function stopRecordSession(message){
-  state.record={ active:false, eventId:null, eventIndex:-1, frames:new Map() };
+  state.record={ active:false, eventId:null, eventIndex:-1, frames:new Map(), auto:false };
   resetRecordButtons(false);
+  setAutoTrackStatus('');
   $('recordStatus').textContent='未開始'; $('recordStatus').className='badge';
   updateRecordStatus();
   if(message)toast(message);
 }
 function recordCancel(){ if(state.record.active)stopRecordSession('記録を中止しました'); }
+function setAutoTrackStatus(message, error=false){
+  const el=$('autoTrackStatus'); if(!el)return;
+  el.textContent=message||''; el.className=`auto-track-status${error?' error':''}`;
+}
+function otherTrackKeys(eventId){
+  return [...state.autoTrackKeys].filter(([id,key])=>id!==eventId&&key).map(([,key])=>key);
+}
+// 半自動モード: 候補の時刻窓を lidar_autotrack にかけ、返ったフレーム別矩形を
+// 記録済みフレームの初期値として取り込む。人はこれを確認・微修正して出力する。
+async function autoTrackCandidate(){
+  if(!state.lidar.loaded)return toast('先にPCAPを読み込んでください',true);
+  const sel=$('recordCandidate').value, index=Number(sel), event=state.events[index];
+  if(sel===''||!event)return toast('追い越し候補を選択してください',true);
+  if(event.review_status==='除外')return toast('除外した候補は使用できません',true);
+  if(!state.synced&&Math.abs(state.offset)<0.001)return toast('先にStep 3でGPS自動同期を実行してください',true);
+  const button=$('recordAutoTrack');
+  button.disabled=true; stopLidarPlay(); setStatus('点群を自動追跡中',true); setAutoTrackStatus('自動追跡中…');
+  let result;
+  try{
+    result=await api().auto_track_candidate({
+      event:{ event_id:event.event_id, t_start_s:event.t_start_s, peak_t_s:event.peak_t_s, t_end_s:event.t_end_s },
+      offset:state.offset,
+      view:document.querySelector('[name=view]:checked')?.value||'',
+      exclude_track_keys:otherTrackKeys(event.event_id)
+    });
+  }catch(err){ result={ ok:false, error:String(err&&err.message||err) }; }
+  finally{ button.disabled=false; setStatus('準備完了'); }
+  if(!result||!result.ok){
+    // 自動が外れても止まらない。従来の手動記録フローへ落とす
+    const message=(result&&result.error)||'自動追跡に失敗しました';
+    setAutoTrackStatus(`${message} → 手動で矩形を選択してください`,true);
+    toast(message,true);
+    if(!state.record.active)await recordStart();
+    return;
+  }
+  const lasers=state.lidar.laserCount?[...state.lidar.lasers]:null;
+  const frames=new Map();
+  for(const frame of result.frames)frames.set(frame.index,{ index:frame.index, bounds:frame.bounds, lasers });
+  state.autoTrackKeys.set(event.event_id, result.track_key||'');
+  state.record={ active:true, eventId:event.event_id, eventIndex:index, frames, auto:true };
+  const l=state.lidar; l.tracking=false; $('lidarTrack').checked=false; l.vel={x:0,y:0}; l.selSet=null; l.selection=null;
+  resetRecordButtons(true);
+  $('recordStatus').textContent=`自動追跡（候補 ${event.event_id}）`; $('recordStatus').className='badge accepted';
+  updateRecordStatus();
+  await loadLidarFrame(result.frames[0].index);
+  const notes=(result.warnings&&result.warnings.length)?` / ${result.warnings.join(' / ')}`:'';
+  setAutoTrackStatus(`${result.frames.length} フレーム ・ 確度 ${Number(result.confidence||0).toFixed(2)}${notes}`);
+  toast(`自動追跡で ${result.frames.length} フレームを記録しました。←→で確認・修正し、終了してCSV出力（Enter）で確定します`);
+}
 function nextUnexportedCandidate(currentIndex){
   // currentIndex より後ろの、除外でない・未出力の候補を順に探す（なければ全体から探す）
   const usable = i => state.events[i] && state.events[i].review_status!=='除外' && !state.exported.has(state.events[i].event_id);
@@ -641,7 +713,7 @@ async function initialize() {
   $('keyModalBackdrop').addEventListener('click', e => { if (e.target === $('keyModalBackdrop')) closeKeyConfig(); });
   $('keyModalBackdrop').addEventListener('keydown', e => { if (e.key === 'Escape') closeKeyConfig(); });
   document.querySelectorAll('.key-field').forEach(f => f.addEventListener('input', () => { f.value = f.value.slice(-1).toUpperCase(); }));
-  $('openPcap').addEventListener('click',openPcap);$('lidarPrevious').addEventListener('click',()=>loadLidarFrame(state.lidar.index-1));$('lidarNext').addEventListener('click',()=>loadLidarFrame(state.lidar.index+1));$('lidarPlay').addEventListener('click',toggleLidarPlay);$('lidarSlider').addEventListener('input',e=>previewLidarFrame(e.target.value));$('lidarSeek').addEventListener('click',()=>seekLidar($('lidarSeekTime').value));$('jumpCandidate').addEventListener('click',jumpToCandidate);$('exportLidar').addEventListener('click',exportLidar);$('lidarFullscreen').addEventListener('click',toggleLidarFullscreen);$('generateEdit').addEventListener('click',generateEditCsv);$('generateAllEdits').addEventListener('click',generateAllEditCsv);$('generateFinal').addEventListener('click',generateFinalExcel);$('recordStart').addEventListener('click',recordStart);$('recordCancel').addEventListener('click',recordCancel);$('recordFinish').addEventListener('click',recordFinish);$('lidarTrack').addEventListener('change',e=>{const l=state.lidar;l.tracking=e.target.checked;l.vel={x:0,y:0};l.selSet=null;if(l.tracking){if(!l.selection)toast('先に点群上で車を矩形選択してください',true);else trackSelection(l.points);}drawLidar();});$('laserAll').addEventListener('click',()=>setAllLasers(true));$('laserNone').addEventListener('click',()=>setAllLasers(false));setupLidarCanvas();
+  $('openPcap').addEventListener('click',openPcap);$('lidarPrevious').addEventListener('click',()=>loadLidarFrame(state.lidar.index-1));$('lidarNext').addEventListener('click',()=>loadLidarFrame(state.lidar.index+1));$('lidarPlay').addEventListener('click',toggleLidarPlay);$('lidarSlider').addEventListener('input',e=>previewLidarFrame(e.target.value));$('lidarSeek').addEventListener('click',()=>seekLidar($('lidarSeekTime').value));$('jumpCandidate').addEventListener('click',jumpToCandidate);$('exportLidar').addEventListener('click',exportLidar);$('lidarFullscreen').addEventListener('click',toggleLidarFullscreen);$('generateEdit').addEventListener('click',generateEditCsv);$('generateAllEdits').addEventListener('click',generateAllEditCsv);$('generateFinal').addEventListener('click',generateFinalExcel);$('recordAutoTrack').addEventListener('click',autoTrackCandidate);$('recordStart').addEventListener('click',recordStart);$('recordCancel').addEventListener('click',recordCancel);$('recordFinish').addEventListener('click',recordFinish);$('lidarTrack').addEventListener('change',e=>{const l=state.lidar;l.tracking=e.target.checked;l.vel={x:0,y:0};l.selSet=null;if(l.tracking){if(!l.selection)toast('先に点群上で車を矩形選択してください',true);else trackSelection(l.points);}drawLidar();});$('laserAll').addEventListener('click',()=>setAllLasers(true));$('laserNone').addEventListener('click',()=>setAllLasers(false));setupLidarCanvas();
   setStatus(window.pywebview ? '準備完了' : 'ブラウザプレビュー');
 }
 

@@ -143,12 +143,14 @@
         <aside class="lidar-side lidar-side-right">
           <article class="card overtaking-record-card">
             <div class="card-title"><h3>追い越し記録</h3><span class="badge" id="recordStatus">未開始</span></div>
-            <p class="record-hint">開始で先頭フレームへ移動し追尾オン。<kbd>←</kbd><kbd>→</kbd>でフレーム送り（自動記録）、<kbd>Enter</kbd>で出力して次の候補へ自動で進みます。</p>
+            <p class="record-hint">「自動追跡」で点群から車両を追跡し記録フレームを作ります（半自動）。手動は「追い越し開始」から。どちらも<kbd>←</kbd><kbd>→</kbd>で確認・微修正、<kbd>Enter</kbd>で出力して次の候補へ進みます。</p>
             <label class="record-candidate">追い越し候補
               <select id="recordCandidate"><option value="">選択してください</option></select>
             </label>
+            <button class="primary record-autotrack" id="recordAutoTrack">自動追跡（点群から車両を検出）</button>
+            <p class="auto-track-status" id="autoTrackStatus"></p>
             <div class="record-buttons">
-              <button class="primary" id="recordStart">追い越し開始</button>
+              <button class="secondary" id="recordStart">追い越し開始（手動）</button>
               <button class="secondary" id="recordCancel" disabled>中止</button>
             </div>
             <button class="accept record-finish" id="recordFinish" disabled>終了してCSV出力</button>
