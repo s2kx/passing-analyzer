@@ -96,7 +96,32 @@ MAX_LANE_CLEARANCE = 3.5
 # 追跡の確信度がこれ未満なら「未確認」にして人手確認へ回す。
 MIN_TRACK_CONFIDENCE = 0.5
 
+# 段階3.5 時刻同期の自己検証（tools/sync_check.py）。
+# GPS速度とLiDAR点群から求めた自車速度の相互相関でオフセットを独立に推定し、
+# 段階3の値と突き合わせる。差の扱いは 260701 の実測（第4波J）に合わせて3段階。
+# 1秒以内は同期の精度内なので記録だけ、3秒以内は警告、3秒超は追い越し1件分
+# （車が窓を通り抜ける時間）を超えるので割り当てが壊れる。
+SYNC_CHECK_TOLERANCE = 1.0      # これ以下の差は正常（記録のみ）
+SYNC_CHECK_MISMATCH = 3.0       # これを超える差はレポートに推定値を明示して人手項目にする
+# 推定値を信用できる条件。tools/sync_check.py の判定と同じ値を使う。
+SYNC_CHECK_MIN_PEAK = 0.50
+SYNC_CHECK_MIN_PROMINENCE = 0.15
+SYNC_CHECK_MAX_SPREAD = 2.0
+
 # イベントと車両の割り当て。
+# 期待通過時刻の基準にする動画側の時刻。front 撮影では追い越し車は「自転車を抜いた
+# 直後」に画角へ入るので、検出トラックの開始時刻が横に並んだ時刻にいちばん近い。
+# bbox 面積が最大になる peak_t_s も普通はその直後に来るが、検出が途中で別の車へ
+# 乗り移ったり、遠方で一度小さくなってから膨らんだりすると開始の十数秒後になり、
+# 期待通過時刻が数秒ずれて隣車線の車を掴む。開始からこの秒数より後の peak は信用せず
+# 開始時刻側へ丸める（rear 撮影は「抜かれる直前」まで映るので終了時刻側が基準）。
+# 実データ5セッションでは 1〜5 秒のどこに取っても成績が同じで、3秒はその中央。
+PEAK_ANCHOR_LIMIT = 3.0
+# 同一車線の追い越しとみなす離隔距離の上限(m)。正解46件の離隔距離は最大 2.45m なので、
+# これを超える車は隣車線を通ったとみなす。採否ではなく割り当ての優先順位に使う値で、
+# 「まず同一車線の車、居なければ隣車線の車」の順に候補を割り当てる。2.0〜3.0m の
+# どこに取っても実データの成績は変わらない。
+NEAR_LANE_CLEARANCE = 2.6
 # 期待通過時刻からこれ以上離れた車は、そのイベントの車とみなさない（秒）。
 PASS_MATCH_TOLERANCE = 6.0
 # 通過時刻がこれ以内なら、別イベントの走査で見つかった同じ車とみなす（秒）。
@@ -160,6 +185,10 @@ class PipelineConfig:
     max_lane_clearance: float = MAX_LANE_CLEARANCE
     # 割り当て先の無い車を LiDAR 発の「未確認」行として起票するか。
     lidar_extra: bool = True
+    # 段階3.5 の時刻同期の自己検証を行うか。
+    sync_check: bool = True
+    # 検証で「信頼できる推定値が現行値と3秒超ずれる」ときに推定値へ差し替えるか。
+    auto_offset: bool = False
 
     def track_margins(self) -> tuple[float, float]:
         """追跡窓の (開始側, 終了側) マージン秒を返す。
@@ -305,6 +334,8 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         track_margin=None if args.track_margin is None else float(args.track_margin),
         max_lane_clearance=float(args.max_lane_clearance),
         lidar_extra=bool(getattr(args, "lidar_extra", True)),
+        sync_check=bool(getattr(args, "sync_check", True)),
+        auto_offset=bool(getattr(args, "auto_offset", False)),
     )
 
 
@@ -636,6 +667,178 @@ def run_sync(config: PipelineConfig, pcap: VelodynePcap, report: PipelineReport)
     return offset
 
 
+# ── 段階3.5: 時刻同期の自己検証 ───────────────────────────────────────────────
+
+def load_sync_checker() -> tuple[object | None, str]:
+    """``tools/sync_check.check_session`` を読み込む（無ければ ``None``）。
+
+    診断用の任意依存なので、モジュールが無くてもパイプラインは止めない。
+    """
+    try:
+        sys.path.insert(0, str(APP_DIR / "tools"))
+        from sync_check import check_session
+    except Exception as exc:  # noqa: BLE001 - 依存が無くても本処理は続ける
+        return None, f"{type(exc).__name__}: {exc}"
+    return check_session, ""
+
+
+def sync_check_is_trusted(result: dict) -> bool:
+    """自己検証の推定オフセットを信用してよいかを判定する。
+
+    相関のピークと突出度が十分高く、区間ごとの推定がばらついていないことを見る
+    （``tools/sync_check.py`` が ``status="low_confidence"`` を付ける条件と同じ）。
+    """
+    if result.get("status") in {"failed", "low_confidence", "no_reference"}:
+        return False
+    if result.get("estimated_offset") is None:
+        return False
+    if float(result.get("correlation_peak") or 0.0) < SYNC_CHECK_MIN_PEAK:
+        return False
+    if float(result.get("correlation_prominence") or 0.0) < SYNC_CHECK_MIN_PROMINENCE:
+        return False
+    spread = result.get("segment_spread_s")
+    return not (spread is not None and float(spread) > SYNC_CHECK_MAX_SPREAD)
+
+
+def run_sync_check(config: PipelineConfig, pcap: VelodynePcap, offset: float,
+                   report: PipelineReport, checker=None) -> float:
+    """段階3のオフセットを GPS 速度×LiDAR 自車速度の相互相関で検証する。
+
+    段階3のオフセットは GoPro の GPMF 時刻と PCAP の記録時刻の引き算なので、
+    LiDAR 収録PCの時計がずれていると丸ごとずれる（260701 では全5セッションで
+    +4.2〜5.2 秒ずれていた）。ここでは点群から自車速度を作り直し、GPS 速度との
+    相互相関でオフセットを独立に推定して突き合わせる。
+
+    差の扱い:
+
+    * ``SYNC_CHECK_TOLERANCE`` 以内 … 記録のみ（同期の精度内）
+    * ``SYNC_CHECK_MISMATCH`` 以内 … 警告（割り当ての取り違えが増えうる）
+    * それ超 … レポートへ推定値を明示し人手項目にする。``--auto-offset`` が
+      指定されていて推定値が信用できるなら、その場で差し替えて先へ進む
+
+    戻り値は以降の段階で使うオフセット（差し替えなければ引数のまま）。
+    """
+    if not config.sync_check:
+        report.stage("synccheck", "3.5.同期の自己検証", "skipped",
+                     "--skip-sync-check が指定されました")
+        return offset
+    if config.offset_override is not None:
+        report.stage("synccheck", "3.5.同期の自己検証", "skipped",
+                     "--offset で手動指定されたオフセットは検証しません")
+        return offset
+
+    checker, load_error = (checker, "") if checker else load_sync_checker()
+    if checker is None:
+        report.stage("synccheck", "3.5.同期の自己検証", "skipped",
+                     f"tools/sync_check を読み込めません（{load_error}）")
+        return offset
+
+    try:
+        result = checker(
+            config.out_dir, config.session_dir, pcap=pcap,
+            series_path=config.out_dir / "sync_series.npz",
+        ) or {}
+    except Exception as exc:  # noqa: BLE001 - 検証の失敗で本処理は止めない
+        report.stage("synccheck", "3.5.同期の自己検証", "failed",
+                     f"自己検証でエラー: {exc}")
+        report.warn(f"時刻同期の自己検証に失敗しました: {exc}")
+        return offset
+
+    try:
+        (config.out_dir / "sync_check.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
+    except OSError as exc:
+        report.warn(f"sync_check.json を書き出せません: {exc}")
+
+    estimated = result.get("estimated_offset")
+    trusted = sync_check_is_trusted(result)
+    detail = {
+        "estimated_offset": estimated,
+        "current_offset": offset,
+        "difference": result.get("difference"),
+        "correlation_peak": result.get("correlation_peak"),
+        "correlation_prominence": result.get("correlation_prominence"),
+        "segment_spread_s": result.get("segment_spread_s"),
+        "trusted": trusted,
+    }
+    if not trusted:
+        report.stage("synccheck", "3.5.同期の自己検証", "warning",
+                     "推定オフセットを信用できません（相関が弱いか区間でばらつきます）",
+                     **detail)
+        report.warn(
+            "時刻同期の自己検証: 推定オフセットを信用できないため検証できませんでした"
+            f"（相関ピーク {result.get('correlation_peak')} / "
+            f"突出度 {result.get('correlation_prominence')} / "
+            f"区間ばらつき {result.get('segment_spread_s')}秒）"
+        )
+        return offset
+
+    difference = float(estimated) - float(offset)
+    report.info["同期の自己検証(推定offset, 差)"] = (round(float(estimated), 3),
+                                                    round(difference, 3))
+    if abs(difference) <= SYNC_CHECK_TOLERANCE:
+        report.stage("synccheck", "3.5.同期の自己検証", "ok",
+                     f"推定 {estimated:+.3f} 秒 / 現行 {offset:+.3f} 秒（差 {difference:+.3f} 秒）",
+                     **detail)
+        return offset
+
+    if abs(difference) <= SYNC_CHECK_MISMATCH:
+        report.stage("synccheck", "3.5.同期の自己検証", "warning",
+                     f"推定 {estimated:+.3f} 秒と現行 {offset:+.3f} 秒の差が "
+                     f"{difference:+.3f} 秒あります", **detail)
+        report.warn(
+            f"時刻同期の自己検証: 推定オフセットとの差が {difference:+.2f} 秒あります"
+            "（車両の割り当てがずれる可能性があります）"
+        )
+        return offset
+
+    if config.auto_offset:
+        report.stage("synccheck", "3.5.同期の自己検証", "warning",
+                     f"--auto-offset により推定値 {estimated:+.3f} 秒へ差し替えました"
+                     f"（現行 {offset:+.3f} 秒 / 差 {difference:+.3f} 秒）",
+                     applied=True, **detail)
+        report.warn(
+            f"時刻同期を自己検証の推定値 {float(estimated):+.3f} 秒へ差し替えました"
+            f"（段階3の値 {offset:+.3f} 秒との差 {difference:+.3f} 秒）"
+        )
+        _rewrite_sync_offset(config, float(estimated), report)
+        return float(estimated)
+
+    report.stage("synccheck", "3.5.同期の自己検証", "warning",
+                 f"推定 {estimated:+.3f} 秒と現行 {offset:+.3f} 秒の差が "
+                 f"{difference:+.3f} 秒あります（許容 {SYNC_CHECK_MISMATCH:g} 秒超）",
+                 **detail)
+    report.warn(
+        f"時刻同期の自己検証: 推定オフセットとの差が {difference:+.2f} 秒で、"
+        "追い越し1件分より大きいため車両の割り当てが壊れます"
+    )
+    report.manual(
+        f"時刻オフセットを確認してください。自己検証の推定値は {float(estimated):+.3f} 秒です"
+        f"（段階3の値 {offset:+.3f} 秒）。--offset {float(estimated):.3f} を指定するか、"
+        "--auto-offset を付けて再実行すると推定値で処理できます"
+    )
+    return offset
+
+
+def _rewrite_sync_offset(config: PipelineConfig, offset: float,
+                         report: PipelineReport) -> None:
+    """``sync.json`` のオフセットを差し替える（差し替え前の値も残す）。"""
+    path = config.out_dir / "sync.json"
+    try:
+        sync = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        report.warn(f"sync.json を更新できません: {exc}")
+        return
+    sync["gpmf_offset"] = sync.get("offset")
+    sync["offset"] = offset
+    sync["source"] = "sync_check"
+    try:
+        path.write_text(json.dumps(sync, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        report.warn(f"sync.json を更新できません: {exc}")
+
+
 # ── 段階4: 点群自動追跡とイベント↔車両の割り当て ─────────────────────────────
 
 def load_autotracker() -> tuple[object | None, str]:
@@ -692,15 +895,33 @@ def event_window(config: PipelineConfig, event: dict, offset: float) -> tuple[fl
             _event_seconds(event, "t_end_s") + offset + end_margin)
 
 
-def expected_pass_times(events: list[dict], offset: float, bias: float = 0.0) -> dict[str, float]:
+def pass_anchor(event: dict, view: str = "", limit: float = PEAK_ANCHOR_LIMIT) -> float:
+    """1 候補について、車が横に並んだ時刻の目安になる動画側の秒を返す。
+
+    基本は最接近時刻 ``peak_t_s`` だが、これは bbox 面積が最大のフレームなので、
+    検出が別の車へ乗り移るとトラック開始のはるか後ろへずれる。追い越し車が
+    自転車の横に並ぶのは、front 撮影なら画角へ入る瞬間（``t_start_s``）、rear 撮影
+    なら画角から消える瞬間（``t_end_s``）なので、そこから ``limit`` 秒より離れた
+    peak は採らずに端の時刻へ丸める。撮影方向が分からない場合は従来どおり peak。
+    """
+    peak = _event_seconds(event, "peak_t_s")
+    kind = str(view).lower()
+    if kind == "front":
+        return min(peak, _event_seconds(event, "t_start_s") + limit)
+    if kind == "rear":
+        return max(peak, _event_seconds(event, "t_end_s") - limit)
+    return peak
+
+
+def expected_pass_times(events: list[dict], offset: float, bias: float = 0.0,
+                        view: str = "") -> dict[str, float]:
     """候補ごとの「車が横に並ぶはずの時刻」（pcap 相対秒）を返す。
 
-    動画の最接近時刻 ``peak_t_s`` を時刻オフセットで pcap 時刻へ移し、系統ずれ
+    動画側の基準時刻（``pass_anchor``）を時刻オフセットで pcap 時刻へ移し、系統ずれ
     ``bias`` を足す。この時刻に最も近い車をそのイベントの車とみなす。
     """
     return {
-        str(event.get("event_id", "")):
-            _event_seconds(event, "peak_t_s") + offset + bias
+        str(event.get("event_id", "")): pass_anchor(event, view) + offset + bias
         for event in events
     }
 
@@ -751,38 +972,61 @@ def group_vehicles(candidate_sets: dict[str, list[dict]],
     return groups
 
 
+def lane_rank(candidate: dict, near_clearance: float = NEAR_LANE_CLEARANCE) -> int:
+    """候補の車線らしさを ``0``（同一車線）/ ``1``（隣車線相当）で返す。
+
+    追跡側が出す離隔距離の目安 ``lc_estimate`` が ``near_clearance`` を超える車は
+    隣車線を通ったとみなす。目安が無い（追跡が通過区間を捉えていない）場合は
+    決めつけず同一車線側に置く。
+    """
+    clearance = candidate.get("lc_estimate")
+    if isinstance(clearance, (int, float)) and float(clearance) > near_clearance:
+        return 1
+    return 0
+
+
 def assign_events(expected: dict[str, float], candidate_sets: dict[str, list[dict]],
                   tolerance: float = PASS_MATCH_TOLERANCE,
-                  merge_gap: float = VEHICLE_MERGE_GAP) -> dict[str, dict]:
+                  merge_gap: float = VEHICLE_MERGE_GAP,
+                  near_clearance: float = NEAR_LANE_CLEARANCE) -> dict[str, dict]:
     """イベントと車両を 1 対 1 に割り当てる。
 
-    期待通過時刻との差が小さいペアから順に確定していくグリーディ法。既に使った
-    イベントと車両は飛ばすため、同じ車が複数イベントへ出力される重複が起きず、
-    同じ車を取り合った場合は期待通過時刻に近い方のイベントが勝つ。差が
-    ``tolerance`` を超えるペアは組まない（＝そのイベントは車なしになる）。
+    「同一車線を通った車で、期待通過時刻との差が小さい」ペアから順に確定していく
+    グリーディ法。既に使ったイベントと車両は飛ばすため、同じ車が複数イベントへ
+    出力される重複が起きず、同じ車を取り合った場合は期待通過時刻に近い方の
+    イベントが勝つ。差が ``tolerance`` を超えるペアは組まない（＝そのイベントは
+    車なしになる）。
+
+    車線を時刻より優先するのは、追い越しの窓には隣車線を走る車も入るためで、
+    時刻だけで選ぶと期待時刻が僅かにずれただけで隣車線の車を掴み、本来のその
+    イベントの車が余る（＝どのイベントにも割り当たらない車として捨てられる）。
+    隣車線の車も、同一車線の候補が無いイベントには従来どおり割り当てる。
 
     戻り値は ``event_id -> {"track_key", "pass_time", "lc_estimate", "score",
     "vehicle", "delta"}``。割り当たらなかったイベントは含まない。
     """
-    pairs: list[tuple[float, str, int, dict]] = []
+    pairs: list[tuple[int, float, str, int, dict]] = []
     for vehicle, members in enumerate(group_vehicles(candidate_sets, merge_gap)):
         # 同じ車について同じイベントが複数の候補を持つことはないが、念のため近い方を採る
-        best: dict[str, tuple[float, dict]] = {}
+        best: dict[str, tuple[tuple[int, float], dict]] = {}
         for event_id, candidate in members:
             want = expected.get(event_id)
             if want is None:
                 continue
             delta = abs(candidate["pass_time"] - want)
-            if delta <= tolerance and (event_id not in best or delta < best[event_id][0]):
-                best[event_id] = (delta, candidate)
-        pairs.extend((delta, event_id, vehicle, candidate)
-                     for event_id, (delta, candidate) in best.items())
+            if delta > tolerance:
+                continue
+            key = (lane_rank(candidate, near_clearance), delta)
+            if event_id not in best or key < best[event_id][0]:
+                best[event_id] = (key, candidate)
+        pairs.extend((rank, delta, event_id, vehicle, candidate)
+                     for event_id, ((rank, delta), candidate) in best.items())
 
-    pairs.sort(key=lambda item: (item[0], item[1]))
+    pairs.sort(key=lambda item: (item[0], item[1], item[2]))
     used_events: set[str] = set()
     used_vehicles: set[int] = set()
     assignment: dict[str, dict] = {}
-    for delta, event_id, vehicle, candidate in pairs:
+    for _rank, delta, event_id, vehicle, candidate in pairs:
         if event_id in used_events or vehicle in used_vehicles:
             continue
         used_events.add(event_id)
@@ -829,14 +1073,76 @@ def unassigned_vehicles(candidate_sets: dict[str, list[dict]], assignment: dict[
     return sorted(orphans, key=lambda candidate: candidate["pass_time"])
 
 
+def dump_assignment_debug(path: Path, offset: float, bias: float,
+                          events: list[dict], results: dict[str, dict],
+                          raw_expected: dict[str, float], expected: dict[str, float],
+                          candidate_sets: dict[str, list[dict]],
+                          assignment: dict[str, dict]) -> None:
+    """割り当ての入力と結果を JSON へ書き出す（診断用）。
+
+    点群の走査は 1 セッション数分かかるため、割り当てだけを試行錯誤したいときに
+    走査をやり直さずに済むよう、候補一覧と期待通過時刻をそのまま残す。
+    パイプラインの動作には影響しない。
+    """
+    payload = {
+        "offset": offset,
+        "bias": bias,
+        "events": [
+            {
+                "event_id": str(event.get("event_id", "")),
+                "peak_t_s": _event_seconds(event, "peak_t_s"),
+                "t_start_s": _event_seconds(event, "t_start_s"),
+                "t_end_s": _event_seconds(event, "t_end_s"),
+                "class": event.get("class", ""),
+                "first_frame": (results.get(str(event.get("event_id", ""))) or {}).get("first_frame"),
+                "last_frame": (results.get(str(event.get("event_id", ""))) or {}).get("last_frame"),
+                "raw_expected": raw_expected.get(str(event.get("event_id", ""))),
+                "expected": expected.get(str(event.get("event_id", ""))),
+                "candidates": candidate_sets.get(str(event.get("event_id", "")), []),
+                "assigned": assignment.get(str(event.get("event_id", ""))),
+            }
+            for event in events
+        ],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:  # 診断用なので書けなくても続行する
+        pass
+
+
+def same_vehicle_key(left: str, right: str) -> bool:
+    """2 つの ``track_key`` が同じ車を指すかを、追跡側と同じ規則で判定する。
+
+    追跡側（``lidar_autotrack.track_key_matches``）は追跡窓のぶれを吸収するため
+    キーを完全一致ではなくフレーム・横位置の近さで照合する。除外キーを組み立てる
+    側が完全一致で考えると、狙ったトラックの近くにある別キーを除外したつもりが
+    狙ったトラックまで除外されてしまうため、判定を追跡側に合わせる。
+    追跡モジュールが無い環境では完全一致に落とす。
+    """
+    if left == right:
+        return True
+    try:
+        from lidar_autotrack import track_key_matches
+    except Exception:  # noqa: BLE001 - 追跡モジュールが無くても割り当ては続ける
+        return False
+    return bool(track_key_matches(left, right))
+
+
 def keys_before(candidates: list[dict], track_key: str) -> list[str]:
     """``candidates`` の採用順で ``track_key`` より前にあるキーを返す。
 
     ``track_overtaking`` は ``candidates`` を採用順に返すので、ここで返したキーを
-    ``exclude_track_keys`` に渡せば、狙ったトラックが選ばれる。
+    ``exclude_track_keys`` に渡せば、狙ったトラックが選ばれる。ただし狙った
+    トラック自身と同一視されるキー（通過フレームが数フレーム・横位置が1m以内しか
+    違わない別候補）は除くこと。これを渡すと追跡側が狙ったトラックごと除外して
+    しまい、「候補はすべて他のイベントへ割り当て済み」になって車を失う。
     """
     keys = [candidate["track_key"] for candidate in candidates]
-    return keys[:keys.index(track_key)] if track_key in keys else []
+    if track_key not in keys:
+        return []
+    return [key for key in keys[:keys.index(track_key)]
+            if not same_vehicle_key(key, track_key)]
 
 
 def _scan_event(tracker, pcap: VelodynePcap, config: PipelineConfig, event: dict,
@@ -1005,7 +1311,9 @@ def run_autotrack(config: PipelineConfig, pcap: VelodynePcap, events: list[dict]
         return {}, []
 
     ordered = sorted(events, key=lambda event: _event_seconds(event, "peak_t_s"))
-    raw_expected = expected_pass_times(ordered, offset)
+    # 撮影方向が確定していないときは、向き依存の丸め（pass_anchor）を効かせない
+    anchor_view = "" if config.view_source == "fallback" else config.view
+    raw_expected = expected_pass_times(ordered, offset, view=anchor_view)
 
     # 1回目: 窓ごとに走査して候補を集める
     results: dict[str, dict] = {}
@@ -1038,6 +1346,9 @@ def run_autotrack(config: PipelineConfig, pcap: VelodynePcap, events: list[dict]
     assignment = assign_events(expected, candidate_sets)
     if bias:
         report.info["期待通過時刻の系統ずれ(秒)"] = round(bias, 2)
+    dump_assignment_debug(config.out_dir / "lidar" / "autotrack_candidates.json",
+                          offset, bias, ordered, results, raw_expected, expected,
+                          candidate_sets, assignment)
     # 割り当て先の無い車（動画検出の取りこぼし候補）を洗い出し、必要なら起票する
     orphans = unassigned_vehicles(candidate_sets, assignment, config.max_lane_clearance)
     events_by_id = {str(event.get("event_id", "")): event for event in ordered}
@@ -1343,11 +1654,15 @@ def run_edit_csv(config: PipelineConfig, report: PipelineReport) -> dict[str, di
 
 # ── 段階6: 自動レビュー ───────────────────────────────────────────────────────
 
+def _analysis_metric(analysis: dict | None, key: str) -> float | None:
+    """edit 解析から指標を1つ取り出す（解析できていなければ ``None``）。"""
+    value = ((analysis or {}).get("metrics") or {}).get(key)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def _analysis_lc(analysis: dict | None) -> float | None:
     """edit 解析から離隔距離 LC を取り出す（解析できていなければ None）。"""
-    metrics = (analysis or {}).get("metrics") or {}
-    value = metrics.get("lc")
-    return float(value) if isinstance(value, (int, float)) else None
+    return _analysis_metric(analysis, "lc")
 
 
 def auto_review_events(events: list[dict], config: PipelineConfig,
@@ -1394,6 +1709,19 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
             event["review_status"] = "除外"
             event["review_reason"] = (
                 f"離隔距離 {lc:.2f}m が {limit}m を超えます（隣車線の通過）"
+            )
+            continue
+        # フェーズ3→4で車が前進していない解析は成り立たない。通過区間の途中で追跡が
+        # 切れ、代用のフェーズ4が後方の点になった場合に起きる（距離p3・相対速度・TTC
+        # がすべて負になる）。値を採用すると最終Excelへ TTC が負の行が入るので、
+        # 除外はせず人手確認へ回す。
+        speed = _analysis_metric(analyses.get(event_id), "relative_speed")
+        if speed is not None and speed <= 0:
+            event["review_status"] = "未確認"
+            event["review_reason"] = (
+                f"フェーズ3→4で車が前進していません（相対速度 {speed:.1f} km/h）。"
+                "通過区間を抜けるまで追えておらず、通過時間・距離p3・TTCが"
+                "成り立たないため目視確認が必要です"
             )
             continue
         confidence = float(track.get("confidence") or 0.0)
@@ -1471,7 +1799,8 @@ def run_final_export(config: PipelineConfig, pcap: VelodynePcap, offset: float,
 
 # ── パイプライン本体 ──────────────────────────────────────────────────────────
 
-def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None) -> PipelineReport:
+def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None,
+                 sync_checker=None) -> PipelineReport:
     report = PipelineReport(config)
     config.out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1487,6 +1816,7 @@ def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None) -> Pi
         })
 
         offset = run_sync(config, pcap, report)
+        offset = run_sync_check(config, pcap, offset, report, checker=sync_checker)
         report.info["時刻オフセット(秒)"] = offset
 
         events = read_events_csv(events_csv, {}, "")
@@ -1543,6 +1873,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-lane-clearance", type=float, default=MAX_LANE_CLEARANCE,
                         help="自動レビューで隣車線の通過として除外する離隔距離(m)"
                              f"（既定: {MAX_LANE_CLEARANCE}）")
+    parser.add_argument("--skip-sync-check", dest="sync_check", action="store_false",
+                        default=True,
+                        help="段階3.5の時刻同期の自己検証を行わない"
+                             "（1セッション約3分かかる。既定は検証する）")
+    parser.add_argument("--auto-offset", action="store_true",
+                        help="自己検証の推定オフセットが信頼でき、現行値と"
+                             f"{SYNC_CHECK_MISMATCH:g}秒超ずれている場合に推定値へ差し替える")
     parser.add_argument("--no-lidar-extra", dest="lidar_extra", action="store_false",
                         default=True,
                         help="動画側に候補の無い車をレビューCSVへ「未確認」で"

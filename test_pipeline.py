@@ -556,6 +556,234 @@ def test_auto_review_classifies_by_lidar_result():
     print("  OK: LiDAR結果で採用・未確認・除外を判定（実測LC優先）")
 
 
+def stub_sync_checker(estimated: float, peak: float = 0.9, prominence: float = 0.4,
+                      spread: float = 0.2, calls: list | None = None):
+    """段階3.5 のダミー ``sync_check.check_session``。"""
+
+    def check_session(out_dir, session_dir=None, **options):
+        if calls is not None:
+            calls.append({"out_dir": Path(out_dir), "options": options})
+        return {"status": "ok", "estimated_offset": estimated,
+                "correlation_peak": peak, "correlation_prominence": prominence,
+                "segment_spread_s": spread, "difference": None}
+
+    return check_session
+
+
+def test_sync_check_reports_a_large_offset_mismatch():
+    """自己検証の推定オフセットが大きくずれていたら警告と人手項目を出す。
+
+    段階3のオフセットは GoPro の GPMF 時刻と PCAP の記録時刻の引き算なので、
+    LiDAR 収録PCの時計がずれていると丸ごとずれる（260701 では全5セッションで
+    +4.2〜5.2 秒ずれていた）。既定では差し替えずに人へ知らせる。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        calls: list = []
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(
+            config, tracker=scripted_tracker([car("f10x+1.2", 1.0)]),
+            sync_checker=stub_sync_checker(4.4, calls=calls),
+        )
+        data = report.to_dict()
+        stage = next(s for s in data["stages"] if s["name"] == "synccheck")
+
+        assert stage["status"] == "warning", stage
+        assert stage["estimated_offset"] == 4.4 and stage["trusted"] is True, stage
+        assert not stage.get("applied"), stage
+        assert any("--auto-offset" in item for item in data["manual_actions"]), \
+            data["manual_actions"]
+        assert data["info"]["時刻オフセット(秒)"] == 0.0, data["info"]
+        # 索引済みの PCAP を渡して再索引を避けている
+        assert calls and "pcap" in calls[0]["options"], calls
+        print("  OK: 同期の自己検証で大きなずれを警告する")
+
+
+def test_auto_offset_replaces_the_offset():
+    """--auto-offset なら、信用できる推定オフセットへその場で差し替える。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--auto-offset"]))
+        report = execute_pipeline(
+            config, tracker=scripted_tracker([car("f10x+1.2", 4.4)]),
+            sync_checker=stub_sync_checker(4.4),
+        )
+        data = report.to_dict()
+        stage = next(s for s in data["stages"] if s["name"] == "synccheck")
+
+        assert stage["status"] == "warning" and stage["applied"] is True, stage
+        assert data["info"]["時刻オフセット(秒)"] == 4.4, data["info"]
+        sync = json.loads((out_dir / "sync.json").read_text(encoding="utf-8"))
+        assert (sync["offset"], sync["source"]) == (4.4, "sync_check"), sync
+        assert sync["gpmf_offset"] == 0.0, sync
+        print("  OK: --auto-offset で推定オフセットへ差し替える")
+
+
+def test_sync_check_ignores_an_unreliable_estimate():
+    """相関が弱い推定は信用せず、オフセットも差し替えない。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--auto-offset"]))
+        report = execute_pipeline(
+            config, tracker=scripted_tracker([car("f10x+1.2", 1.0)]),
+            sync_checker=stub_sync_checker(4.4, peak=0.3),
+        )
+        data = report.to_dict()
+        stage = next(s for s in data["stages"] if s["name"] == "synccheck")
+
+        assert stage["trusted"] is False and not stage.get("applied"), stage
+        assert data["info"]["時刻オフセット(秒)"] == 0.0, data["info"]
+        print("  OK: 信頼度の低い推定オフセットは採用しない")
+
+
+def test_skip_sync_check_skips_the_stage():
+    """--skip-sync-check と --offset の手動指定では自己検証を行わない。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        calls: list = []
+        for extra in (["--skip-sync-check"], ["--offset", "0"]):
+            config = build_config(parse_args(
+                [str(session), "--skip-detect", "--skip-gps", *extra]
+            ))
+            report = execute_pipeline(
+                config, tracker=scripted_tracker([car("f10x+1.2", 1.0)]),
+                sync_checker=stub_sync_checker(4.4, calls=calls),
+            )
+            stage = next(s for s in report.to_dict()["stages"] if s["name"] == "synccheck")
+            assert stage["status"] == "skipped", (extra, stage)
+        assert calls == [], calls
+        print("  OK: --skip-sync-check / --offset 指定時は自己検証を省く")
+
+
+def test_non_advancing_analysis_is_flagged_for_review():
+    """フェーズ3→4で車が前進していない解析は採用せず人手確認へ回す。
+
+    通過区間を抜けるまで追えず、代用のフェーズ4が後方の点になると距離p3・
+    相対速度・TTC がすべて負になる。最終Excelへ「TTC が負の行」を入れないよう
+    「未確認」にする（実データ260701/ID1の281.9s、ID3の869.1sがこの型）。
+    """
+    config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                            pcap_path=Path("."), view="front")
+    events = [{"event_id": "1"}, {"event_id": "2"}]
+    tracking = {"1": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2},
+                "2": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
+    analyses = {
+        "1": {"metrics": {"lc": 1.27, "relative_speed": -0.32, "ttc": -40.31}},
+        "2": {"metrics": {"lc": 1.30, "relative_speed": 15.6, "ttc": 1.2}},
+    }
+    reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses)
+    assert [row["review_status"] for row in reviewed] == ["未確認", "採用"], reviewed
+    assert "前進していません" in reviewed[0]["review_reason"], reviewed[0]
+    print("  OK: 車が前進していない解析を「未確認」にする")
+
+
+def test_pass_anchor_rounds_a_late_peak_toward_the_visible_edge():
+    """トラック開始から離れすぎた bbox 面積のピークは期待通過時刻の基準にしない。
+
+    front 撮影では追い越し車は自転車を抜いた直後に画角へ入るので、開始時刻が
+    横に並んだ時刻に最も近い。検出が別の車へ乗り移ると peak_t_s が開始の十数秒後
+    まで流れ、そのままだと期待通過時刻が数秒ずれる。
+    """
+    late = {"event_id": "001", "t_start_s": 100.0, "peak_t_s": 114.0, "t_end_s": 116.0}
+    normal = {"event_id": "002", "t_start_s": 200.0, "peak_t_s": 200.7, "t_end_s": 208.0}
+
+    # front: 開始から PEAK_ANCHOR_LIMIT 秒より後の peak は開始側へ丸める
+    assert run_pipeline.pass_anchor(late, "front") == 103.0
+    assert run_pipeline.pass_anchor(normal, "front") == 200.7
+    # rear: 抜かれる直前まで映るので終了時刻側が基準
+    assert run_pipeline.pass_anchor(late, "rear") == 114.0
+    assert run_pipeline.pass_anchor(normal, "rear") == 205.0
+    # 撮影方向が分からなければ従来どおり peak をそのまま使う
+    assert run_pipeline.pass_anchor(late, "") == 114.0
+
+    expected = run_pipeline.expected_pass_times([late, normal], offset=-10.0, view="front")
+    assert expected == {"001": 93.0, "002": 190.7}, expected
+    print("  OK: 遅すぎる bbox ピークを期待通過時刻の基準から外す")
+
+
+def test_same_lane_vehicle_wins_over_a_closer_adjacent_lane_one():
+    """時刻がより近くても、隣車線の車より同一車線の車を先に割り当てる。
+
+    追い越しの窓には隣車線を走る車も入る。時刻だけで選ぶと期待時刻が僅かに
+    ずれただけで隣車線の車を掴み、そのイベント本来の車が余ってしまう。
+    """
+    candidates = {
+        "001": [car("f10x+3.2", 1.0, lc_estimate=3.2),      # 隣車線・期待時刻ちょうど
+                car("f24x+1.1", 2.4, lc_estimate=1.1)],     # 同一車線・1.4秒ずれ
+    }
+    assignment = run_pipeline.assign_events({"001": 1.0}, candidates)
+    assert assignment["001"]["track_key"] == "f24x+1.1", assignment
+    assert assignment["001"]["delta"] == 1.4, assignment
+
+    # 同一車線の候補が無ければ、隣車線の車も従来どおり割り当てる
+    only_far = {"001": [car("f10x+3.2", 1.0, lc_estimate=3.2)]}
+    assert run_pipeline.assign_events({"001": 1.0}, only_far)["001"]["track_key"] == "f10x+3.2"
+
+    # 同一車線どうしなら従来どおり時刻の近い方が勝つ
+    both_near = {"001": [car("f10x+1.2", 1.0, lc_estimate=1.2),
+                         car("f24x+1.1", 2.4, lc_estimate=1.1)]}
+    assert run_pipeline.assign_events({"001": 1.0}, both_near)["001"]["track_key"] == "f10x+1.2"
+    print("  OK: 隣車線の車より同一車線の車を優先して割り当て")
+
+
+def test_same_lane_priority_frees_the_vehicle_for_the_next_event():
+    """隣車線の車を掴まなくなることで、後続イベントが本来の車を拾えるようになる。
+
+    実データ(260701/ID3)で起きていた取り違えの型。1台目のイベントが隣車線の車を
+    掴むと、そのイベント本来の車がどの候補にも割り当たらず捨てられていた。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5)
+                         + event_row("002", 3.5, 4.0, 4.5))
+
+        # 001 の期待通過時刻(1.0s)ちょうどに隣車線の車がいる。時刻だけで選ぶと 001 は
+        # そちらを掴み、本来の車(2.0s)はどの候補にも割り当たらず捨てられていた。
+        cars = [car("f10x+3.2", 1.0, lc_estimate=3.2, score=0.95),   # 隣車線
+                car("f20x+1.1", 2.0, lc_estimate=1.1, score=0.90),   # 001 の本来の車
+                car("f40x+1.0", 4.0, lc_estimate=1.0, score=0.90)]   # 002 の本来の車
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--no-lidar-extra"]))
+        report = execute_pipeline(config, tracker=scripted_tracker(cars))
+        track = next(s for s in report.to_dict()["stages"] if s["name"] == "autotrack")
+
+        assert track["assigned"] == {"001": "f20x+1.1", "002": "f40x+1.0"}, track["assigned"]
+        print("  OK: 隣車線の車を避けたことで両候補が本来の車を拾う")
+
+
+def test_retry_exclusion_keeps_the_target_track():
+    """選び直しの除外キーに、狙ったトラックと同一視されるキーを混ぜない。
+
+    追跡側は追跡窓のぶれを吸収するため track_key を完全一致ではなく近さで照合する。
+    通過フレームが数フレームしか違わない別候補を除外キーに入れると、狙った
+    トラックまで除外されて「候補はすべて割り当て済み」になり車を失う
+    （実データ260701/ID2 の 674.1s がこれで消えていた）。
+    """
+    candidates = [{"track_key": "f6662x+2.3"}, {"track_key": "f6671x+1.7"},
+                  {"track_key": "f6717x+1.4"}, {"track_key": "f6720x+2.0"}]
+    excluded = run_pipeline.keys_before(candidates, "f6720x+2.0")
+    assert excluded == ["f6662x+2.3", "f6671x+1.7"], excluded
+    # 採用順で後ろにあるキーや、一覧に無いキーは従来どおり何も除外しない
+    assert run_pipeline.keys_before(candidates, "f6662x+2.3") == []
+    assert run_pipeline.keys_before(candidates, "f9999x+9.9") == []
+    print("  OK: 選び直しの除外キーから狙ったトラック自身を外す")
+
+
 def test_unassigned_vehicle_is_reported_as_a_detection_gap():
     """どの候補にも割り当たらない車は、動画検出の取りこぼしとしてレポートへ挙げる。
 
