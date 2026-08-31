@@ -556,6 +556,119 @@ def test_auto_review_classifies_by_lidar_result():
     print("  OK: LiDAR結果で採用・未確認・除外を判定（実測LC優先）")
 
 
+def stub_sync_checker(estimated: float, peak: float = 0.9, prominence: float = 0.4,
+                      spread: float = 0.2, calls: list | None = None):
+    """段階3.5 のダミー ``sync_check.check_session``。"""
+
+    def check_session(out_dir, session_dir=None, **options):
+        if calls is not None:
+            calls.append({"out_dir": Path(out_dir), "options": options})
+        return {"status": "ok", "estimated_offset": estimated,
+                "correlation_peak": peak, "correlation_prominence": prominence,
+                "segment_spread_s": spread, "difference": None}
+
+    return check_session
+
+
+def test_sync_check_reports_a_large_offset_mismatch():
+    """自己検証の推定オフセットが大きくずれていたら警告と人手項目を出す。
+
+    段階3のオフセットは GoPro の GPMF 時刻と PCAP の記録時刻の引き算なので、
+    LiDAR 収録PCの時計がずれていると丸ごとずれる（260701 では全5セッションで
+    +4.2〜5.2 秒ずれていた）。既定では差し替えずに人へ知らせる。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        calls: list = []
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(
+            config, tracker=scripted_tracker([car("f10x+1.2", 1.0)]),
+            sync_checker=stub_sync_checker(4.4, calls=calls),
+        )
+        data = report.to_dict()
+        stage = next(s for s in data["stages"] if s["name"] == "synccheck")
+
+        assert stage["status"] == "warning", stage
+        assert stage["estimated_offset"] == 4.4 and stage["trusted"] is True, stage
+        assert not stage.get("applied"), stage
+        assert any("--auto-offset" in item for item in data["manual_actions"]), \
+            data["manual_actions"]
+        assert data["info"]["時刻オフセット(秒)"] == 0.0, data["info"]
+        # 索引済みの PCAP を渡して再索引を避けている
+        assert calls and "pcap" in calls[0]["options"], calls
+        print("  OK: 同期の自己検証で大きなずれを警告する")
+
+
+def test_auto_offset_replaces_the_offset():
+    """--auto-offset なら、信用できる推定オフセットへその場で差し替える。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--auto-offset"]))
+        report = execute_pipeline(
+            config, tracker=scripted_tracker([car("f10x+1.2", 4.4)]),
+            sync_checker=stub_sync_checker(4.4),
+        )
+        data = report.to_dict()
+        stage = next(s for s in data["stages"] if s["name"] == "synccheck")
+
+        assert stage["status"] == "warning" and stage["applied"] is True, stage
+        assert data["info"]["時刻オフセット(秒)"] == 4.4, data["info"]
+        sync = json.loads((out_dir / "sync.json").read_text(encoding="utf-8"))
+        assert (sync["offset"], sync["source"]) == (4.4, "sync_check"), sync
+        assert sync["gpmf_offset"] == 0.0, sync
+        print("  OK: --auto-offset で推定オフセットへ差し替える")
+
+
+def test_sync_check_ignores_an_unreliable_estimate():
+    """相関が弱い推定は信用せず、オフセットも差し替えない。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--auto-offset"]))
+        report = execute_pipeline(
+            config, tracker=scripted_tracker([car("f10x+1.2", 1.0)]),
+            sync_checker=stub_sync_checker(4.4, peak=0.3),
+        )
+        data = report.to_dict()
+        stage = next(s for s in data["stages"] if s["name"] == "synccheck")
+
+        assert stage["trusted"] is False and not stage.get("applied"), stage
+        assert data["info"]["時刻オフセット(秒)"] == 0.0, data["info"]
+        print("  OK: 信頼度の低い推定オフセットは採用しない")
+
+
+def test_skip_sync_check_skips_the_stage():
+    """--skip-sync-check と --offset の手動指定では自己検証を行わない。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        calls: list = []
+        for extra in (["--skip-sync-check"], ["--offset", "0"]):
+            config = build_config(parse_args(
+                [str(session), "--skip-detect", "--skip-gps", *extra]
+            ))
+            report = execute_pipeline(
+                config, tracker=scripted_tracker([car("f10x+1.2", 1.0)]),
+                sync_checker=stub_sync_checker(4.4, calls=calls),
+            )
+            stage = next(s for s in report.to_dict()["stages"] if s["name"] == "synccheck")
+            assert stage["status"] == "skipped", (extra, stage)
+        assert calls == [], calls
+        print("  OK: --skip-sync-check / --offset 指定時は自己検証を省く")
+
+
 def test_non_advancing_analysis_is_flagged_for_review():
     """フェーズ3→4で車が前進していない解析は採用せず人手確認へ回す。
 

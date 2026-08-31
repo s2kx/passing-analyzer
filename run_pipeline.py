@@ -96,6 +96,18 @@ MAX_LANE_CLEARANCE = 3.5
 # 追跡の確信度がこれ未満なら「未確認」にして人手確認へ回す。
 MIN_TRACK_CONFIDENCE = 0.5
 
+# 段階3.5 時刻同期の自己検証（tools/sync_check.py）。
+# GPS速度とLiDAR点群から求めた自車速度の相互相関でオフセットを独立に推定し、
+# 段階3の値と突き合わせる。差の扱いは 260701 の実測（第4波J）に合わせて3段階。
+# 1秒以内は同期の精度内なので記録だけ、3秒以内は警告、3秒超は追い越し1件分
+# （車が窓を通り抜ける時間）を超えるので割り当てが壊れる。
+SYNC_CHECK_TOLERANCE = 1.0      # これ以下の差は正常（記録のみ）
+SYNC_CHECK_MISMATCH = 3.0       # これを超える差はレポートに推定値を明示して人手項目にする
+# 推定値を信用できる条件。tools/sync_check.py の判定と同じ値を使う。
+SYNC_CHECK_MIN_PEAK = 0.50
+SYNC_CHECK_MIN_PROMINENCE = 0.15
+SYNC_CHECK_MAX_SPREAD = 2.0
+
 # イベントと車両の割り当て。
 # 期待通過時刻の基準にする動画側の時刻。front 撮影では追い越し車は「自転車を抜いた
 # 直後」に画角へ入るので、検出トラックの開始時刻が横に並んだ時刻にいちばん近い。
@@ -173,6 +185,10 @@ class PipelineConfig:
     max_lane_clearance: float = MAX_LANE_CLEARANCE
     # 割り当て先の無い車を LiDAR 発の「未確認」行として起票するか。
     lidar_extra: bool = True
+    # 段階3.5 の時刻同期の自己検証を行うか。
+    sync_check: bool = True
+    # 検証で「信頼できる推定値が現行値と3秒超ずれる」ときに推定値へ差し替えるか。
+    auto_offset: bool = False
 
     def track_margins(self) -> tuple[float, float]:
         """追跡窓の (開始側, 終了側) マージン秒を返す。
@@ -318,6 +334,8 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         track_margin=None if args.track_margin is None else float(args.track_margin),
         max_lane_clearance=float(args.max_lane_clearance),
         lidar_extra=bool(getattr(args, "lidar_extra", True)),
+        sync_check=bool(getattr(args, "sync_check", True)),
+        auto_offset=bool(getattr(args, "auto_offset", False)),
     )
 
 
@@ -647,6 +665,178 @@ def run_sync(config: PipelineConfig, pcap: VelodynePcap, report: PipelineReport)
         json.dumps(sync, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return offset
+
+
+# ── 段階3.5: 時刻同期の自己検証 ───────────────────────────────────────────────
+
+def load_sync_checker() -> tuple[object | None, str]:
+    """``tools/sync_check.check_session`` を読み込む（無ければ ``None``）。
+
+    診断用の任意依存なので、モジュールが無くてもパイプラインは止めない。
+    """
+    try:
+        sys.path.insert(0, str(APP_DIR / "tools"))
+        from sync_check import check_session
+    except Exception as exc:  # noqa: BLE001 - 依存が無くても本処理は続ける
+        return None, f"{type(exc).__name__}: {exc}"
+    return check_session, ""
+
+
+def sync_check_is_trusted(result: dict) -> bool:
+    """自己検証の推定オフセットを信用してよいかを判定する。
+
+    相関のピークと突出度が十分高く、区間ごとの推定がばらついていないことを見る
+    （``tools/sync_check.py`` が ``status="low_confidence"`` を付ける条件と同じ）。
+    """
+    if result.get("status") in {"failed", "low_confidence", "no_reference"}:
+        return False
+    if result.get("estimated_offset") is None:
+        return False
+    if float(result.get("correlation_peak") or 0.0) < SYNC_CHECK_MIN_PEAK:
+        return False
+    if float(result.get("correlation_prominence") or 0.0) < SYNC_CHECK_MIN_PROMINENCE:
+        return False
+    spread = result.get("segment_spread_s")
+    return not (spread is not None and float(spread) > SYNC_CHECK_MAX_SPREAD)
+
+
+def run_sync_check(config: PipelineConfig, pcap: VelodynePcap, offset: float,
+                   report: PipelineReport, checker=None) -> float:
+    """段階3のオフセットを GPS 速度×LiDAR 自車速度の相互相関で検証する。
+
+    段階3のオフセットは GoPro の GPMF 時刻と PCAP の記録時刻の引き算なので、
+    LiDAR 収録PCの時計がずれていると丸ごとずれる（260701 では全5セッションで
+    +4.2〜5.2 秒ずれていた）。ここでは点群から自車速度を作り直し、GPS 速度との
+    相互相関でオフセットを独立に推定して突き合わせる。
+
+    差の扱い:
+
+    * ``SYNC_CHECK_TOLERANCE`` 以内 … 記録のみ（同期の精度内）
+    * ``SYNC_CHECK_MISMATCH`` 以内 … 警告（割り当ての取り違えが増えうる）
+    * それ超 … レポートへ推定値を明示し人手項目にする。``--auto-offset`` が
+      指定されていて推定値が信用できるなら、その場で差し替えて先へ進む
+
+    戻り値は以降の段階で使うオフセット（差し替えなければ引数のまま）。
+    """
+    if not config.sync_check:
+        report.stage("synccheck", "3.5.同期の自己検証", "skipped",
+                     "--skip-sync-check が指定されました")
+        return offset
+    if config.offset_override is not None:
+        report.stage("synccheck", "3.5.同期の自己検証", "skipped",
+                     "--offset で手動指定されたオフセットは検証しません")
+        return offset
+
+    checker, load_error = (checker, "") if checker else load_sync_checker()
+    if checker is None:
+        report.stage("synccheck", "3.5.同期の自己検証", "skipped",
+                     f"tools/sync_check を読み込めません（{load_error}）")
+        return offset
+
+    try:
+        result = checker(
+            config.out_dir, config.session_dir, pcap=pcap,
+            series_path=config.out_dir / "sync_series.npz",
+        ) or {}
+    except Exception as exc:  # noqa: BLE001 - 検証の失敗で本処理は止めない
+        report.stage("synccheck", "3.5.同期の自己検証", "failed",
+                     f"自己検証でエラー: {exc}")
+        report.warn(f"時刻同期の自己検証に失敗しました: {exc}")
+        return offset
+
+    try:
+        (config.out_dir / "sync_check.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
+    except OSError as exc:
+        report.warn(f"sync_check.json を書き出せません: {exc}")
+
+    estimated = result.get("estimated_offset")
+    trusted = sync_check_is_trusted(result)
+    detail = {
+        "estimated_offset": estimated,
+        "current_offset": offset,
+        "difference": result.get("difference"),
+        "correlation_peak": result.get("correlation_peak"),
+        "correlation_prominence": result.get("correlation_prominence"),
+        "segment_spread_s": result.get("segment_spread_s"),
+        "trusted": trusted,
+    }
+    if not trusted:
+        report.stage("synccheck", "3.5.同期の自己検証", "warning",
+                     "推定オフセットを信用できません（相関が弱いか区間でばらつきます）",
+                     **detail)
+        report.warn(
+            "時刻同期の自己検証: 推定オフセットを信用できないため検証できませんでした"
+            f"（相関ピーク {result.get('correlation_peak')} / "
+            f"突出度 {result.get('correlation_prominence')} / "
+            f"区間ばらつき {result.get('segment_spread_s')}秒）"
+        )
+        return offset
+
+    difference = float(estimated) - float(offset)
+    report.info["同期の自己検証(推定offset, 差)"] = (round(float(estimated), 3),
+                                                    round(difference, 3))
+    if abs(difference) <= SYNC_CHECK_TOLERANCE:
+        report.stage("synccheck", "3.5.同期の自己検証", "ok",
+                     f"推定 {estimated:+.3f} 秒 / 現行 {offset:+.3f} 秒（差 {difference:+.3f} 秒）",
+                     **detail)
+        return offset
+
+    if abs(difference) <= SYNC_CHECK_MISMATCH:
+        report.stage("synccheck", "3.5.同期の自己検証", "warning",
+                     f"推定 {estimated:+.3f} 秒と現行 {offset:+.3f} 秒の差が "
+                     f"{difference:+.3f} 秒あります", **detail)
+        report.warn(
+            f"時刻同期の自己検証: 推定オフセットとの差が {difference:+.2f} 秒あります"
+            "（車両の割り当てがずれる可能性があります）"
+        )
+        return offset
+
+    if config.auto_offset:
+        report.stage("synccheck", "3.5.同期の自己検証", "warning",
+                     f"--auto-offset により推定値 {estimated:+.3f} 秒へ差し替えました"
+                     f"（現行 {offset:+.3f} 秒 / 差 {difference:+.3f} 秒）",
+                     applied=True, **detail)
+        report.warn(
+            f"時刻同期を自己検証の推定値 {float(estimated):+.3f} 秒へ差し替えました"
+            f"（段階3の値 {offset:+.3f} 秒との差 {difference:+.3f} 秒）"
+        )
+        _rewrite_sync_offset(config, float(estimated), report)
+        return float(estimated)
+
+    report.stage("synccheck", "3.5.同期の自己検証", "warning",
+                 f"推定 {estimated:+.3f} 秒と現行 {offset:+.3f} 秒の差が "
+                 f"{difference:+.3f} 秒あります（許容 {SYNC_CHECK_MISMATCH:g} 秒超）",
+                 **detail)
+    report.warn(
+        f"時刻同期の自己検証: 推定オフセットとの差が {difference:+.2f} 秒で、"
+        "追い越し1件分より大きいため車両の割り当てが壊れます"
+    )
+    report.manual(
+        f"時刻オフセットを確認してください。自己検証の推定値は {float(estimated):+.3f} 秒です"
+        f"（段階3の値 {offset:+.3f} 秒）。--offset {float(estimated):.3f} を指定するか、"
+        "--auto-offset を付けて再実行すると推定値で処理できます"
+    )
+    return offset
+
+
+def _rewrite_sync_offset(config: PipelineConfig, offset: float,
+                         report: PipelineReport) -> None:
+    """``sync.json`` のオフセットを差し替える（差し替え前の値も残す）。"""
+    path = config.out_dir / "sync.json"
+    try:
+        sync = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        report.warn(f"sync.json を更新できません: {exc}")
+        return
+    sync["gpmf_offset"] = sync.get("offset")
+    sync["offset"] = offset
+    sync["source"] = "sync_check"
+    try:
+        path.write_text(json.dumps(sync, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        report.warn(f"sync.json を更新できません: {exc}")
 
 
 # ── 段階4: 点群自動追跡とイベント↔車両の割り当て ─────────────────────────────
@@ -1609,7 +1799,8 @@ def run_final_export(config: PipelineConfig, pcap: VelodynePcap, offset: float,
 
 # ── パイプライン本体 ──────────────────────────────────────────────────────────
 
-def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None) -> PipelineReport:
+def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None,
+                 sync_checker=None) -> PipelineReport:
     report = PipelineReport(config)
     config.out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1625,6 +1816,7 @@ def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None) -> Pi
         })
 
         offset = run_sync(config, pcap, report)
+        offset = run_sync_check(config, pcap, offset, report, checker=sync_checker)
         report.info["時刻オフセット(秒)"] = offset
 
         events = read_events_csv(events_csv, {}, "")
@@ -1681,6 +1873,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-lane-clearance", type=float, default=MAX_LANE_CLEARANCE,
                         help="自動レビューで隣車線の通過として除外する離隔距離(m)"
                              f"（既定: {MAX_LANE_CLEARANCE}）")
+    parser.add_argument("--skip-sync-check", dest="sync_check", action="store_false",
+                        default=True,
+                        help="段階3.5の時刻同期の自己検証を行わない"
+                             "（1セッション約3分かかる。既定は検証する）")
+    parser.add_argument("--auto-offset", action="store_true",
+                        help="自己検証の推定オフセットが信頼でき、現行値と"
+                             f"{SYNC_CHECK_MISMATCH:g}秒超ずれている場合に推定値へ差し替える")
     parser.add_argument("--no-lidar-extra", dest="lidar_extra", action="store_false",
                         default=True,
                         help="動画側に候補の無い車をレビューCSVへ「未確認」で"

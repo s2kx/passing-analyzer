@@ -522,8 +522,13 @@ def check_session(out_dir: Path, session_dir: Path | None = None,
                   pair_step: int = PAIR_STEP, max_lag: float = MAX_LAG,
                   tolerance: float = OFFSET_TOLERANCE,
                   segments: int = SEGMENTS, limit_seconds: float | None = None,
-                  progress: bool = False, series_path: Path | None = None) -> dict:
-    """1 セッションのオフセットを検証して報告用の辞書を返す。"""
+                  progress: bool = False, series_path: Path | None = None,
+                  pcap: "VelodynePcap | None" = None) -> dict:
+    """1 セッションのオフセットを検証して報告用の辞書を返す。
+
+    ``pcap`` に索引済みの ``VelodynePcap`` を渡すと、PCAP を開き直さずに使う
+    （``run_pipeline`` から呼ぶとき 1.4GB の再索引を省ける）。
+    """
     started = time.time()
     pcap_path, videos, sync, warnings = discover_inputs(out_dir, session_dir, pcap_override)
     current = sync.get("offset")
@@ -539,9 +544,10 @@ def check_session(out_dir: Path, session_dir: Path | None = None,
         pcap_duration, frame_count = float(series["time"][-1]) if series["time"].size else 0.0, 0
         pcap_start_unix = float(sync.get("pcap_start_unix") or 0.0)
     else:
-        if progress:
-            print(f"[pcap] {pcap_path.name} を索引中...", flush=True)
-        pcap = VelodynePcap(pcap_path)
+        if pcap is None:
+            if progress:
+                print(f"[pcap] {pcap_path.name} を索引中...", flush=True)
+            pcap = VelodynePcap(pcap_path)
         pcap_duration, frame_count = pcap.duration, len(pcap.frames)
         pcap_start_unix = pcap.start_unix_time
         if progress:
