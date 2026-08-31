@@ -105,6 +105,11 @@ MIN_TRACK_CONFIDENCE = 0.5
 # 開始時刻側へ丸める（rear 撮影は「抜かれる直前」まで映るので終了時刻側が基準）。
 # 実データ5セッションでは 1〜5 秒のどこに取っても成績が同じで、3秒はその中央。
 PEAK_ANCHOR_LIMIT = 3.0
+# 同一車線の追い越しとみなす離隔距離の上限(m)。正解46件の離隔距離は最大 2.45m なので、
+# これを超える車は隣車線を通ったとみなす。採否ではなく割り当ての優先順位に使う値で、
+# 「まず同一車線の車、居なければ隣車線の車」の順に候補を割り当てる。2.0〜3.0m の
+# どこに取っても実データの成績は変わらない。
+NEAR_LANE_CLEARANCE = 2.6
 # 期待通過時刻からこれ以上離れた車は、そのイベントの車とみなさない（秒）。
 PASS_MATCH_TOLERANCE = 6.0
 # 通過時刻がこれ以内なら、別イベントの走査で見つかった同じ車とみなす（秒）。
@@ -777,38 +782,61 @@ def group_vehicles(candidate_sets: dict[str, list[dict]],
     return groups
 
 
+def lane_rank(candidate: dict, near_clearance: float = NEAR_LANE_CLEARANCE) -> int:
+    """候補の車線らしさを ``0``（同一車線）/ ``1``（隣車線相当）で返す。
+
+    追跡側が出す離隔距離の目安 ``lc_estimate`` が ``near_clearance`` を超える車は
+    隣車線を通ったとみなす。目安が無い（追跡が通過区間を捉えていない）場合は
+    決めつけず同一車線側に置く。
+    """
+    clearance = candidate.get("lc_estimate")
+    if isinstance(clearance, (int, float)) and float(clearance) > near_clearance:
+        return 1
+    return 0
+
+
 def assign_events(expected: dict[str, float], candidate_sets: dict[str, list[dict]],
                   tolerance: float = PASS_MATCH_TOLERANCE,
-                  merge_gap: float = VEHICLE_MERGE_GAP) -> dict[str, dict]:
+                  merge_gap: float = VEHICLE_MERGE_GAP,
+                  near_clearance: float = NEAR_LANE_CLEARANCE) -> dict[str, dict]:
     """イベントと車両を 1 対 1 に割り当てる。
 
-    期待通過時刻との差が小さいペアから順に確定していくグリーディ法。既に使った
-    イベントと車両は飛ばすため、同じ車が複数イベントへ出力される重複が起きず、
-    同じ車を取り合った場合は期待通過時刻に近い方のイベントが勝つ。差が
-    ``tolerance`` を超えるペアは組まない（＝そのイベントは車なしになる）。
+    「同一車線を通った車で、期待通過時刻との差が小さい」ペアから順に確定していく
+    グリーディ法。既に使ったイベントと車両は飛ばすため、同じ車が複数イベントへ
+    出力される重複が起きず、同じ車を取り合った場合は期待通過時刻に近い方の
+    イベントが勝つ。差が ``tolerance`` を超えるペアは組まない（＝そのイベントは
+    車なしになる）。
+
+    車線を時刻より優先するのは、追い越しの窓には隣車線を走る車も入るためで、
+    時刻だけで選ぶと期待時刻が僅かにずれただけで隣車線の車を掴み、本来のその
+    イベントの車が余る（＝どのイベントにも割り当たらない車として捨てられる）。
+    隣車線の車も、同一車線の候補が無いイベントには従来どおり割り当てる。
 
     戻り値は ``event_id -> {"track_key", "pass_time", "lc_estimate", "score",
     "vehicle", "delta"}``。割り当たらなかったイベントは含まない。
     """
-    pairs: list[tuple[float, str, int, dict]] = []
+    pairs: list[tuple[int, float, str, int, dict]] = []
     for vehicle, members in enumerate(group_vehicles(candidate_sets, merge_gap)):
         # 同じ車について同じイベントが複数の候補を持つことはないが、念のため近い方を採る
-        best: dict[str, tuple[float, dict]] = {}
+        best: dict[str, tuple[tuple[int, float], dict]] = {}
         for event_id, candidate in members:
             want = expected.get(event_id)
             if want is None:
                 continue
             delta = abs(candidate["pass_time"] - want)
-            if delta <= tolerance and (event_id not in best or delta < best[event_id][0]):
-                best[event_id] = (delta, candidate)
-        pairs.extend((delta, event_id, vehicle, candidate)
-                     for event_id, (delta, candidate) in best.items())
+            if delta > tolerance:
+                continue
+            key = (lane_rank(candidate, near_clearance), delta)
+            if event_id not in best or key < best[event_id][0]:
+                best[event_id] = (key, candidate)
+        pairs.extend((rank, delta, event_id, vehicle, candidate)
+                     for event_id, ((rank, delta), candidate) in best.items())
 
-    pairs.sort(key=lambda item: (item[0], item[1]))
+    pairs.sort(key=lambda item: (item[0], item[1], item[2]))
     used_events: set[str] = set()
     used_vehicles: set[int] = set()
     assignment: dict[str, dict] = {}
-    for delta, event_id, vehicle, candidate in pairs:
+    for _rank, delta, event_id, vehicle, candidate in pairs:
         if event_id in used_events or vehicle in used_vehicles:
             continue
         used_events.add(event_id)

@@ -580,6 +580,57 @@ def test_pass_anchor_rounds_a_late_peak_toward_the_visible_edge():
     print("  OK: 遅すぎる bbox ピークを期待通過時刻の基準から外す")
 
 
+def test_same_lane_vehicle_wins_over_a_closer_adjacent_lane_one():
+    """時刻がより近くても、隣車線の車より同一車線の車を先に割り当てる。
+
+    追い越しの窓には隣車線を走る車も入る。時刻だけで選ぶと期待時刻が僅かに
+    ずれただけで隣車線の車を掴み、そのイベント本来の車が余ってしまう。
+    """
+    candidates = {
+        "001": [car("f10x+3.2", 1.0, lc_estimate=3.2),      # 隣車線・期待時刻ちょうど
+                car("f24x+1.1", 2.4, lc_estimate=1.1)],     # 同一車線・1.4秒ずれ
+    }
+    assignment = run_pipeline.assign_events({"001": 1.0}, candidates)
+    assert assignment["001"]["track_key"] == "f24x+1.1", assignment
+    assert assignment["001"]["delta"] == 1.4, assignment
+
+    # 同一車線の候補が無ければ、隣車線の車も従来どおり割り当てる
+    only_far = {"001": [car("f10x+3.2", 1.0, lc_estimate=3.2)]}
+    assert run_pipeline.assign_events({"001": 1.0}, only_far)["001"]["track_key"] == "f10x+3.2"
+
+    # 同一車線どうしなら従来どおり時刻の近い方が勝つ
+    both_near = {"001": [car("f10x+1.2", 1.0, lc_estimate=1.2),
+                         car("f24x+1.1", 2.4, lc_estimate=1.1)]}
+    assert run_pipeline.assign_events({"001": 1.0}, both_near)["001"]["track_key"] == "f10x+1.2"
+    print("  OK: 隣車線の車より同一車線の車を優先して割り当て")
+
+
+def test_same_lane_priority_frees_the_vehicle_for_the_next_event():
+    """隣車線の車を掴まなくなることで、後続イベントが本来の車を拾えるようになる。
+
+    実データ(260701/ID3)で起きていた取り違えの型。1台目のイベントが隣車線の車を
+    掴むと、そのイベント本来の車がどの候補にも割り当たらず捨てられていた。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5)
+                         + event_row("002", 3.5, 4.0, 4.5))
+
+        # 001 の期待通過時刻(1.0s)ちょうどに隣車線の車がいる。時刻だけで選ぶと 001 は
+        # そちらを掴み、本来の車(2.0s)はどの候補にも割り当たらず捨てられていた。
+        cars = [car("f10x+3.2", 1.0, lc_estimate=3.2, score=0.95),   # 隣車線
+                car("f20x+1.1", 2.0, lc_estimate=1.1, score=0.90),   # 001 の本来の車
+                car("f40x+1.0", 4.0, lc_estimate=1.0, score=0.90)]   # 002 の本来の車
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--no-lidar-extra"]))
+        report = execute_pipeline(config, tracker=scripted_tracker(cars))
+        track = next(s for s in report.to_dict()["stages"] if s["name"] == "autotrack")
+
+        assert track["assigned"] == {"001": "f20x+1.1", "002": "f40x+1.0"}, track["assigned"]
+        print("  OK: 隣車線の車を避けたことで両候補が本来の車を拾う")
+
+
 def test_unassigned_vehicle_is_reported_as_a_detection_gap():
     """どの候補にも割り当たらない車は、動画検出の取りこぼしとしてレポートへ挙げる。
 
