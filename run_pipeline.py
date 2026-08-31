@@ -14,6 +14,7 @@ GUI(`web_gui.py`)で人が Step1〜6 を順に操作していた作業を、1コ
 
 段階:
 
+    0. 撮影方向    --view / metadata.json が無ければ detect_view で自動判定
     1. 検出        detect_overtaking.py をサブプロセス実行
     2. GPS抽出     各動画の GoPro テレメトリ → out/gps/<stem>/telemetry_gps.xlsx
     3. 時刻同期    GoPro GPS と PCAP からオフセットを算出 → out/sync.json
@@ -38,6 +39,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from detect_view import (
+    DEFAULT_SAMPLE_SECONDS as VIEW_SAMPLE_SECONDS,
+    DEFAULT_SAMPLES as VIEW_SAMPLES,
+    DetectViewError,
+    detect_view,
+)
 from edit_csv import write_edit_analysis_xlsx, write_edit_csv
 from final_export import generate_final_workbook
 from lidar_pcap import VelodynePcap
@@ -54,13 +61,22 @@ VIDEO_SUFFIXES = {".mp4", ".mov"}
 # 実データ検証(260701/ID1)より: 1.5秒では接近区間が窓に入らずフェーズ2が
 # フォールバックになりやすい。5秒で追跡成功が大きく増える(5/66→15/66相当)。
 DEFAULT_TRACK_MARGIN = 5.0
-DEFAULT_VIEW = "rear"
+# 撮影方向は指定が無ければ段階0で自動判定する。判定不能のときだけこの値を仮定する
+# （既定値を front / rear のどちらかに固定すると自動判定が走らなくなる点に注意）。
+DEFAULT_VIEW = "front"
 
 STATUS_LABELS = {
     "ok": "完了",
     "skipped": "スキップ",
     "warning": "警告あり",
     "failed": "失敗",
+}
+
+VIEW_SOURCE_LABELS = {
+    "cli": "--view で明示指定",
+    "metadata": "metadata.json の指定",
+    "auto": "自動判定",
+    "fallback": "判定不能のため仮定",
 }
 
 
@@ -76,7 +92,12 @@ class PipelineConfig:
     out_dir: Path
     videos: list[Path]
     pcap_path: Path
-    view: str = DEFAULT_VIEW
+    #: "front" / "rear"。空文字なら段階0で自動判定する。
+    view: str = ""
+    #: view の決まり方: "cli" / "metadata" / "auto"（自動判定）
+    view_source: str = "auto"
+    view_samples: int = VIEW_SAMPLES
+    view_sample_seconds: float = VIEW_SAMPLE_SECONDS
     subject_id: str = ""
     collection_date: str = ""
     organize_id: str = ""
@@ -184,9 +205,16 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
     out_value = args.out or metadata.get("out")
     out_dir = Path(out_value).expanduser().resolve() if out_value else session_dir / "out_auto"
 
-    view = str(_pick(args.view, metadata, "view", DEFAULT_VIEW))
-    if view not in {"front", "rear"}:
-        raise PipelineError(f"--view は front / rear のどちらかです: {view}")
+    # 撮影方向: CLI > metadata.json > 自動判定（空文字＝段階0で判定する）
+    view = str(_pick(args.view, metadata, "view", ""))
+    if view and view not in {"front", "rear"}:
+        raise PipelineError(f"撮影方向は front / rear のどちらかです: {view}")
+    if args.view:
+        view_source = "cli"
+    elif view:
+        view_source = "metadata"
+    else:
+        view_source = "auto"
 
     return PipelineConfig(
         session_dir=session_dir,
@@ -194,6 +222,9 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         videos=videos,
         pcap_path=pcap_path,
         view=view,
+        view_source=view_source,
+        view_samples=int(args.view_samples),
+        view_sample_seconds=float(args.view_sample_seconds),
         subject_id=str(_pick(args.subject, metadata, "subject", session_dir.name)),
         collection_date=str(_pick(args.date, metadata, "date", session_dir.parent.name)),
         organize_id=str(_pick(args.organize_id, metadata, "organize_id", "")),
@@ -237,7 +268,8 @@ class PipelineReport:
             "out": str(config.out_dir),
             "videos": [str(v) for v in config.videos],
             "pcap": str(config.pcap_path),
-            "view": config.view,
+            "view": config.view or DEFAULT_VIEW,
+            "view_source": config.view_source,
             "subject_id": config.subject_id,
             "collection_date": config.collection_date,
             "organize_id": config.organize_id,
@@ -258,7 +290,7 @@ class PipelineReport:
             f"出力先       : {data['out']}",
             f"動画         : {', '.join(Path(v).name for v in data['videos'])}",
             f"PCAP         : {Path(data['pcap']).name}",
-            f"撮影方向     : {data['view']}",
+            f"撮影方向     : {data['view']}（{VIEW_SOURCE_LABELS.get(data['view_source'], data['view_source'])}）",
             f"被験者       : {data['subject_id']}",
             f"データ収集日 : {data['collection_date']}",
             f"実行         : {data['started_at']} 〜 {data['finished_at']}"
@@ -297,6 +329,100 @@ class PipelineReport:
         )
         text_path.write_text(self.to_text(), encoding="utf-8")
         return json_path, text_path
+
+
+# ── 段階0: 撮影方向 ───────────────────────────────────────────────────────────
+
+VIEW_MANUAL_ACTION = (
+    "撮影方向を自動判定できませんでした。out/clips のクリップで前向き／後ろ向きを確認し、"
+    f"--view front / --view rear を指定して再実行してください（暫定で {DEFAULT_VIEW} を使用）"
+)
+
+
+def resolve_view(config: PipelineConfig, report: PipelineReport, detector=None) -> str:
+    """撮影方向を決める。明示指定が常に優先し、無い場合だけ自動判定する。
+
+    `detector` は差し替え用（既定は ``detect_view.detect_view``）。判定不能でも
+    パイプラインは止めず、``DEFAULT_VIEW`` を仮定して警告と人手項目を残す。
+    """
+    if config.view:
+        report.stage(
+            "view", "0.撮影方向", "ok",
+            f"{config.view}（{VIEW_SOURCE_LABELS[config.view_source]}）",
+            view=config.view, source=config.view_source,
+        )
+        return config.view
+
+    if config.skip_detect:
+        # 検出をやり直さないなら方向は結果に影響しない。GPU時間を使わずに済ませる
+        config.view = DEFAULT_VIEW
+        config.view_source = "fallback"
+        report.stage(
+            "view", "0.撮影方向", "skipped",
+            "検出を行わないため自動判定は不要です",
+            view=config.view, source=config.view_source,
+        )
+        return config.view
+
+    detector = detector or detect_view
+    try:
+        result = detector(
+            config.videos, config.out_dir / "view_probe",
+            samples=config.view_samples, sample_seconds=config.view_sample_seconds,
+        )
+    except DetectViewError as exc:
+        config.view = DEFAULT_VIEW
+        config.view_source = "fallback"
+        report.stage("view", "0.撮影方向", "failed", f"自動判定に失敗しました: {exc}",
+                     view=config.view, source=config.view_source)
+        report.warn(f"撮影方向を自動判定できません: {exc}")
+        report.manual(VIEW_MANUAL_ACTION)
+        return config.view
+    except Exception as exc:  # noqa: BLE001 - 自動判定の失敗でパイプラインを止めない
+        config.view = DEFAULT_VIEW
+        config.view_source = "fallback"
+        report.stage("view", "0.撮影方向", "failed", f"自動判定で予期しないエラー: {exc}",
+                     view=config.view, source=config.view_source)
+        report.warn(f"撮影方向の自動判定で予期しないエラー: {exc}")
+        report.manual(VIEW_MANUAL_ACTION)
+        return config.view
+
+    result = result or {}
+    detail = dict(result.get("detail") or {})
+    view = result.get("view")
+    confidence = float(result.get("confidence") or 0.0)
+    ratio = detail.get("radial_ratio")
+    evidence = (
+        f"背景フローの放射成分 {ratio:+.2f}" if isinstance(ratio, (int, float))
+        else "背景フローを測定できず"
+    ) + f" / 走行中 {detail.get('moving_pairs', '?')}フレーム対"
+    if view in {"front", "rear"}:
+        config.view = view
+        config.view_source = "auto"
+        report.stage(
+            "view", "0.撮影方向", "ok",
+            f"{view} と判定しました（確信度 {confidence:.2f}、{evidence}）",
+            view=view, source="auto", confidence=confidence, detail=detail,
+        )
+        report.info["撮影方向の判定根拠"] = detail.get("reason", "")
+        if confidence < 0.8:
+            report.warn(
+                f"撮影方向の自動判定の確信度が低めです（{confidence:.2f}）。"
+                "検出結果が明らかに少ない場合は --view を明示して再実行してください"
+            )
+        return view
+
+    config.view = DEFAULT_VIEW
+    config.view_source = "fallback"
+    report.stage(
+        "view", "0.撮影方向", "warning",
+        f"判定不能のため {DEFAULT_VIEW} を仮定します（{evidence}）",
+        view=config.view, source="fallback", confidence=0.0, detail=detail,
+    )
+    report.info["撮影方向の判定根拠"] = detail.get("reason", "")
+    report.warn(f"撮影方向を自動判定できませんでした: {detail.get('reason', '')}")
+    report.manual(VIEW_MANUAL_ACTION)
+    return config.view
 
 
 # ── 段階1: 検出 ───────────────────────────────────────────────────────────────
@@ -681,10 +807,11 @@ def run_final_export(config: PipelineConfig, pcap: VelodynePcap, offset: float,
 
 # ── パイプライン本体 ──────────────────────────────────────────────────────────
 
-def run_pipeline(config: PipelineConfig, tracker=None) -> PipelineReport:
+def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None) -> PipelineReport:
     report = PipelineReport(config)
     config.out_dir.mkdir(parents=True, exist_ok=True)
     try:
+        resolve_view(config, report, detector=view_detector)
         events_csv = run_detection(config, report)
         run_gps_extraction(config, report)
 
@@ -721,7 +848,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("session", help="撮影セッションフォルダ（GOPRO/ と LiDAR/ を含む）")
     parser.add_argument("--out", default="", help="出力先（既定: <セッション>/out_auto）")
-    parser.add_argument("--view", default=None, choices=["front", "rear"], help="撮影方向")
+    parser.add_argument("--view", default=None, choices=["front", "rear"],
+                        help="撮影方向（省略時は metadata.json、それも無ければ自動判定）")
+    parser.add_argument("--view-samples", type=int, default=VIEW_SAMPLES,
+                        help=f"撮影方向を自動判定するサンプル箇所数（既定: {VIEW_SAMPLES}）")
+    parser.add_argument("--view-sample-seconds", type=float, default=VIEW_SAMPLE_SECONDS,
+                        help=f"自動判定サンプル1箇所の長さ秒（既定: {VIEW_SAMPLE_SECONDS:.0f}）")
     parser.add_argument("--subject", default="", help="被験者名またはID（既定: セッションフォルダ名）")
     parser.add_argument("--date", default="", help="データ収集日（既定: セッションの親フォルダ名 YYMMDD）")
     parser.add_argument("--organize-id", default="", help="整理ID")
