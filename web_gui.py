@@ -905,7 +905,11 @@ def run_check() -> None:
     # Step6: 採用候補とedit.csv分析から共有用Excelを生成する。
     with tempfile.TemporaryDirectory() as temp_value:
         from zipfile import ZipFile
-        from final_export import _vehicle_speed_kmh
+        from final_export import DANGER_BY_LEVEL, _vehicle_speed_kmh
+
+        # 危険感は未設定("0")なら空欄。全自動実行では人が後から入力する。
+        assert DANGER_BY_LEVEL["0"] == "", DANGER_BY_LEVEL
+        assert DANGER_BY_LEVEL["2"] == "危険", DANGER_BY_LEVEL
 
         out_dir = Path(temp_value) / "260701_4"
         edit_dir = out_dir / "lidar_edit"

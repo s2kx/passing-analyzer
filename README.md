@@ -108,6 +108,91 @@ GUIを開かず起動環境だけ確認する場合:
 .\起動.bat --check
 ```
 
+## 全自動実行 (run_pipeline.py)
+
+撮影セッションフォルダを指定すると、検出から最終Excel出力までを1コマンドで通す。
+GUIのStep1〜6を人が順に操作する代わりに使う。
+
+```powershell
+.venv\Scripts\python.exe run_pipeline.py E:\データ\260701\ID1
+.venv\Scripts\python.exe run_pipeline.py E:\データ\260701\ID1 --view rear --organize-id 1
+.venv\Scripts\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect   # 検出済みの続きから
+```
+
+### 入力フォルダの規約
+
+```text
+<セッション>\           … フォルダ名が既定の被験者ID (例 ID1)
+  GOPRO\*.MP4          … GoPro動画。ファイル名順に1本の連結タイムラインとして扱う
+  LiDAR\*.pcap         … Velodyne PCAP (1つ)
+  metadata.json        … 任意。{"subject":..,"date":..,"view":..,"organize_id":..}
+```
+
+親フォルダ名が `YYMMDD`(例 `260701`)ならデータ収集日として使う。`metadata.json` があれば
+読み込み、CLI引数のほうが優先される。動画やPCAPが規約どおりに置かれていない場合は
+`--videos` / `--pcap` で明示指定する。
+
+### 主なオプション
+
+| オプション | 既定 | 説明 |
+|-----------|------|------|
+| `--out` | `<セッション>\out_auto` | 出力先 |
+| `--view` | `rear` | 撮影方向。`front` / `rear` |
+| `--subject` | セッションフォルダ名 | 被験者名またはID |
+| `--date` | セッションの親フォルダ名 | データ収集日 (`YYMMDD` / `YYYY-MM-DD`) |
+| `--organize-id` | (空) | 整理ID。空なら候補IDを使う |
+| `--videos` / `--pcap` | (自動発見) | 入力を明示指定する |
+| `--skip-detect` | off | 段階1のYOLO検出を行わない (既存CSVを使う) |
+| `--redetect` | off | 既存CSVがあっても検出をやり直す |
+| `--skip-gps` | off | 段階2のGPSテレメトリ抽出を行わない |
+| `--offset` | (GPS自動同期) | 時刻オフセット(秒)を手動指定する |
+| `--track-margin` | `1.5` | 点群追跡に使う候補前後のマージン(秒) |
+
+`overtaking_events.csv` が既にある場合、段階1は自動でスキップされる。
+
+### 実行される段階
+
+1. **検出** — `detect_overtaking.py` をサブプロセス実行 (`--view` / `--out` / `--clip`)
+2. **GPS抽出** — 各動画のGoProテレメトリ → `out/gps/<動画名>/telemetry_gps.xlsx`。失敗しても続行
+3. **時刻同期** — 先頭動画のGPS UTCとPCAP開始時刻からオフセットを算出 → `out/sync.json`
+4. **自動レビュー** — 候補の採用判定 → `out/reviewed_overtaking_events.csv`
+   (現段階は暫定で全候補を採用する)
+5. **点群自動追跡** — `lidar_autotrack` プラグインで車両を追跡 → `out/lidar/overtaking_*.csv`
+6. **edit CSV** — 最近接点の軌跡と解析Excel → `out/lidar_edit/`
+7. **最終Excel** — `out/final/<出力フォルダ名>_final.xlsx`
+8. **レポート** — `out/pipeline_report.json` と `out/pipeline_report.txt`
+
+レポートには各段階の成否、オフセット値、候補数、警告、**人手が必要な項目**の一覧が出る。
+段階2〜7は個別の失敗で止まらず、その候補を「手動作業が必要」としてレポートへ記録して続行する。
+
+### 点群自動追跡プラグイン
+
+段階5は `lidar_autotrack` モジュールを任意の依存として読み込む。モジュールが無い場合は
+その候補を「GUIで手動選択が必要」としてレポートに記録し、残りの段階を続行する。
+
+```python
+from lidar_pcap import VelodynePcap
+
+def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
+                     side: str = "right") -> dict:
+    """追い越し区間のフレームごとに車両を囲う矩形を返す。
+
+    戻り値: {
+        "ok": bool,
+        "frames": [{"index": int,
+                    "bounds": {"min_x":.., "max_x":.., "min_y":.., "max_y":..}}],
+        "confidence": float,
+        "warnings": [str],
+    }
+    """
+```
+
+### 危険感の扱い
+
+危険感は被験者の申告値なので全自動実行では**空欄**にする。最終Excelの「危険感」列は
+レビューで 1〜3 を明示した場合だけ「やや危険 / 危険 / 非常に危険」になり、未設定なら空欄。
+セルには従来どおり入力候補のリストが付いているので、後から人が選択して埋める。
+
 ## 主なオプション
 
 | オプション | 既定 | 説明 |
@@ -241,9 +326,13 @@ GoProの向き・画角で変わるため既定では無効になっている。
 ```powershell
 .\portable\python\python.exe test_logic.py
 .\portable\python\python.exe web_gui.py --check
+.\portable\python\python.exe test_pipeline.py
 ```
 
-判定ロジック(`classify_overtaking`)を YOLO/動画なしの合成軌跡で検証する。
+- `test_logic.py` … 判定ロジック(`classify_overtaking`)を YOLO/動画なしの合成軌跡で検証する
+- `web_gui.py --check` … GUI画面・PCAP読み込み・edit CSV・最終Excel生成を検証する
+- `test_pipeline.py` … `run_pipeline.py` の段階4〜8を、合成PCAPと一時フォルダで検証する
+  (YOLO検出は実行しない)
 
 ## 既知の制約 / 今後
 
