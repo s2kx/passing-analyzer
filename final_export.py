@@ -22,7 +22,9 @@ FINAL_HEADERS = [
 ]
 VEHICLE_LIST = ["普通", "軽", "大型", "二輪"]
 DANGER_LIST = ["非常に危険", "危険", "やや危険", "なし"]
-DANGER_BY_LEVEL = {"0": "なし", "1": "やや危険", "2": "危険", "3": "非常に危険"}
+# 危険感は被験者の申告値。レビューで 1〜3 を明示した場合だけラベルを入れ、
+# 未設定("0")は空欄にする（全自動実行では人が後から入力する）。
+DANGER_BY_LEVEL = {"0": "", "1": "やや危険", "2": "危険", "3": "非常に危険"}
 EXCEL_EPOCH = datetime(1899, 12, 30, tzinfo=timezone.utc)
 JST = timezone(timedelta(hours=9))
 
@@ -265,7 +267,7 @@ def _final_rows(
             Cell(_round_or_blank(metrics.get("lc")), 4),
             Cell(_round_or_blank(bike_speed), 4),
             Cell(_round_or_blank(vehicle_speed), 4),
-            Cell(DANGER_BY_LEVEL.get(str(event.get("danger_level", "0")), "なし"), 0),
+            Cell(DANGER_BY_LEVEL.get(str(event.get("danger_level", "0")), ""), 0),
             Cell(_round_or_blank(metrics.get("passing_time")), 4),
             Cell(_round_or_blank(metrics.get("distance_p2")), 4),
             Cell(_round_or_blank(metrics.get("distance_p3")), 4),
