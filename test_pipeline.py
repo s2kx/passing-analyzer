@@ -163,7 +163,8 @@ def test_session_discovery_and_metadata():
 
         # metadata.json だけの場合はその値を使う
         config = build_config(parse_args([str(session)]))
-        assert config.view == "front" and config.subject_id == "ID9"
+        assert config.view == "front" and config.view_source == "metadata", config
+        assert config.subject_id == "ID9"
         assert config.organize_id == "7" and config.collection_date == "2026-07-01"
         assert config.out_dir == session / "out_auto", config.out_dir
 
@@ -172,7 +173,8 @@ def test_session_discovery_and_metadata():
             str(session), "--view", "rear", "--subject", "ID1", "--organize-id", "3",
             "--out", str(session / "custom"),
         ]))
-        assert config.view == "rear" and config.subject_id == "ID1"
+        assert config.view == "rear" and config.view_source == "cli", config
+        assert config.subject_id == "ID1"
         assert config.organize_id == "3" and config.out_dir == session / "custom"
         print("  OK: セッション自動発見と metadata.json / CLI の優先順")
 
@@ -368,6 +370,137 @@ def test_danger_level_is_blank_unless_reviewed():
         assert sheet_cell(sheet_xml, "G2") == "", "危険感0が空欄になっていない"
         assert sheet_cell(sheet_xml, "G3") == "危険", "危険感2のラベルが失われている"
         print("  OK: 危険感は未設定なら空欄、明示した場合だけラベルを出す")
+
+
+def _stub_view_detector(view, confidence=0.9, calls=None):
+    """段階0に差し込む detect_view のスタブ。"""
+
+    def detector(videos, work_dir, *, samples=3, sample_seconds=60.0):
+        if calls is not None:
+            calls.append((list(videos), samples, sample_seconds))
+        return {
+            "view": view,
+            "confidence": confidence if view else 0.0,
+            "detail": {
+                "method": "background_optical_flow",
+                "radial_ratio": {"front": 0.87, "rear": -0.81}.get(view, 0.05),
+                "moving_pairs": 120,
+                "reason": "テスト用のスタブ判定",
+            },
+        }
+
+    return detector
+
+
+def _run_with_existing_events(session: Path, argv: list[str], detector, calls=None):
+    """検出済みCSVを置いた状態でパイプラインを回し、段階の状態を返す。"""
+    out_dir = session / "out_auto"
+    write_events_csv(out_dir, "001,普通,car,right,0.5,2.5,4.5,4.0,0.1,0,GX010001.MP4,0.5,4.5\n")
+    config = build_config(parse_args([str(session), *argv]))
+    report = execute_pipeline(config, tracker=dummy_tracker(), view_detector=detector)
+    data = report.to_dict()
+    return config, data, {stage["name"]: stage for stage in data["stages"]}
+
+
+def test_view_explicit_option_skips_auto_detection():
+    """--view の明示指定が常に優先し、自動判定は走らせない。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        calls: list = []
+        config, data, stages = _run_with_existing_events(
+            session, ["--skip-gps", "--view", "rear"],
+            _stub_view_detector("front", calls=calls),
+        )
+        assert config.view == "rear" and config.view_source == "cli", config
+        assert stages["view"]["status"] == "ok", stages["view"]
+        assert calls == [], "明示指定なのに自動判定が走った"
+        assert data["view"] == "rear", data
+        print("  OK: --view の明示指定は自動判定より優先される")
+
+
+def test_view_metadata_skips_auto_detection():
+    """metadata.json に view があれば自動判定しない。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value), metadata={"view": "front"})
+        calls: list = []
+        config, _, stages = _run_with_existing_events(
+            session, ["--skip-gps"], _stub_view_detector("rear", calls=calls),
+        )
+        assert config.view == "front" and config.view_source == "metadata", config
+        assert calls == [], "metadata.json の指定があるのに自動判定が走った"
+        assert "metadata.json" in stages["view"]["message"], stages["view"]
+        print("  OK: metadata.json の view があれば自動判定しない")
+
+
+def test_view_is_auto_detected_when_unspecified():
+    """--view も metadata.json も無ければ自動判定し、根拠をレポートへ残す。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        calls: list = []
+        config, data, stages = _run_with_existing_events(
+            session, ["--skip-gps"], _stub_view_detector("front", calls=calls),
+        )
+        assert config.view == "front" and config.view_source == "auto", config
+        assert len(calls) == 1 and calls[0][0] == config.videos, calls
+        assert stages["view"]["status"] == "ok", stages["view"]
+        assert stages["view"]["confidence"] == 0.9, stages["view"]
+        # 判定根拠（背景フローの放射成分）がレポートの段階メッセージに残る
+        assert "放射成分 +0.87" in stages["view"]["message"], stages["view"]
+        assert data["view_source"] == "auto", data
+        assert data["info"]["撮影方向の判定根拠"] == "テスト用のスタブ判定", data["info"]
+        assert "撮影方向" in report_text(session), "レポート本文に撮影方向が出ていない"
+        print("  OK: 撮影方向が未指定なら自動判定して根拠を記録する")
+
+
+def test_view_undecided_falls_back_to_front_with_manual_action():
+    """判定不能なら front を仮定し、警告と人手項目を残す（パイプラインは止めない）。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        config, data, stages = _run_with_existing_events(
+            session, ["--skip-gps"], _stub_view_detector(None),
+        )
+        assert config.view == "front" and config.view_source == "fallback", config
+        assert stages["view"]["status"] == "warning", stages["view"]
+        assert any("自動判定できません" in item for item in data["warnings"]), data["warnings"]
+        assert any("--view" in item for item in data["manual_actions"]), data["manual_actions"]
+        # 判定不能でも後続段階は動く
+        assert stages["review"]["status"] == "ok", stages
+        print("  OK: 判定不能時は front を仮定して警告と人手項目を出す")
+
+
+def test_view_detection_error_does_not_stop_pipeline():
+    """自動判定が例外で落ちても、front を仮定して続行する。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+
+        def broken(videos, work_dir, *, samples=3, sample_seconds=60.0):
+            raise run_pipeline.DetectViewError("ffmpeg が見つかりません")
+
+        config, data, stages = _run_with_existing_events(session, ["--skip-gps"], broken)
+        assert config.view == "front" and config.view_source == "fallback", config
+        assert stages["view"]["status"] == "failed", stages["view"]
+        assert stages["final"]["status"] in {"ok", "warning"}, stages
+        assert any("ffmpeg" in item for item in data["warnings"]), data["warnings"]
+        print("  OK: 自動判定の失敗でパイプラインを止めない")
+
+
+def test_view_auto_detection_is_skipped_with_skip_detect():
+    """--skip-detect なら検出をやり直さないので、GPUを使う自動判定も行わない。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        calls: list = []
+        config, _, stages = _run_with_existing_events(
+            session, ["--skip-gps", "--skip-detect"],
+            _stub_view_detector("rear", calls=calls),
+        )
+        assert calls == [], "--skip-detect なのに自動判定が走った"
+        assert stages["view"]["status"] == "skipped", stages["view"]
+        assert config.view == "front", config
+        print("  OK: --skip-detect 時は自動判定を行わない")
+
+
+def report_text(session: Path) -> str:
+    return (session / "out_auto" / "pipeline_report.txt").read_text(encoding="utf-8")
 
 
 def test_detection_command_matches_gui():
