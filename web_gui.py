@@ -995,7 +995,7 @@ def run_ui_smoke(api: AppApi, server: UiServer, url: str) -> None:
                   changeVehicleType(0, '軽');
                   decide('採用');
                   const afterDecision = { selected: state.selected, firstStatus: state.events[0].review_status, firstClass: state.events[0].class };
-                  document.dispatchEvent(new KeyboardEvent('keydown', {key:'x', bubbles:true}));
+                  document.dispatchEvent(new KeyboardEvent('keydown', {key: state.shortcuts.reject, bubbles:true}));
                   return {
                     before,
                     afterDecision,
