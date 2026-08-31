@@ -586,6 +586,86 @@ def test_unassigned_vehicle_is_reported_as_a_detection_gap():
         print("  OK: 割り当て先の無い車を検出の取りこぼし候補として報告")
 
 
+def test_lidar_only_vehicle_is_issued_as_an_unreviewed_row():
+    """割り当て先の無い車を L### の「未確認」行として起票する。
+
+    動画検出が取りこぼした車は、点群CSV・edit CSV まで作ってレビューCSVへ
+    ``review_status="未確認"`` で残す。列は動画由来の候補行と同じ構成にそろえ、
+    最終Excel（採用行のみ）へは出さない。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5)
+                         + event_row("002", 3.5, 4.0, 4.5))
+
+        cars = [car("f10x+1.8", 1.0), car("f40x+2.0", 4.0),
+                car("f25x+1.9", 2.5, lc_estimate=1.0, score=0.95)]   # 候補の無い車
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        assert config.lidar_extra is True, config
+        report = execute_pipeline(config, tracker=scripted_tracker(cars))
+        data = report.to_dict()
+
+        # 点群CSVとedit CSVが L001 として残る
+        assert (out_dir / "lidar" / "overtaking_L001.csv").is_file()
+        assert (out_dir / "lidar_edit" / "overtaking_L001_edit.csv").is_file()
+        track = next(s for s in data["stages"] if s["name"] == "autotrack")
+        assert len(track["lidar_extra"]) == 1, track
+        assert "候補 2 件のうち 2 件" in track["message"], track["message"]
+
+        # レビューCSVでは「未確認」。列は動画由来の候補行と同じ構成のまま
+        reviewed = read_reviewed(out_dir)
+        assert [row["event_id"] for row in reviewed] == ["001", "002", "L001"], reviewed
+        extra = reviewed[-1]
+        assert extra["review_status"] == "未確認", extra
+        assert "対応する検出候補がありません" in extra["review_reason"], extra
+        assert set(extra) == set(reviewed[0]), (set(extra) ^ set(reviewed[0]))
+        assert "lidar_extra" not in extra, extra
+        # 時刻は動画側の秒で入り、veloview 表示（pcap時刻）も埋まる
+        assert 2.0 <= float(extra["peak_t_s"]) <= 3.0, extra
+        assert extra["veloview_peak_t"] and extra["class"] == "", extra
+
+        review = next(s for s in data["stages"] if s["name"] == "review")
+        assert (review["accepted"], review["unreviewed"]) == (2, 1), review
+        # 最終Excelは採用のみ（2行）。3行目は空
+        with ZipFile(out_dir / "final" / "out_auto_final.xlsx") as book:
+            sheet_xml = book.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert sheet_cell(sheet_xml, "C3") == "ID1", sheet_xml[:200]
+        assert sheet_cell(sheet_xml, "C4") == "", "未確認の行が最終Excelに出ている"
+        assert any("L001" in item for item in data["manual_actions"]), data["manual_actions"]
+        print("  OK: 割り当て先の無い車を L001 の「未確認」行として起票")
+
+
+def test_no_lidar_extra_skips_the_issue_and_cleans_up():
+    """--no-lidar-extra なら起票せず、前回の L### 出力も残さない。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5)
+                         + event_row("002", 3.5, 4.0, 4.5))
+        cars = [car("f10x+1.8", 1.0), car("f40x+2.0", 4.0),
+                car("f25x+1.9", 2.5, lc_estimate=1.0, score=0.95)]
+
+        # まず起票する実行で L001 を作る
+        execute_pipeline(build_config(parse_args([str(session), "--skip-detect", "--skip-gps"])),
+                         tracker=scripted_tracker(cars))
+        assert (out_dir / "lidar" / "overtaking_L001.csv").is_file()
+
+        # 同じ出力先へ --no-lidar-extra で再実行すると、起票も前回の出力も消える
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--no-lidar-extra"]))
+        assert config.lidar_extra is False, config
+        data = execute_pipeline(config, tracker=scripted_tracker(cars)).to_dict()
+        assert not (out_dir / "lidar" / "overtaking_L001.csv").exists()
+        assert not (out_dir / "lidar_edit" / "overtaking_L001_edit.csv").exists()
+        assert [row["event_id"] for row in read_reviewed(out_dir)] == ["001", "002"]
+        review = next(s for s in data["stages"] if s["name"] == "review")
+        assert review["unreviewed"] == 0, review
+        # 起票しなくても取りこぼしの報告そのものは残る
+        assert data["info"]["割り当て先の無い車(動画検出の取りこぼし候補)"] == 1, data["info"]
+        print("  OK: --no-lidar-extra で起票を止め、前回のL###も削除する")
+
+
 def test_measured_lc_overrides_the_tracking_estimate():
     """edit解析で LC が求まれば、追跡時の目安ではなく実測値でしきい値判定する。
 
