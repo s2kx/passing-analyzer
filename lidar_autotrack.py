@@ -71,6 +71,23 @@ MIN_CLUSTER_POINTS = 6
 GATE_DISTANCE = 3.0
 MAX_MISSED_FRAMES = 3
 
+# 対応づけの速度整合。等速度予測の最近傍だけで対応づけると、注目領域の遠端
+# （|Y| ≒ 30m）で「遠ざかる静止物」と「近づいてくる追い越し車」がすれ違うときに
+# 静止物のトラックが車へ乗り移る。遠端では点がまばらでクラスタが小さく、両者の
+# 見かけの位置が 3m 以内まで近づくためで、乗り移ったトラックは前進と後退が
+# 混ざって Y 速度がほぼ 0 になり、追い越し車として同定できなくなる
+# （260701/ID1 の 395.1s がこれで取りこぼされていた）。
+# 進行方向がはっきりしているトラックについては、進行方向を反転させる観測を
+# 別の物体とみなして対応づけない。
+# しきい値 12m/s の根拠(260701/ID1 の実測): クラスタ重心は見えている面が変わるだけで
+# 揺れるため、同じ物体でも 1 フレームで 5〜6m/s の見かけの揺り戻しが出る。一方で
+# 乗り移りは -4.6m/s のトラックへ +9.6m/s の観測が入る（差 14m/s）形で起きる。
+# 6m/s まで下げると同じ物体のトラックまで細切れになり、断片が別の車に見えて誤検出が
+# 増えたので、揺り戻しの実測幅より十分大きく、乗り移りより小さい 12m/s を採る。
+VELOCITY_LOCK_FRAMES = 3      # 進行方向が確定したとみなす最小観測数
+VELOCITY_LOCK_SPEED = 2.0     # 進行方向が確定したとみなす Y 速度 (m/s)
+MAX_SPEED_REVERSAL = 12.0     # 反転を許す Y 速度差の上限 (m/s)
+
 # 追い越し車両の同定条件
 MIN_TRACK_FRAMES = 5
 MIN_RELATIVE_SPEED = 1.0      # 自転車に対する前進速度 (m/s)
@@ -391,12 +408,43 @@ class Track:
         self.missed = 0
 
 
+def velocity_compatible(track: Track, cluster: Cluster,
+                        max_reversal: float = MAX_SPEED_REVERSAL,
+                        lock_frames: int = VELOCITY_LOCK_FRAMES,
+                        lock_speed: float = VELOCITY_LOCK_SPEED) -> bool:
+    """観測がトラックの進行方向と両立するかを判定する。
+
+    進行方向が確定したトラック（``lock_frames`` 回以上観測され、Y 速度の大きさが
+    ``lock_speed`` 以上）に対して、Y 速度の符号を反転させ、かつ速度差が
+    ``max_reversal`` を超える観測は別の物体とみなして ``False`` を返す。
+
+    注目領域の遠端では点がまばらで、遠ざかる静止物と近づいてくる追い越し車の
+    クラスタが数メートルまで近づく。距離だけで対応づけると静止物のトラックが
+    車へ乗り移り、前進と後退が混ざって追い越し車として同定できなくなる。
+    実際の車両は 0.1 秒で進行方向を反転できないので、この判定で切り分けられる。
+    クラスタ重心は見えている面が変わるだけで揺れるため、同じ物体でも数 m/s の
+    揺り戻しは出る。それで細切れにしないよう ``max_reversal`` は広めに取る。
+    """
+    if len(track.clusters) < lock_frames or abs(track.velocity_y) < lock_speed:
+        return True
+    last = track.clusters[-1]
+    dt = cluster.timestamp - last.timestamp
+    if dt <= 1e-6:
+        return True
+    speed_y = (cluster.center_y - last.center_y) / dt
+    if speed_y * track.velocity_y >= 0:
+        return True
+    return abs(speed_y - track.velocity_y) <= max_reversal
+
+
 class Tracker:
     """クラスタ重心を等速度予測つき最近傍で対応づける簡易トラッカー。"""
 
-    def __init__(self, gate: float = GATE_DISTANCE, max_missed: int = MAX_MISSED_FRAMES):
+    def __init__(self, gate: float = GATE_DISTANCE, max_missed: int = MAX_MISSED_FRAMES,
+                 max_reversal: float = MAX_SPEED_REVERSAL):
         self.gate = gate
         self.max_missed = max_missed
+        self.max_reversal = max_reversal
         self.active: list[Track] = []
         self.finished: list[Track] = []
         self._next_id = 0
@@ -410,7 +458,8 @@ class Tracker:
             px, py = track.predict(timestamp)
             for ci, cluster in enumerate(clusters):
                 distance = math.hypot(cluster.center_x - px, cluster.center_y - py)
-                if distance <= self.gate:
+                if distance <= self.gate and velocity_compatible(
+                        track, cluster, self.max_reversal):
                     pairs.append((distance, ti, ci))
         pairs.sort()
         used_tracks: set[int] = set()
@@ -443,9 +492,10 @@ class Tracker:
 
 
 def build_tracks(frames: list[tuple[int, float, list[Cluster]]],
-                 gate: float = GATE_DISTANCE, max_missed: int = MAX_MISSED_FRAMES) -> list[Track]:
+                 gate: float = GATE_DISTANCE, max_missed: int = MAX_MISSED_FRAMES,
+                 max_reversal: float = MAX_SPEED_REVERSAL) -> list[Track]:
     """``(フレーム番号, 時刻, クラスタ列)`` の並びからトラックを構築する。"""
-    tracker = Tracker(gate=gate, max_missed=max_missed)
+    tracker = Tracker(gate=gate, max_missed=max_missed, max_reversal=max_reversal)
     for _index, timestamp, clusters in frames:
         tracker.update(clusters, timestamp)
     return tracker.tracks()

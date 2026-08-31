@@ -11,10 +11,10 @@ PCAP を使わず、numpy で合成した点群（地面平面 + 静止障害物
 import numpy as np
 
 from lidar_autotrack import (
-    MIN_TRACK_FRAMES, Cluster, Tracker, build_tracks, cluster_points, detect_clusters,
-    estimate_forward_sign, estimate_ground_plane, estimate_ground_z, filter_points,
-    ground_height, score_track, select_overtaking, summarize_track,
-    track_key_matches, track_overtaking, track_to_frames,
+    MIN_TRACK_FRAMES, ROI_MAX_ABS_Y, Cluster, Track, Tracker, build_tracks, cluster_points,
+    detect_clusters, estimate_forward_sign, estimate_ground_plane, estimate_ground_z,
+    filter_points, ground_height, score_track, select_overtaking, summarize_track,
+    track_key_matches, track_overtaking, track_to_frames, velocity_compatible,
 )
 
 
@@ -243,6 +243,101 @@ def test_tracker_bridges_short_loss():
     summary = summarize_track(vehicle)
     assert summary.frames == 28 and summary.span == 30
     print("  OK: 2フレームのロストを跨いで追跡継続")
+
+
+def _cluster(frame: int, x: float, y: float, length: float = 4.6, width: float = 1.8,
+             count: int = 60) -> Cluster:
+    """指定位置・寸法のクラスタを 1 つ作る（トラッキングの単体テスト用）。"""
+    return Cluster(
+        frame=frame, timestamp=frame * FRAME_INTERVAL, center_x=x, center_y=y,
+        min_x=x - width / 2, max_x=x + width / 2,
+        min_y=y - length / 2, max_y=y + length / 2, count=count,
+    )
+
+
+# 注目領域の遠端ですれ違う「遠ざかる静止物」と「近づいてくる追い越し車」。
+# 実データ(260701/ID1)の 395.1s と同じ形: 静止物は 65 フレーム追われたあと遠端
+# Y=-29m で見えなくなり、そこへ追い越し車が Y=-28m から入ってくる（相対 +6m/s で
+# 57 フレーム）。距離だけで対応づけると静止物のトラックが車へ乗り移り、前進と後退が
+# 混ざって Y 速度がほぼ 0 になるため、追い越し車として同定できなくなる。
+CROSSING_HANDOVER_FRAME = 65
+CAR_SPEED = 6.0
+
+
+def crossing_frames(count: int = 122) -> list[tuple[int, float, list[Cluster]]]:
+    """遠端で静止物と追い越し車がすれ違う場面を合成する。"""
+    frames = []
+    for frame in range(count):
+        t = frame * FRAME_INTERVAL
+        clusters = []
+        for base_x, base_y, length, width in ((-5.5, 12.0, 6.0, 0.6),   # 壁
+                                              (6.2, 20.0, 4.4, 1.7)):   # 路駐車
+            y = base_y - BIKE_SPEED * t
+            if abs(y) <= ROI_MAX_ABS_Y:          # 遠端を出た静止物は見えない
+                clusters.append(_cluster(frame, base_x, y, length, width))
+        if frame < CROSSING_HANDOVER_FRAME:      # 遠端で見えなくなる静止物
+            clusters.append(_cluster(frame, 2.0, 3.0 - BIKE_SPEED * t))
+        if frame >= CROSSING_HANDOVER_FRAME:     # 遠端から入ってくる追い越し車
+            clusters.append(_cluster(
+                frame, 2.2,
+                -28.0 + CAR_SPEED * (t - CROSSING_HANDOVER_FRAME * FRAME_INTERVAL)))
+        frames.append((frame, t, clusters))
+    return frames
+
+
+def test_velocity_compatible_rejects_direction_reversal():
+    """進行方向が確定したトラックは、向きを反転させる観測を受け付けない。"""
+    track = Track(track_id=0)
+    for frame in range(4):
+        track.append(_cluster(frame, 2.0, -20.0 - BIKE_SPEED * frame * FRAME_INTERVAL))
+    assert track.velocity_y < -4.0, track.velocity_y
+    # 遠ざかっているトラックへ、近づいてくる車の観測は結び付けない
+    approaching = _cluster(4, 2.2, track.clusters[-1].center_y + 1.0)
+    assert not velocity_compatible(track, approaching)
+    # 同じ向きの観測と、重心の揺れ程度（数 m/s）の揺り戻しは通す。ここを狭めると
+    # 同じ物体のトラックが細切れになり、断片が別の車に見えて誤検出が増える
+    assert velocity_compatible(track, _cluster(4, 2.0, track.clusters[-1].center_y - 0.5))
+    assert velocity_compatible(track, _cluster(4, 2.0, track.clusters[-1].center_y + 0.05))
+    assert velocity_compatible(track, _cluster(4, 2.0, track.clusters[-1].center_y + 0.6))
+    # 進行方向が定まっていない（観測数・速度が足りない）トラックには効かない
+    slow = Track(track_id=1)
+    for frame in range(4):
+        slow.append(_cluster(frame, 2.0, -20.0 - 0.5 * frame * FRAME_INTERVAL))
+    assert velocity_compatible(slow, _cluster(4, 2.0, slow.clusters[-1].center_y + 1.0))
+    print("  OK: 進行方向を反転させる観測を対応づけから外す")
+
+
+def test_receding_object_does_not_hijack_the_approaching_car():
+    """遠端ですれ違っても、静止物のトラックが追い越し車へ乗り移らない。"""
+    frames = crossing_frames()
+    tracks = build_tracks(frames)
+    lane = [t for t in tracks if 1.0 < t.clusters[0].center_x < 4.0]
+    car = [t for t in lane if t.first_frame == CROSSING_HANDOVER_FRAME]
+    assert len(car) == 1, [(t.first_frame, t.last_frame) for t in lane]
+    summary = summarize_track(car[0])
+    assert summary.frames == len(frames) - CROSSING_HANDOVER_FRAME, summary.frames
+    assert abs(summary.speed_y - CAR_SPEED) < 0.3, summary.speed_y
+    # 静止物側は乗り移らずに終わっている（車のフレームを1つも含まない）
+    stale = [t for t in lane if t.first_frame == 0]
+    assert len(stale) == 1 and stale[0].last_frame < CROSSING_HANDOVER_FRAME, stale
+    print(f"  OK: 遠端のすれ違いで乗り移らない（車のY速度 {summary.speed_y:+.2f}m/s）")
+
+
+def test_hijacked_track_would_hide_the_passing_vehicle():
+    """速度整合を外すと乗り移りが起き、追い越し車を同定できなくなる（回帰の証拠）。"""
+    frames = crossing_frames()
+    merged = build_tracks(frames, max_reversal=float("inf"))
+    hijacked = [t for t in merged if 1.0 < t.clusters[0].center_x < 4.0]
+    assert len(hijacked) == 1 and hijacked[0].last_frame == len(frames) - 1, \
+        "乗り移りが再現しない（テストの前提が崩れている）"
+    # 前進と後退が混ざって Y 速度がほぼ 0 になり、追い越し車の条件を満たさなくなる
+    assert abs(summarize_track(hijacked[0]).speed_y) < 1.0, summarize_track(hijacked[0]).speed_y
+    assert select_overtaking(merged)["summary"] is None, "乗り移ったのに同定できている"
+    # 速度整合ありなら同じ場面で追い越し車を同定できる
+    chosen = select_overtaking(build_tracks(frames))["summary"]
+    assert chosen is not None and chosen.median_x > 1.0, chosen
+    assert chosen.pass_time is not None and chosen.passed_zone, chosen
+    print("  OK: 速度整合なしでは同定できない場面を、ありなら同定できる")
 
 
 def test_static_objects_move_backward():
