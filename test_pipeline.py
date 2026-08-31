@@ -631,6 +631,24 @@ def test_same_lane_priority_frees_the_vehicle_for_the_next_event():
         print("  OK: 隣車線の車を避けたことで両候補が本来の車を拾う")
 
 
+def test_retry_exclusion_keeps_the_target_track():
+    """選び直しの除外キーに、狙ったトラックと同一視されるキーを混ぜない。
+
+    追跡側は追跡窓のぶれを吸収するため track_key を完全一致ではなく近さで照合する。
+    通過フレームが数フレームしか違わない別候補を除外キーに入れると、狙った
+    トラックまで除外されて「候補はすべて割り当て済み」になり車を失う
+    （実データ260701/ID2 の 674.1s がこれで消えていた）。
+    """
+    candidates = [{"track_key": "f6662x+2.3"}, {"track_key": "f6671x+1.7"},
+                  {"track_key": "f6717x+1.4"}, {"track_key": "f6720x+2.0"}]
+    excluded = run_pipeline.keys_before(candidates, "f6720x+2.0")
+    assert excluded == ["f6662x+2.3", "f6671x+1.7"], excluded
+    # 採用順で後ろにあるキーや、一覧に無いキーは従来どおり何も除外しない
+    assert run_pipeline.keys_before(candidates, "f6662x+2.3") == []
+    assert run_pipeline.keys_before(candidates, "f9999x+9.9") == []
+    print("  OK: 選び直しの除外キーから狙ったトラック自身を外す")
+
+
 def test_unassigned_vehicle_is_reported_as_a_detection_gap():
     """どの候補にも割り当たらない車は、動画検出の取りこぼしとしてレポートへ挙げる。
 

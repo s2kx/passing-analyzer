@@ -921,14 +921,38 @@ def dump_assignment_debug(path: Path, offset: float, bias: float,
         pass
 
 
+def same_vehicle_key(left: str, right: str) -> bool:
+    """2 つの ``track_key`` が同じ車を指すかを、追跡側と同じ規則で判定する。
+
+    追跡側（``lidar_autotrack.track_key_matches``）は追跡窓のぶれを吸収するため
+    キーを完全一致ではなくフレーム・横位置の近さで照合する。除外キーを組み立てる
+    側が完全一致で考えると、狙ったトラックの近くにある別キーを除外したつもりが
+    狙ったトラックまで除外されてしまうため、判定を追跡側に合わせる。
+    追跡モジュールが無い環境では完全一致に落とす。
+    """
+    if left == right:
+        return True
+    try:
+        from lidar_autotrack import track_key_matches
+    except Exception:  # noqa: BLE001 - 追跡モジュールが無くても割り当ては続ける
+        return False
+    return bool(track_key_matches(left, right))
+
+
 def keys_before(candidates: list[dict], track_key: str) -> list[str]:
     """``candidates`` の採用順で ``track_key`` より前にあるキーを返す。
 
     ``track_overtaking`` は ``candidates`` を採用順に返すので、ここで返したキーを
-    ``exclude_track_keys`` に渡せば、狙ったトラックが選ばれる。
+    ``exclude_track_keys`` に渡せば、狙ったトラックが選ばれる。ただし狙った
+    トラック自身と同一視されるキー（通過フレームが数フレーム・横位置が1m以内しか
+    違わない別候補）は除くこと。これを渡すと追跡側が狙ったトラックごと除外して
+    しまい、「候補はすべて他のイベントへ割り当て済み」になって車を失う。
     """
     keys = [candidate["track_key"] for candidate in candidates]
-    return keys[:keys.index(track_key)] if track_key in keys else []
+    if track_key not in keys:
+        return []
+    return [key for key in keys[:keys.index(track_key)]
+            if not same_vehicle_key(key, track_key)]
 
 
 def _scan_event(tracker, pcap: VelodynePcap, config: PipelineConfig, event: dict,
