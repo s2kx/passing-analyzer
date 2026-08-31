@@ -34,6 +34,14 @@ PHASE2_MAX_SPEED_KMH = 100.0
 # 5.2〜5.5m にしたとき距離p2の平均絶対差が最小（1.42m）になる。
 PHASE2_MAX_ABS_Y = 5.5
 
+# 路面点の除去。矩形選択は車両の外接箱に余裕を足した範囲なので、車体の左右外側の
+# 路面がわずかに入り込む。この路面点が最近接点になると離隔距離LCが小さめに出る。
+# フレーム内の Z 下端（外れ値に強い下側パーセンタイル）から GROUND_MARGIN 以下を
+# 路面とみなして落とす。点数が少ないフレームは下端を推定できないので何もしない。
+GROUND_PERCENTILE = 0.02
+GROUND_MARGIN = 0.10
+GROUND_MIN_POINTS = 30
+
 # XYZ 座標の列位置（0 始まり）。旧プログラムの注記「XYZ座標は9,10,11列目」に対応。
 COL_X, COL_Y, COL_Z = 8, 9, 10
 
@@ -103,6 +111,41 @@ def _read_points(path: Path) -> list[list[str]]:
     return rows
 
 
+def _drop_ground_points(points: list[list[str]], col_z: int) -> list[list[str]]:
+    """1フレーム分の点から路面付近の点を落とす。
+
+    フレーム内の Z の下側パーセンタイル（``GROUND_PERCENTILE``）を路面高さとみなし、
+    そこから ``GROUND_MARGIN`` 以内の点を除く。点数が ``GROUND_MIN_POINTS`` 未満の
+    フレームは路面高さを推定できないため、また全点が落ちてしまう場合も、元の点を
+    そのまま返す（車両を見失うより路面が混じるほうが安全なため）。
+    """
+    if len(points) < GROUND_MIN_POINTS:
+        return points
+    heights = []
+    for p in points:
+        if len(p) <= col_z:
+            continue
+        try:
+            heights.append(float(p[col_z]))
+        except ValueError:
+            continue
+    if len(heights) < GROUND_MIN_POINTS:
+        return points
+    heights.sort()
+    ground = heights[int(GROUND_PERCENTILE * (len(heights) - 1))]
+    limit = ground + GROUND_MARGIN
+    kept = []
+    for p in points:
+        if len(p) <= col_z:
+            continue
+        try:
+            if float(p[col_z]) >= limit:
+                kept.append(p)
+        except ValueError:
+            continue
+    return kept or points
+
+
 def _trajectory_rows(frames, col_x: int = COL_X, col_y: int = COL_Y, col_z: int = COL_Z) -> list[list[str]]:
     """フレーム列から edit.csv 行（ヘッダ込み）を作る共通ロジック。
 
@@ -112,6 +155,9 @@ def _trajectory_rows(frames, col_x: int = COL_X, col_y: int = COL_Y, col_z: int 
       * 速度[km/h] = 前フレーム最近接点からの移動距離 / 経過秒 × 3600 / 1000
       * 先頭フレームの速度は空欄
       * 有効点が無いフレームは時刻のみ、X..speed は空欄
+
+    旧実装との違いは、最近接点を選ぶ前に ``_drop_ground_points`` で路面付近の点を
+    落とす点だけである（車体の外側に残る路面点が最近接点になるとLCが小さめに出る）。
     """
     out: list[list[str]] = [list(EDIT_HEADER)]
     if not frames:
@@ -126,7 +172,7 @@ def _trajectory_rows(frames, col_x: int = COL_X, col_y: int = COL_Y, col_z: int 
         row = [time_text, "", "", "", "", ""]
 
         speed_text = ""
-        for p in points:
+        for p in _drop_ground_points(points, col_z):
             if len(p) <= col_z:
                 continue
             try:

@@ -20,7 +20,10 @@ from detect_overtaking import (
     Track, TrackSample, classify_overtaking, classify_vehicle_type,
     yellow_plate_score,
 )
-from edit_csv import PHASE2_MAX_ABS_Y, EditPoint, analyze_edit_points, classify_phases
+from edit_csv import (
+    PHASE2_MAX_ABS_Y, EditPoint, analyze_edit_points, classify_phases,
+    build_edit_rows_from_file,
+)
 
 
 def default_args(view="rear"):
@@ -487,6 +490,35 @@ def test_phase2_far_only_falls_back_with_warning():
     assert metrics["distance_p2"] == 18.0, metrics        # 速度最小の点に戻る
     assert any("|Y|" in w for w in metrics["warnings"]), metrics
     print("  OK: 近い候補が無いときは制限を外して警告")
+
+
+def test_nearest_point_skips_ground_points():
+    """路面付近の点は最近接点にしない（矩形の余裕で入り込む路面点のLC過小対策）。"""
+    import tempfile
+    from pathlib import Path
+
+    header = ",".join((
+        "Frame", "Time", "Laser ID", "Intensity", "Distance",
+        "Azimuth", "Elevation", "Selected", "Points:0", "Points:1", "Points:2",
+    ))
+    lines = [header]
+    # 路面: Z=-1.0 に 30 点。うち 1 点は車体より内側(X=0.8)にあり、
+    # 除去しないとこれが最近接点になってしまう。
+    for i in range(30):
+        x = 0.8 if i == 0 else 2.0 + i * 0.05
+        lines.append(f"0,10.0,0,5,5,0,0,1,{x},0.0,-1.0")
+    # 車体: Z=-0.2 に 10 点。最も近いのは X=1.5。
+    for i in range(10):
+        lines.append(f"0,10.0,0,5,5,0,0,1,{1.5 + i * 0.1},0.0,-0.2")
+
+    with tempfile.TemporaryDirectory() as temp_value:
+        path = Path(temp_value) / "overtaking_900.csv"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+        rows = build_edit_rows_from_file(path)
+
+    assert len(rows) == 2, rows
+    assert float(rows[1][1]) == 1.5, rows[1]      # 路面の 0.8 ではなく車体の 1.5
+    print("  OK: 路面付近の点を除いてから最近接点を選ぶ")
 
 
 if __name__ == "__main__":
