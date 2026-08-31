@@ -21,6 +21,13 @@ from zipfile import ZIP_DEFLATED, ZipFile
 EDIT_HEADER = ("unixtime", "X", "Y", "Z", "distance(m)", "speed(km/h)")
 LC_MIN_DISTANCE = 1.0
 
+# フェーズ3・4を切り分ける Y のしきい値[m]（docs/計算方法.md 8章）。
+PHASE_Y_THRESHOLD = 3.0
+
+# フェーズ2候補として妥当な速度の上限[km/h]。最近接点が車体上を移り変わると
+# speed 列にスパイクが出るため、これを超える点は候補から外す。
+PHASE2_MAX_SPEED_KMH = 100.0
+
 # XYZ 座標の列位置（0 始まり）。旧プログラムの注記「XYZ座標は9,10,11列目」に対応。
 COL_X, COL_Y, COL_Z = 8, 9, 10
 
@@ -273,64 +280,165 @@ def read_edit_points(edit_path: Path) -> list[EditPoint]:
     return points
 
 
-def classify_phases(points: list[EditPoint]) -> dict[str, EditPoint]:
+def _mark_phase(point: EditPoint, label: str) -> None:
+    """フェーズ名を付ける。フォールバックで1点が2フェーズを兼ねる場合は連結する。"""
+    point.phase = f"{point.phase}/{label}" if point.phase else label
+
+
+def _pick_phase2(candidates: list[EditPoint]) -> EditPoint:
+    """フェーズ2候補から1点を選ぶ（速度が一桁の最後の点、無ければ速度絶対値が最小の点）。"""
+    single_digit = [point for point in candidates if 0 <= abs(point.speed or 0) < 10]
+    return single_digit[-1] if single_digit else min(candidates, key=lambda point: abs(point.speed or 0))
+
+
+def lateral_clearance(section: list[EditPoint]) -> tuple[float, list[str]]:
+    """通過区間から離隔距離 LC を求め、(LC, 警告) を返す。
+
+    通過区間の X は本来どちらか一方の側（車が抜けていった側）に偏る。1点だけ
+    反対符号の外れ値が混ざると単純な最小値が外れ値で決まってしまうため、
+    点数の多い側（同数なら重心の側）に限定してから |X| の最小値を採る。
+    """
+    notes: list[str] = []
+    xs = [point.x for point in section]
+    negatives = sum(1 for x in xs if x < 0)
+    positives = sum(1 for x in xs if x > 0)
+    if positives == negatives:
+        passes_right = sum(xs) >= 0      # 同数のときは重心の符号で通過側を決める
+    else:
+        passes_right = positives > negatives
+    side_text = "X>0側" if passes_right else "X<0側"
+    same_side = [x for x in xs if (x >= 0 if passes_right else x <= 0)]
+    dropped = len(xs) - len(same_side)
+    if dropped:
+        notes.append(
+            f"離隔距離LC: 通過側({side_text})と符号が逆のX外れ値 {dropped} 点を除外しました"
+        )
+    return min(abs(x) for x in same_side), notes
+
+
+def classify_phases(
+    points: list[EditPoint],
+    strict: bool = True,
+    warnings: list[str] | None = None,
+) -> dict[str, EditPoint]:
+    """edit.csv の有効点からフェーズ1〜4を決める。
+
+    ``strict=True``（既定・従来互換）は該当点が無ければ ``ValueError`` を送出する。
+    ``strict=False`` では全自動処理向けに、可能な範囲でフォールバックして
+    ``warnings`` に品質警告を積む。
+
+    * フェーズ2が無い（|Y| < 3 になる前に speed 値のある点が無い）
+      → フェーズ3直前の有効点をフェーズ2として代用
+    * フェーズ4が無い（フェーズ3以降で |Y| >= 3 に戻らない）
+      → 最終有効点をフェーズ4として代用
+    * フェーズ3が無い（|Y| < 3 が一度も無い）→ 計算不能なので strict によらず例外
+    """
+    notes = warnings if warnings is not None else []
     if not points:
         raise ValueError("分析対象のedit.csvに有効な行がありません")
 
     for point in points:
         point.phase = ""
     p1 = points[0]
-    p1.phase = "フェーズ1"
+    _mark_phase(p1, "フェーズ1")
 
-    p2_candidates = []
-    for point in points:
-        if abs(point.y) < 3:
-            break
-        if point.speed is not None:
-            p2_candidates.append(point)
-    if not p2_candidates:
+    # フェーズ3: 最初に |Y| < 3 になる点。これが無いと通過区間が作れない。
+    p3_index = next(
+        (i for i, point in enumerate(points) if abs(point.y) < PHASE_Y_THRESHOLD), None
+    )
+    if p3_index is None:
+        raise ValueError(
+            "フェーズ3が見つかりません（abs(Y) < 3 の点が1つもありません）。"
+            "点群の選択範囲・同期ずれの可能性があります"
+        )
+
+    # フェーズ2: フェーズ3より前で speed 値のある点から選ぶ。
+    raw_candidates = [point for point in points[:p3_index] if point.speed is not None]
+    sane_candidates = [
+        point for point in raw_candidates if abs(point.speed or 0) <= PHASE2_MAX_SPEED_KMH
+    ]
+    if sane_candidates:
+        if len(sane_candidates) != len(raw_candidates):
+            notes.append(
+                f"フェーズ2候補から速度スパイク({PHASE2_MAX_SPEED_KMH:g} km/h超) "
+                f"{len(raw_candidates) - len(sane_candidates)} 点を除外しました"
+            )
+        p2 = _pick_phase2(sane_candidates)
+    elif raw_candidates:
+        notes.append(
+            f"フェーズ2候補の速度がすべて {PHASE2_MAX_SPEED_KMH:g} km/h を超えています"
+            "（最近接点が車体上を移り変わっている可能性）"
+        )
+        p2 = _pick_phase2(raw_candidates)
+    elif strict:
         raise ValueError("フェーズ2候補が見つかりません（|Y| < 3 になる前にspeed値がありません）")
+    else:
+        p2 = points[p3_index - 1] if p3_index > 0 else points[p3_index]
+        notes.append(
+            "フェーズ2が見つからないため、フェーズ3直前の有効点をフェーズ2として代用しました"
+            "（|Y| < 3 になる前にspeed値がありません）"
+        )
+    _mark_phase(p2, "フェーズ2")
 
-    single_digit = [point for point in p2_candidates if 0 <= abs(point.speed or 0) < 10]
-    p2 = single_digit[-1] if single_digit else min(p2_candidates, key=lambda point: abs(point.speed or 0))
-    p2.phase = "フェーズ2"
+    p3 = points[p3_index]
+    _mark_phase(p3, "フェーズ3")
 
-    p2_index = points.index(p2)
-    p3 = next((point for point in points[p2_index + 1:] if abs(point.y) < 3), None)
-    if p3 is None:
-        raise ValueError("フェーズ3が見つかりません（フェーズ2以降でabs(Y) < 3の点がありません）")
-    p3.phase = "フェーズ3"
-
-    p3_index = points.index(p3)
-    p4 = next((point for point in points[p3_index + 1:] if abs(point.y) >= 3), None)
+    # フェーズ4: フェーズ3以降で最初に |Y| >= 3 に戻る点。
+    p4 = next(
+        (point for point in points[p3_index + 1:] if abs(point.y) >= PHASE_Y_THRESHOLD), None
+    )
     if p4 is None:
-        raise ValueError("フェーズ4が見つかりません（フェーズ3以降でabs(Y) >= 3の点がありません）")
-    p4.phase = "フェーズ4"
+        if strict:
+            raise ValueError("フェーズ4が見つかりません（フェーズ3以降でabs(Y) >= 3の点がありません）")
+        if p3_index >= len(points) - 1:
+            raise ValueError(
+                "フェーズ4が見つからず、フェーズ3が最終点のため通過区間を作れません。"
+                "点群の選択範囲・同期ずれの可能性があります"
+            )
+        p4 = points[-1]
+        notes.append(
+            "フェーズ4が見つからないため、最終有効点をフェーズ4として代用しました"
+            "（フェーズ3以降でabs(Y) >= 3 に戻りません）"
+        )
+    _mark_phase(p4, "フェーズ4")
 
     return {"phase1": p1, "phase2": p2, "phase3": p3, "phase4": p4}
 
 
-def analyze_edit_points(points: list[EditPoint]) -> dict[str, float | EditPoint]:
-    phases = classify_phases(points)
+def analyze_edit_points(
+    points: list[EditPoint], strict: bool = False
+) -> dict[str, float | EditPoint | list[str]]:
+    """フェーズ判定と分析指標をまとめて返す。
+
+    既定（``strict=False``）は全自動処理向けにフォールバックを使い、採用した
+    フォールバックや外れ値除外を ``"warnings"`` キーに文字列リストで返す。
+    ``strict=True`` を渡すと従来どおり、フェーズ2・4が無い場合は例外になる。
+    """
+    warnings: list[str] = []
+    phases = classify_phases(points, strict=strict, warnings=warnings)
     p2, p3, p4 = phases["phase2"], phases["phase3"], phases["phase4"]
-    start = points.index(p3)
-    end = points.index(p4)
+    # 同じ値の行があっても取り違えないよう、同一性で位置を求める。
+    start = next(i for i, point in enumerate(points) if point is p3)
+    end = next(i for i, point in enumerate(points) if point is p4)
     section = points[start:end + 1]
     lc_section = [point for point in section if point.distance >= LC_MIN_DISTANCE] or section
     passing_time = p4.unixtime - p3.unixtime
     if passing_time == 0:
         raise ValueError("フェーズ3とフェーズ4の時刻差が0のため計算できません")
+    lc, lc_notes = lateral_clearance(lc_section)
+    warnings.extend(lc_notes)
     distance_p3 = p4.y - p3.y
     relative_speed = distance_p3 / passing_time * 3.6
     ttc = abs(p2.y) / (relative_speed / 3.6) if relative_speed != 0 else float("nan")
     return {
         **phases,
-        "lc": abs(min(point.x for point in lc_section)),
+        "lc": lc,
         "passing_time": passing_time,
         "distance_p2": abs(p2.y),
         "distance_p3": distance_p3,
         "relative_speed": relative_speed,
         "ttc": ttc,
+        "warnings": warnings,
     }
 
 

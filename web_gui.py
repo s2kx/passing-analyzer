@@ -893,7 +893,9 @@ def run_check() -> None:
         assert metrics["phase2"].row_number == 5, metrics
         assert metrics["phase3"].row_number == 6, metrics
         assert metrics["phase4"].row_number == 7, metrics
-        assert metrics["lc"] == 2.5, metrics
+        # LC は通過区間(フェーズ3〜4, X=-2.5 と -1.0)の通過側で |X| が最小の点。
+        # 旧実装の abs(min(X)) は X が負側だと「最も遠い横距離」(2.5) を返していた。
+        assert metrics["lc"] == 1.0, metrics
         assert metrics["passing_time"] == 1.0, metrics
         analysis_path = write_edit_analysis_xlsx(edit_path)
         assert analysis_path.is_file(), analysis_path

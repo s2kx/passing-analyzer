@@ -247,6 +247,10 @@ def _final_rows(
             p3 = metrics.get("phase3")
             if isinstance(p3, EditPoint):
                 phase3_time = p3.unixtime
+            # フォールバック採用や外れ値除外の品質警告をそのまま最終Excelの警告へ流す。
+            notes = metrics.get("warnings")
+            if isinstance(notes, list):
+                warnings.extend(f"候補 {event_id}: {note}" for note in notes)
         except Exception as exc:
             warnings.append(f"候補 {event_id}: 分析できません ({exc})")
 

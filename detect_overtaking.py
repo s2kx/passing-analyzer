@@ -1,30 +1,45 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GoPro 蜍慕判縺九ｉ縲瑚・蜍戊ｻ翫↓霑ｽ縺・ｶ翫＆繧後ｋ迸ｬ髢薙阪ｒ閾ｪ蜍墓､懷・縺吶ｋ繝代う繝励Λ繧､繝ｳ縲・
-蜑肴署:
-    GoPro 繧定・霆｢霆翫・蜑榊髄縺・繝輔Ο繝ｳ繝・縺ｾ縺溘・蠕後ｍ蜷代″(繝ｪ繧｢)縺ｫ蜿悶ｊ莉倥￠縺ｦ謦ｮ蠖ｱ縺励◆
-    蜍慕判繧貞・蜉帙→縺吶ｋ縲よ聴蠖ｱ譁ｹ蜷代・ --view {front,rear} 縺ｧ繝ｦ繝ｼ繧ｶ繝ｼ縺梧欠螳壹☆繧九・    霑ｽ縺・ｶ翫＠霆贋ｸ｡縺ｮ縺ｿ繧偵瑚ｿｽ縺・ｶ翫＠繧､繝吶Φ繝医阪→縺励※讀懷・縺励∝玄髢捺ュ蝣ｱ繧・CSV 縺ｫ蜃ｺ蜉帙・    隧ｲ蠖灘玄髢薙・繧ｯ繝ｪ繝・・繧貞・繧雁・縺吶・
-謦ｮ蠖ｱ譁ｹ蜷代↓繧医ｋ霑ｽ縺・ｶ翫＠霆贋ｸ｡縺ｮ隕九∴譁ｹ:
-    譌･譛ｬ(蟾ｦ蛛ｴ騾夊｡・縺ｧ縺ｯ霑ｽ縺・ｶ翫＠霆贋ｸ｡縺ｯ閾ｪ霆｢霆翫・蜿ｳ蛛ｴ繧呈栢縺代※縺・￥縲・    --view front (蜑榊髄縺・: 霑ｽ縺・ｶ翫＠霆翫・逕ｻ髱｢縺ｮ蜿ｳ遶ｯ莉倩ｿ代°繧臥樟繧後∫判髱｢荳ｭ螟ｮ縺ｸ蜷代°縺｣縺ｦ
-        遘ｻ蜍輔＠縺ｦ謚懊￠繧九ょｷｦ遶ｯ縺ｾ縺ｧ騾壹ｊ謚懊￠繧玖ｻ・讓ｪ蛻・ｊ)縺ｯ髯､螟悶☆繧九・    --view rear  (蠕後ｍ蜷代″): 縺昴・騾・〒縲∝ｷｦ遶ｯ莉倩ｿ代°繧臥樟繧御ｸｭ螟ｮ縺ｸ蜷代°縺｣縺ｦ遘ｻ蜍輔☆繧九・        蜿ｳ遶ｯ縺ｾ縺ｧ騾壹ｊ謚懊￠繧玖ｻ翫・髯､螟悶☆繧九・
-讀懷・繝ｭ繧ｸ繝・け(讓ｪ菴咲ｽｮ cx 縺ｮ縺ｿ縺ｧ蛻､螳壹る擇遨阪・諠・ｱ險倬鹸縺ｮ縺ｿ):
-    1. 蜷・ヵ繝ｬ繝ｼ繝繧・YOLO 縺ｧ霆贋ｸ｡讀懷・ (car / truck / bus / motorcycle)
-    2. ByteTrack 縺ｧ蜷御ｸ霆贋ｸ｡縺ｫ track ID 繧剃ｻ倅ｸ弱＠縲・ 繝輔Ξ繝ｼ繝莉･荳願ｿｽ霍｡
-    3. 蜃ｺ迴ｾ遶ｯ縺九ｉ迴ｾ繧後※縺・ｋ (front=蜿ｳ遶ｯ / rear=蟾ｦ遶ｯ)
-    4. 逕ｻ髱｢荳ｭ螟ｮ縺ｸ蜷代°縺｣縺ｦ遘ｻ蜍輔＠縺ｦ縺・ｋ
-    5. 蜿榊ｯｾ遶ｯ縺ｧ豸医∴繧玖ｻ贋ｸ｡縺ｯ髯､螟・(front=蟾ｦ遶ｯ / rear=蜿ｳ遶ｯ)
-    6. 閾ｪ霆企°蜍輔ご繝ｼ繝・譌｢螳壽怏蜉ｹ): 閾ｪ霆｢霆翫′蛛懈ｭ｢荳ｭ(閭梧勹縺後⊇縺ｼ蜍輔°縺ｪ縺・縺ｫ逋ｺ逕溘＠縺・       track 繧帝勁螟悶ゆｿ｡蜿ｷ蠕・■繝ｻT蟄苓ｷｯ縺ｪ縺ｩ縺ｮ蛛懈ｭ｢荳ｭ縺ｮ隱､讀懃衍繧呈椛縺医ｋ縲・-no-stop-filter 縺ｧ辟｡蜉ｹ蛹・    -- 荳願ｨ倥ｒ貅縺溘☆蛹ｺ髢薙・髢句ｧ・邨ゆｺ・凾蛻ｻ縺ｨ霑ｽ縺・ｶ翫＠蛛ｴ繧定ｨ倬鹸
-    7. ffmpeg 縺ｧ蜑榊ｾ後・繝ｼ繧ｸ繝ｳ莉倥″繧ｯ繝ｪ繝・・繧呈嶌縺榊・縺・
-菴ｿ縺・婿:
+GoPro 動画から「自動車に追い越される瞬間」を自動検出するパイプライン。
+
+前提:
+    GoPro を自転車の前向き(フロント)、または後ろ向き(リア)に取り付けて撮影した
+    動画を入力とする。撮影方向は --view {front,rear} でユーザーが指定する。
+    追い越し車両のみを「追い越しイベント」として検出し、区間情報を CSV に出力し、
+    該当区間のクリップを切り出す。
+
+撮影方向による追い越し車両の見え方:
+    日本(左側通行)では、追い越し車両は自転車の右側を抜けていく。
+    --view front (前向き): 追い越し車は画面の右端付近から現れ、画面中央へ向かって
+        移動して抜ける。左端まで通り抜ける車(横切り)は除外する。
+    --view rear  (後ろ向き): 追い越し車は画面中央付近(消失点側)に小さく現れ、
+        左端へ向かって大きくなりながら流れる。右端から現れて横切る車は除外する。
+
+検出ロジック(詳細は docs/計算方法.md の2章):
+    1. 各フレームを YOLO で車両検出 (car / truck / bus)
+    2. ByteTrack で同一車両に track ID を付与し、5 サンプル以上かつ
+       --min-track-seconds 以上続く track だけを残す
+    3. 出現端から現れている (front=右端 / rear=中央付近)
+    4. 追い越し方向(画面を左へ流れる向き)へ移動している
+    5. 逆向きに横切る車両は除外 (front=左端で消える / rear=右端から現れる)
+    6. 自車運動ゲート(既定有効): 背景オプティカルフローが小さい=自転車が停止中に
+       発生した track を除外し、信号待ち・T字路などでの誤検知を抑える。
+       --no-stop-filter で無効化
+    7. 軌跡フィルタ・面積変化フィルタ・道路ROI(--road-roi)で、横切り車両や
+       自転車側が追い抜いた車両を除外する
+    8. 残った区間の開始・終了時刻と追い越し側を CSV に記録し、--clip 指定時は
+       ffmpeg で前後マージン付きクリップを書き出す
+
+使い方:
     python detect_overtaking.py input.mp4 --view rear
     python detect_overtaking.py input.mp4 --view front --clip --overlay
     python detect_overtaking.py input.mp4 --view rear --model yolov8m.pt --conf 0.35
 
-蜃ｺ蜉・
-    out/overtaking_events.csv   讀懷・繧､繝吶Φ繝井ｸ隕ｧ
-    out/clips/event_001.mp4 ... 蛻・ｊ蜃ｺ縺励け繝ｪ繝・・ (--clip 謖・ｮ壽凾)
-    out/annotated.mp4           讀懷・蜿ｯ隕門喧蜍慕判 (--overlay 謖・ｮ壽凾)
+出力:
+    out/overtaking_events.csv   検出イベント一覧
+    out/clips/event_001.mp4 ... 切り出しクリップ (--clip 指定時)
+    out/annotated.mp4           検出可視化動画 (--overlay 指定時)
 """
 
 import argparse
@@ -66,16 +81,16 @@ def ffmpeg_executable() -> str | None:
 
 @dataclass
 class TrackSample:
-    """1 track 縺ｮ 1 繝輔Ξ繝ｼ繝蛻・・隕ｳ貂ｬ"""
+    """1 track の 1 フレーム分の観測"""
     frame: int
     t: float
     cx: float
-    cy: float         # bbox 荳ｭ蠢・y (0..1 豁｣隕丞喧)
-    area: float       # bbox 髱｢遨・(0..1 豁｣隕丞喧, 逕ｻ髱｢蜈ｨ菴・1)
+    cy: float         # bbox 中心 y (0..1 正規化)
+    area: float       # bbox 面積 (0..1 正規化, 画面全体=1)
     cls: str
-    bottom_y: float | None = None  # bbox 荳狗ｫｯ y縲る％霍ｯ荳翫・謗･蝨ｰ轤ｹ縺ｮ霑台ｼｼ
-    confidence: float = 1.0        # YOLO 讀懷・菫｡鬆ｼ蠎ｦ
-    yellow_plate_score: float = 0.0  # 鮟・牡繝翫Φ繝舌・繝励Ξ繝ｼ繝医ｉ縺励＆ (0..1)
+    bottom_y: float | None = None  # bbox 下端 y。道路上の接地点の近似
+    confidence: float = 1.0        # YOLO 検出信頼度
+    yellow_plate_score: float = 0.0  # 黄色ナンバープレートらしさ (0..1)
 
 
 @dataclass
@@ -98,9 +113,9 @@ class Event:
     t_start: float
     t_end: float
     side: str          # "left" / "right"
-    peak_area: float   # 譛謗･霑第凾縺ｮ bbox 髱｢遨・(螟ｧ縺阪＞縺ｻ縺ｩ霑代＞縲よュ蝣ｱ逕ｨ)
+    peak_area: float   # 最接近時の bbox 面積 (大きいほど近い。情報用)
     peak_t: float
-    ego_motion: float = float("nan")  # track 蛹ｺ髢薙・閾ｪ霆願レ譎ｯ繝輔Ο繝ｼ荳ｭ螟ｮ蛟､(px縲よュ蝣ｱ逕ｨ)
+    ego_motion: float = float("nan")  # track 区間の自車背景フロー中央値(px。情報用)
     area_change_ratio: float = float("nan")
     vertical_motion: float = float("nan")
     lateral_vertical_ratio: float = float("nan")
@@ -304,7 +319,7 @@ def _read_exact(stream, size: int) -> bytes:
 def _opencv_frames(video: str):
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
-        raise RuntimeError(f"蜍慕判繧帝幕縺代∪縺帙ｓ: {video}")
+        raise RuntimeError(f"動画を開けません: {video}")
     try:
         frame_idx = 0
         while True:
@@ -341,7 +356,7 @@ def _nvdec_frames(video: str, width: int, height: int):
             if not raw:
                 break
             if len(raw) != frame_bytes:
-                raise RuntimeError("NVDEC縺九ｉ荳榊ｮ悟・縺ｪ繝輔Ξ繝ｼ繝繧貞女菫｡縺励∪縺励◆")
+                raise RuntimeError("NVDECから不完全なフレームを受信しました")
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
             yield frame_idx, frame
             frame_idx += 1
@@ -370,7 +385,7 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
 
     metadata_cap = cv2.VideoCapture(video)
     if not metadata_cap.isOpened():
-        sys.exit(f"蜍慕判繧帝幕縺代∪縺帙ｓ: {video}")
+        sys.exit(f"動画を開けません: {video}")
     fps = metadata_cap.get(cv2.CAP_PROP_FPS) or 30.0
     w = int(metadata_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(metadata_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -379,7 +394,7 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
     duration = total / fps if fps else 0.0
     print(f"[info] {w}x{h} {fps:.2f}fps frames={total} ({duration:.2f}s)")
 
-    # 繝・ヰ繧､繧ｹ驕ｸ謚・ auto 縺ｪ繧・CUDA 縺後≠繧後・ GPU縲∫┌縺代ｌ縺ｰ CPU
+    # デバイス選択: auto なら CUDA があれば GPU、無ければ CPU
     if args.device == "auto":
         try:
             import torch
@@ -401,11 +416,11 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
     if use_gpu:
         try:
             import torch
-            print(f"[info] GPU 菴ｿ逕ｨ: {torch.cuda.get_device_name(0)} (fp16={half}, imgsz={args.imgsz})")
+            print(f"[info] GPU 使用: {torch.cuda.get_device_name(0)} (fp16={half}, imgsz={args.imgsz})")
         except Exception:
-            print(f"[info] GPU 菴ｿ逕ｨ (device={device}, fp16={half}, imgsz={args.imgsz})")
+            print(f"[info] GPU 使用 (device={device}, fp16={half}, imgsz={args.imgsz})")
     else:
-        print(f"[warn] CPU 縺ｧ謗ｨ隲悶＠縺ｾ縺・(菴朱・縲・PU迚・orch縺ｮ蟆主・繧呈耳螂ｨ縲Ｊmgsz={args.imgsz}")
+        print(f"[warn] CPU で推論します (低速。GPU版torchの導入を推奨。imgsz={args.imgsz})")
 
     model = _resolve_yolo_model(args, YOLO)
 
@@ -429,7 +444,8 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
             verbose=False, device=device, imgsz=args.imgsz, **precision_kwargs,
         )
 
-    # 閾ｪ霆企°蜍輔ご繝ｼ繝育畑縺ｮ迥ｶ諷九らｸｮ蟆上げ繝ｬ繝ｼ繧ｹ繧ｱ繝ｼ繝ｫ荳翫〒縲∵､懷・縺励◆霆贋ｸ｡鬆伜沺繧帝勁螟悶＠縺ｦ
+    # 自車運動ゲート用の状態。縮小したグレースケール画像から、検出した車両領域を
+    # 除外して背景のオプティカルフロー量を測り、自転車の停止判定に使う。
     stop_filter = not args.no_stop_filter
     sw = 320
     sh = max(1, int(round(h * sw / w)))
@@ -439,7 +455,7 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
     prev_bgmask = None
     prev_flow_frame = None
     last_flow = None
-    motion: dict[int, float] = {}   # frame_idx -> 閭梧勹繝輔Ο繝ｼ驥・px)
+    motion: dict[int, float] = {}   # frame_idx -> 背景フロー量(px)
 
     def handle(frame_idx, frame, result):
         """Process one frame result and update tracks."""
@@ -450,7 +466,7 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
             should_measure = prev_flow_frame is None or frame_idx - prev_flow_frame >= flow_stride
             if should_measure:
                 small = cv2.cvtColor(cv2.resize(frame, (sw, sh)), cv2.COLOR_BGR2GRAY)
-                bgmask = np.full((sh, sw), 255, np.uint8)  # 閭梧勹=255
+                bgmask = np.full((sh, sw), 255, np.uint8)  # 背景=255
                 if result.boxes is not None:
                     for x1, y1, x2, y2 in result.boxes.xyxy.cpu().numpy():
                         X1 = max(0, int(x1 * fx) - 2); X2 = min(sw, int(x2 * fx) + 2)
@@ -464,7 +480,7 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
                 motion[frame_idx] = last_flow
 
         det = result.boxes.cpu().numpy()
-        out = tracker.update(det, frame)  # 蜷・｡・ [x1,y1,x2,y2,id,score,cls,idx]
+        out = tracker.update(det, frame)  # 各行: [x1,y1,x2,y2,id,score,cls,idx]
         for row in out:
             x1, y1, x2, y2 = row[:4]
             tid = int(row[4])
@@ -494,13 +510,13 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
             try:
                 first = next(iterator)
             except Exception as exc:
-                print(f"[warn] NVDEC繧帝幕蟋九〒縺阪↑縺・◆繧＾penCV縺ｸ謌ｻ縺励∪縺・ {exc}")
+                print(f"[warn] NVDECを開始できなかったためOpenCVへ戻します: {exc}")
             else:
-                print("[info] 蜍慕判繝・さ繝ｼ繝・ FFmpeg NVDEC (GPU)")
+                print("[info] 動画デコード: FFmpeg NVDEC (GPU)")
                 yield first
                 yield from iterator
                 return
-        print("[info] 蜍慕判繝・さ繝ｼ繝・ OpenCV (CPU)")
+        print("[info] 動画デコード: OpenCV (CPU)")
         yield from _opencv_frames(video)
 
     prefetch_count = max(0, int(getattr(args, "prefetch_batches", 2)))
@@ -621,8 +637,8 @@ def classify_overtaking(track: Track, args, motion=None) -> Event | None:
     ground_ys = [x.bottom_y if x.bottom_y is not None else x.cy for x in s]
     areas = [x.area for x in s]
     q = max(1, len(cxs) // 4)
-    cx_start = float(statistics.median(cxs[:q]))   # 蜃ｺ迴ｾ菴咲ｽｮ
-    cx_end = float(statistics.median(cxs[-q:]))    # 豸亥､ｱ菴咲ｽｮ
+    cx_start = float(statistics.median(cxs[:q]))   # 出現位置
+    cx_end = float(statistics.median(cxs[-q:]))    # 消失位置
     y_start = float(statistics.median(ground_ys[:q]))
     y_end = float(statistics.median(ground_ys[-q:]))
     area_start = float(statistics.median(areas[:q]))
@@ -636,7 +652,7 @@ def classify_overtaking(track: Track, args, motion=None) -> Event | None:
     )
 
     if args.view == "front":
-        appeared = cx_start >= args.appear_edge          # 3) 蜿ｳ遶ｯ縺九ｉ迴ｾ繧後ｋ
+        appeared = cx_start >= args.appear_edge          # 3) 右端から現れる
         toward_center = cx_end < cx_start
         exits_far_edge = cx_end <= args.exit_edge
         side = "left"
@@ -766,7 +782,7 @@ def main():
     videos = list(args.videos)
     for video in videos:
         if not Path(video).exists():
-            sys.exit(f"蜈･蜉帛虚逕ｻ縺悟ｭ伜惠縺励∪縺帙ｓ: {video}")
+            sys.exit(f"入力動画が存在しません: {video}")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -783,7 +799,7 @@ def main():
         suffix = f"_{index + 1}" if multiple else ""
         tracks, fps, motion, duration = build_tracks(args, out_dir, video, suffix)
         print(f"[info] tracks={len(tracks)}"
-              + ("" if motion is None else " (閾ｪ霆企°蜍輔ご繝ｼ繝・ 譛牙柑)"))
+              + ("" if motion is None else " (自車運動ゲート: 有効)"))
 
         for tr in tracks.values():
             ev = classify_overtaking(tr, args, motion)
@@ -796,7 +812,7 @@ def main():
     # 連結タイムライン上の時刻で全動画を通して並べ替え
     events.sort(key=lambda e: e.global_t_start)
 
-    print(f"[result] 霑ｽ縺・ｶ翫＠繧､繝吶Φ繝・ {len(events)} 莉ｶ")
+    print(f"[result] 追い越しイベント: {len(events)} 件")
     for i, e in enumerate(events, 1):
         ego = "" if e.ego_motion != e.ego_motion else f" ego={e.ego_motion:.2f}"
         src = f" [{Path(e.source_video).name}]" if multiple else ""

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-追い越し判定ロジック (classify_overtaking) の単体テスト。
-YOLO や動画を使わず、合成した track 軌跡で判定を検証する。
+追い越し判定ロジック (classify_overtaking) と、edit.csv 解析
+(classify_phases / analyze_edit_points) の単体テスト。
+YOLO や動画を使わず、合成した track 軌跡・合成した最近接点軌跡で検証する。
 
 判定条件 (検出・追跡は前段):
   2) 5 フレーム以上追跡
@@ -12,12 +13,14 @@ YOLO や動画を使わず、合成した track 軌跡で判定を検証する�
 
     .venv\\Scripts\\python.exe test_logic.py
 """
+import math
 from argparse import Namespace
 
 from detect_overtaking import (
     Track, TrackSample, classify_overtaking, classify_vehicle_type,
     yellow_plate_score,
 )
+from edit_csv import EditPoint, analyze_edit_points, classify_phases
 
 
 def default_args(view="rear"):
@@ -309,6 +312,147 @@ def test_weak_yellow_mark_does_not_override_large_vehicle():
     assert vehicle_type == "大型" and detector_class == "truck"
     assert 0.55 <= score <= 0.57 and hits == 8
     print("  OK: 大型車の弱い黄色注意表示をナンバーと誤認しない")
+
+
+# ---------------------------------------------------------------------------
+# edit.csv 解析 (フェーズ判定・離隔距離LC) のテスト
+# ---------------------------------------------------------------------------
+
+def edit_points(rows):
+    """rows: list of (unixtime, X, Y, speed) から EditPoint の列を作る。
+
+    distance(m) は edit_csv と同じく sqrt(X^2 + Y^2) で埋める。
+    """
+    points = []
+    for row_number, (t, x, y, speed) in enumerate(rows, start=2):
+        speed_text = "" if speed is None else str(speed)
+        points.append(EditPoint(
+            row_number=row_number, unixtime_text=str(t), unixtime=float(t),
+            x=float(x), y=float(y), z_text="0", distance=math.hypot(x, y),
+            speed=None if speed is None else float(speed),
+            raw=[str(t), str(x), str(y), "0", str(math.hypot(x, y)), speed_text],
+        ))
+    return points
+
+
+def test_phases_normal_case():
+    """通常データ: フェーズ2は一桁速度の最後の点、フェーズ3/4は Y で決まる。"""
+    points = edit_points([
+        (0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -1.5, 6, 8),
+        (3, -2.0, 5, 7), (4, -2.5, 2.5, 14), (5, -1.0, 3.2, 16),
+    ])
+    metrics = analyze_edit_points(points)
+    assert metrics["phase2"].row_number == 5, metrics
+    assert metrics["phase3"].row_number == 6, metrics
+    assert metrics["phase4"].row_number == 7, metrics
+    assert metrics["passing_time"] == 1.0, metrics
+    assert metrics["warnings"] == [], metrics
+    print("  OK: 通常データのフェーズ判定は従来どおり")
+
+
+def test_phase2_fallback_uses_point_before_phase3():
+    """フェーズ2欠落(|Y|<3 の前に speed が無い) → フェーズ3直前の点で代用し警告。"""
+    rows = [(0, -2.0, 8, None), (1, -2.5, 5, None), (2, -2.5, 2.5, 14), (3, -1.0, 3.2, 16)]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["phase2"].row_number == 3, metrics          # フェーズ3直前の有効点
+    assert metrics["phase3"].row_number == 4, metrics
+    assert metrics["distance_p2"] == 5.0, metrics
+    assert any("フェーズ2" in w for w in metrics["warnings"]), metrics
+
+    # strict=True (既定) の classify_phases は従来どおり例外で止まる。
+    try:
+        classify_phases(edit_points(rows))
+    except ValueError as exc:
+        assert "フェーズ2" in str(exc), exc
+    else:
+        raise AssertionError("strict=True ではフェーズ2欠落は例外になるべき")
+    print("  OK: フェーズ2欠落をフェーズ3直前の点で代用し警告")
+
+
+def test_phase4_fallback_uses_last_point():
+    """フェーズ4欠落(|Y|>=3 に戻らない) → 最終有効点で代用し警告。"""
+    rows = [
+        (0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -1.5, 6, 8),
+        (3, -2.0, 5, 7), (4, -2.5, 2.5, 14), (5, -1.0, 1.0, 16),
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["phase3"].row_number == 6, metrics
+    assert metrics["phase4"].row_number == 7, metrics          # 最終有効点
+    assert metrics["passing_time"] == 1.0, metrics
+    assert any("フェーズ4" in w for w in metrics["warnings"]), metrics
+
+    try:
+        classify_phases(edit_points(rows))
+    except ValueError as exc:
+        assert "フェーズ4" in str(exc), exc
+    else:
+        raise AssertionError("strict=True ではフェーズ4欠落は例外になるべき")
+    print("  OK: フェーズ4欠落を最終有効点で代用し警告")
+
+
+def test_phase3_missing_still_raises():
+    """フェーズ3欠落(|Y|<3 が一度も無い)は計算不能なのでフォールバックしない。"""
+    rows = [(0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -1.5, 6, 8)]
+    for strict in (True, False):
+        try:
+            classify_phases(edit_points(rows), strict=strict)
+        except ValueError as exc:
+            assert "選択範囲" in str(exc) and "同期" in str(exc), exc
+        else:
+            raise AssertionError("フェーズ3欠落は例外になるべき")
+    print("  OK: フェーズ3欠落は選択範囲・同期ずれを示す例外で停止")
+
+
+def test_lc_ignores_opposite_side_outlier():
+    """通過区間に反対符号のX外れ値が1点混ざってもLCが乗っ取られない。"""
+    rows = [
+        (0, 2.0, 8, None), (1, 2.0, 7, 12), (2, 2.0, 5, 7),
+        (3, 2.5, 2.5, 14),      # フェーズ3
+        (4, -0.2, 1.0, 15),     # 反対側へ飛んだ外れ値
+        (5, 1.5, 0.5, 15),
+        (6, 2.0, 3.2, 16),      # フェーズ4
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    # 外れ値 -0.2 ではなく、多数派(X>0)側で最も近い 1.5 が採用される。
+    assert metrics["lc"] == 1.5, metrics
+    assert any("外れ値" in w for w in metrics["warnings"]), metrics
+    print("  OK: 反対符号の外れ値を除いてLCを算出")
+
+
+def test_lc_is_nearest_lateral_distance():
+    """LCは通過側で |X| が最小の点（最も近い横距離）。"""
+    rows = [
+        (0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -2.0, 5, 7),
+        (3, -2.5, 2.5, 14), (4, -1.0, 3.2, 16),
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["lc"] == 1.0, metrics     # min(|-2.5|, |-1.0|)
+    print("  OK: 通過側で最も近い横距離をLCにする")
+
+
+def test_lc_skips_points_closer_than_one_meter():
+    """distance(m) < 1.0 の点はLC対象から外す（既存仕様）。"""
+    rows = [
+        (0, 2.0, 8, None), (1, 2.0, 7, 12), (2, 2.0, 5, 7),
+        (3, 2.5, 2.5, 14),      # フェーズ3
+        (4, 0.3, 0.3, 15),      # distance=0.42 → LC対象外
+        (5, 2.0, 3.2, 16),      # フェーズ4
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["lc"] == 2.0, metrics
+    print("  OK: distance < 1m の点はLC対象から除外")
+
+
+def test_phase2_speed_spike_is_reported():
+    """最近接点の乗り移りによる速度スパイクは候補から外し、警告を残す。"""
+    rows = [
+        (0, -0.5, 8, None), (1, -1.0, 7, 480), (2, -1.5, 6, 8),
+        (3, -2.0, 5, 320), (4, -2.5, 2.5, 14), (5, -1.0, 3.2, 16),
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["phase2"].row_number == 4, metrics   # 一桁速度(8)の点
+    assert any("スパイク" in w for w in metrics["warnings"]), metrics
+    print("  OK: フェーズ2候補の速度スパイクを除外し警告")
 
 
 if __name__ == "__main__":
