@@ -151,9 +151,17 @@ class PipelineConfig:
     max_lane_clearance: float = MAX_LANE_CLEARANCE
 
     def track_margins(self) -> tuple[float, float]:
-        """追跡窓の (開始側, 終了側) マージン秒を返す。"""
+        """追跡窓の (開始側, 終了側) マージン秒を返す。
+
+        撮影方向が確定していない（自動判定が走らない・判定不能の ``fallback``）
+        場合は、非対称マージンの向きを誤ると接近または離脱の区間が窓から切れる
+        ため、両側とも広い方の値で対称に取る。
+        """
         if self.track_margin is not None:
             return float(self.track_margin), float(self.track_margin)
+        if self.view_source == "fallback":
+            wide = max(m for pair in VIEW_TRACK_MARGINS.values() for m in pair)
+            return wide, wide
         return VIEW_TRACK_MARGINS.get(
             self.view, (DEFAULT_TRACK_MARGIN, DEFAULT_TRACK_MARGIN)
         )
@@ -406,12 +414,13 @@ def resolve_view(config: PipelineConfig, report: PipelineReport, detector=None) 
         return config.view
 
     if config.skip_detect:
-        # 検出をやり直さないなら方向は結果に影響しない。GPU時間を使わずに済ませる
+        # 検出をやり直さないなら方向が要るのは点群追跡の窓だけ。自動判定は省略し、
+        # 窓は track_margins() が fallback 扱いで前後対称の広い値に切り替える
         config.view = DEFAULT_VIEW
         config.view_source = "fallback"
         report.stage(
             "view", "0.撮影方向", "skipped",
-            "検出を行わないため自動判定は不要です",
+            "検出を行わないため自動判定は省略します（追跡窓は前後対称の広めで対応）",
             view=config.view, source=config.view_source,
         )
         return config.view
