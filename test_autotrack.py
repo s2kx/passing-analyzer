@@ -11,7 +11,8 @@ PCAP を使わず、numpy で合成した点群（地面平面 + 静止障害物
 import numpy as np
 
 from lidar_autotrack import (
-    MIN_TRACK_FRAMES, ROI_MAX_ABS_Y, Cluster, Track, Tracker, build_tracks, cluster_points,
+    MIN_TRACK_FRAMES, PASS_ZONE, ROI_MAX_ABS_Y, Cluster, Track, Tracker, build_tracks,
+    cluster_points,
     detect_clusters, estimate_forward_sign, estimate_ground_plane, estimate_ground_z,
     filter_points, ground_height, score_track, select_overtaking, summarize_track,
     track_key_matches, track_overtaking, track_to_frames, velocity_compatible,
@@ -625,6 +626,44 @@ def test_cluster_split_separates_a_vehicle_that_touches_the_rider():
     single = cluster_points(box_points(rng, 2.0, 0.0, 4.4, 1.8, 1.5, count=900), frame=0)
     assert len(single) == 1, single
     print("  OK: 幅4mを超えて繋がったかたまりを車と搭乗者へ分離")
+
+
+def _zone_track(centers: list[tuple[float, float]]) -> Track:
+    """``(X, Y)`` の並びから、幅 1.8m・長さ 4.0m の矩形が動くトラックを作る。"""
+    clusters = [
+        Cluster(frame=index, timestamp=index * FRAME_INTERVAL,
+                center_x=x, center_y=y, min_x=x - 0.9, max_x=x + 0.9,
+                min_y=y - 2.0, max_y=y + 2.0, count=200, top_z=GROUND_Z + 1.5)
+        for index, (x, y) in enumerate(centers)
+    ]
+    return Track(track_id=1, clusters=clusters)
+
+
+def test_pass_time_uses_the_visit_that_draws_level():
+    """通過区間へ2回入るトラックでは、真横に並んだほうの滞在を通過とみなす。
+
+    路肩の静止物から追い越し車へ乗り移ったトラックがこの形になる。最初の滞在
+    （かすめただけ）を採ると通過時刻が数秒早くなり、割り当てが外れる。
+    """
+    # 1回目: |Y| < 3 をかすめるだけで Y=0 を跨がない。2回目: 後方から真横を抜ける。
+    graze = [(-5.0, -2.5), (-5.0, -2.8)]
+    away = [(-3.0, -6.0 - 2.0 * i) for i in range(5)]
+    approach = [(2.0, -4.0 + 1.5 * i) for i in range(6)]
+    summary = summarize_track(_zone_track(graze + away + approach))
+    assert summary.entered_zone
+    # 2回目の滞在の先頭（Y=-4.0 の矩形が |Y|<3 へ入るフレーム）が通過時刻
+    assert summary.pass_frame == len(graze) + len(away), summary.pass_frame
+    assert abs(summary.lateral_min - 1.1) < 1e-6, summary.lateral_min
+    print(f"  OK: 乗り移りトラックの通過時刻は真横の滞在 (frame {summary.pass_frame})")
+
+
+def test_pass_time_unchanged_for_a_single_visit():
+    """通過区間へ1回しか入らないふつうのトラックでは通過時刻は変わらない。"""
+    centers = [(1.8, -12.0 + 1.5 * i) for i in range(14)]
+    summary = summarize_track(_zone_track(centers))
+    first = next(i for i, (_x, y) in enumerate(centers) if abs(y) - 2.0 < PASS_ZONE)
+    assert summary.pass_frame == first, (summary.pass_frame, first)
+    print("  OK: 1回しか区間へ入らないトラックの通過時刻は従来どおり")
 
 
 if __name__ == "__main__":

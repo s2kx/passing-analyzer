@@ -578,6 +578,37 @@ def _fit_speed(times: np.ndarray, values: np.ndarray) -> float:
     return float(np.polyfit(times, values, 1)[0])
 
 
+def _passing_visit(inside: np.ndarray, gap: np.ndarray) -> tuple[int, int] | None:
+    """通過区間（``|Y| < PASS_ZONE``）への滞在のうち、追い越しにあたる区間を返す。
+
+    戻り値は ``[start, stop)`` の添字。区間へ一度も入っていなければ ``None``。
+
+    ふつうトラックは通過区間へ 1 回しか入らないので、そのときの戻り値は
+    「最初に入った滞在」＝従来と同じで、値は 1 つも変わらない。2 回以上入るのは
+    トラックが別の物体へ乗り移ったときで（``MAX_SPEED_REVERSAL`` は速度差が
+    大きい乗り移りしか止められない。路肩の静止物からゆっくり近づく車へ移る場合の
+    速度差は、同じ物体でも起きる見かけの揺り戻しと同じ 5〜6m/s 程度しかない）、
+    このとき最初の滞在を採ると通過時刻が数秒早くなり、イベントとの割り当てが
+    外れる（260701/ID5 の 574.3s がこれで取りこぼされていた。路肩の物体が
+    ``|Y|=2m`` をかすめた 567.4s が通過時刻になっていた）。
+
+    どちらが追い越しかは「矩形が ``Y=0`` を跨いだか」＝自転車の真横に並んだかで
+    決まる。かすめただけの滞在は跨がないので、跨いだ滞在を優先して選ぶ。
+    """
+    if not inside.any():
+        return None
+    edges = np.flatnonzero(np.diff(inside.astype(np.int8)))
+    starts = [0] if inside[0] else []
+    stops: list[int] = []
+    for edge in edges:
+        (starts if inside[edge + 1] else stops).append(int(edge) + 1)
+    if len(stops) < len(starts):
+        stops.append(len(inside))
+    visits = list(zip(starts, stops))
+    beside = [visit for visit in visits if np.any(gap[visit[0]:visit[1]] <= 0.0)]
+    return beside[0] if beside else visits[0]
+
+
 def summarize_track(track: Track) -> TrackSummary:
     """トラックの軌跡特徴をまとめる。"""
     times = np.array([c.timestamp for c in track.clusters], dtype=float)
@@ -598,19 +629,22 @@ def summarize_track(track: Track) -> TrackSummary:
     gap = np.where((low <= 0) & (high >= 0), 0.0, np.minimum(np.abs(low), np.abs(high)))
     inside = gap < PASS_ZONE
     entered = bool(inside.any())
-    passed = bool(entered and np.any(gap[int(np.argmax(inside)) + 1:] >= PASS_ZONE))
-    # 通過時刻は「最初に |Y| < 3m へ入った」時刻。edit_csv のフェーズ3と同じ定義。
+    # 通過時刻は「|Y| < 3m へ入った」時刻。edit_csv のフェーズ3と同じ定義。
+    # 1本のトラックが区間へ2回以上入ることがある（乗り移り）ので、どの滞在を
+    # 通過とみなすかは _passing_visit が決める。
+    visit = _passing_visit(inside, gap)
     pass_time = pass_frame = None
     lateral_min = float("inf")
-    if entered:
-        first = int(np.argmax(inside))
-        pass_time = float(times[first])
-        pass_frame = int(track.clusters[first].frame)
+    passed = False
+    if visit is not None:
+        start, stop = visit
+        passed = bool(np.any(gap[start + 1:] >= PASS_ZONE))
+        pass_time = float(times[start])
+        pass_frame = int(track.clusters[start].frame)
         # 通過区間にいる間の最小 |X|。矩形が原点を跨ぐフレームは 0 とみなす。
-        in_zone = [c for c, near in zip(track.clusters, inside) if near]
         lateral_min = min(
             0.0 if c.min_x <= 0 <= c.max_x else min(abs(c.min_x), abs(c.max_x))
-            for c in in_zone
+            for c in track.clusters[start:stop]
         )
     return TrackSummary(
         track=track, frames=len(track.clusters), span=track.frame_span,
