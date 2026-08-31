@@ -14,7 +14,7 @@ from lidar_autotrack import (
     MIN_TRACK_FRAMES, Cluster, Tracker, build_tracks, cluster_points, detect_clusters,
     estimate_forward_sign, estimate_ground_plane, estimate_ground_z, filter_points,
     ground_height, score_track, select_overtaking, summarize_track,
-    track_overtaking, track_to_frames,
+    track_key_matches, track_overtaking, track_to_frames,
 )
 
 
@@ -45,13 +45,18 @@ def box_points(rng, center_x: float, center_y: float, length: float, width: floa
     return np.column_stack([x, y, z])
 
 
+# 車列の2台目。1台目より 24m 後ろ = 相対 8m/s なので約 3 秒あとに通過する。
+FOLLOWER_START_Y = -44.0
+
+
 def scene_frame(rng, frame: int, vehicle: bool = True, flip: bool = False,
-                oncoming: bool = False) -> np.ndarray:
+                oncoming: bool = False, follower: float | None = None) -> np.ndarray:
     """1 フレーム分の合成点群を作る。
 
     - 地面平面（z = -1.30）
     - 静止障害物 3 つ（路駐車・壁・電柱）。自転車速度で後退して見える。
     - 通過車両（``vehicle=True``）。自転車の右 1.8m を相対 8m/s で追い越す。
+    - 車列の2台目（``follower`` に開始 Y を指定）。同じ速度で後ろから続く。
     - ``oncoming=True`` では対向車（後退方向へ速く動く物体）を追加する。
     - ``flip=True`` では XY を 180 度回転し、センサが逆向きに取り付けられた場合を模す。
     """
@@ -66,6 +71,8 @@ def scene_frame(rng, frame: int, vehicle: bool = True, flip: bool = False,
         clouds.append(box_points(rng, base_x, base_y, length, width, height))
     if vehicle:
         clouds.append(box_points(rng, 1.8, -20.0 + 8.0 * t, 4.6, 1.8, 1.5))
+    if follower is not None:
+        clouds.append(box_points(rng, 2.1, follower + 8.0 * t, 4.2, 1.8, 1.5))
     if oncoming:
         clouds.append(box_points(rng, -2.5, 25.0 - 18.0 * t, 4.4, 1.8, 1.5))
     points = np.vstack(clouds)
@@ -432,6 +439,72 @@ def test_exported_boxes_contain_vehicle_points():
         ]
         assert len(inside) > 100, (frame["index"], len(inside))
     print("  OK: 各矩形が車両点群を含む")
+
+
+# --- 車列（イベント↔車両の対応付け） -----------------------------------------
+def convoy_pcap(count: int = 70) -> FakePcap:
+    """2 台が続けて通過する場面。1台目は 1.9 秒、2台目は 4.9 秒に通過区間へ入る。"""
+    return FakePcap(count, follower=FOLLOWER_START_Y)
+
+
+def test_candidates_list_every_passing_vehicle():
+    """車列では通過した車すべてを ``candidates`` に通過時刻つきで返す。"""
+    result = track_overtaking(convoy_pcap(), 0, 69, "right")
+    keys = {candidate["track_key"] for candidate in result["candidates"]}
+    assert len(result["candidates"]) == 2, result["candidates"]
+    assert len(keys) == 2, keys
+    times = sorted(candidate["pass_time"] for candidate in result["candidates"])
+    assert abs(times[0] - 1.9) < 0.3 and abs(times[1] - 4.9) < 0.3, times
+    for candidate in result["candidates"]:
+        assert set(candidate) == {"track_key", "pass_time", "score", "median_x", "lc_estimate"}
+        assert 0.5 < candidate["lc_estimate"] < 2.0, candidate
+    print(f"  OK: 車列の2台を候補として列挙 (通過 {times[0]:.1f}s / {times[1]:.1f}s)")
+
+
+def test_expected_pass_time_picks_the_matching_vehicle():
+    """期待通過時刻に最も近いトラックを選ぶ（スコア最大ではなく）。
+
+    2 台とも評価値は同じなので、スコアだけでは 2 台目を選べない。
+    """
+    plain = track_overtaking(convoy_pcap(), 0, 69, "right")
+    leader = track_overtaking(convoy_pcap(), 0, 69, "right", expected_pass_time=2.0)
+    follower = track_overtaking(convoy_pcap(), 0, 69, "right", expected_pass_time=5.0)
+    assert leader["ok"] and follower["ok"]
+    assert leader["track_key"] != follower["track_key"], leader["track_key"]
+    assert abs(leader["pass_time"] - 1.9) < 0.3, leader["pass_time"]
+    assert abs(follower["pass_time"] - 4.9) < 0.3, follower["pass_time"]
+    # 期待時刻を渡さない従来の呼び方では 1 台目（スコア順の先頭）のままになる
+    assert plain["track_key"] == leader["track_key"], plain["track_key"]
+    assert plain["pass_time"] is not None and plain["candidates"]
+    # 2台目の矩形は 1台目より後ろのフレームから始まる
+    assert follower["frames"][0]["index"] > leader["frames"][0]["index"] - 5
+    print("  OK: 期待通過時刻 2.0s/5.0s で1台目・2台目を撃ち分け")
+
+
+def test_exclude_track_keys_falls_back_to_the_next_vehicle():
+    """割り当て済みのトラックを除外すると次点（車列の2台目）を選ぶ。"""
+    first = track_overtaking(convoy_pcap(), 0, 69, "right", expected_pass_time=2.0)
+    second = track_overtaking(convoy_pcap(), 0, 69, "right", expected_pass_time=2.0,
+                              exclude_track_keys=[first["track_key"]])
+    assert second["ok"] and second["track_key"] != first["track_key"]
+    assert abs(second["pass_time"] - 4.9) < 0.3, second["pass_time"]
+    # 全部除外すれば候補なしとして ok=False（重複出力を作らない）
+    empty = track_overtaking(convoy_pcap(), 0, 69, "right", expected_pass_time=2.0,
+                             exclude_track_keys=[first["track_key"], second["track_key"]])
+    assert empty["ok"] is False and empty["frames"] == []
+    assert empty["track_key"] is None and len(empty["candidates"]) == 2
+    assert any("割り当て済み" in w for w in empty["warnings"]), empty["warnings"]
+    print("  OK: 割り当て済みを除外して2台目を選び、全除外なら ok=False")
+
+
+def test_track_key_tolerates_window_jitter():
+    """追跡窓が違って通過フレームが僅かにずれても同じ車と照合できる。"""
+    assert track_key_matches("f19x+1.8", "f19x+1.8")
+    assert track_key_matches("f19x+1.8", "f21x+2.0")      # 2フレーム・0.2m のぶれ
+    assert not track_key_matches("f19x+1.8", "f49x+2.1")  # 車列の2台目は別の車
+    assert not track_key_matches("f19x+1.8", "f19x+3.5")  # 隣車線の車は別の車
+    assert not track_key_matches("f19x+1.8", "t19x+1.8")  # 種別が違えば別扱い
+    print("  OK: track_key を前後3フレーム・1mの許容で照合")
 
 
 def test_tracker_handles_empty_frames():

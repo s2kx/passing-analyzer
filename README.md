@@ -154,7 +154,8 @@ GUIのStep1〜6を人が順に操作する代わりに使う。
 | `--redetect` | off | 既存CSVがあっても検出をやり直す |
 | `--skip-gps` | off | 段階2のGPSテレメトリ抽出を行わない |
 | `--offset` | (GPS自動同期) | 時刻オフセット(秒)を手動指定する |
-| `--track-margin` | `5.0` | 点群追跡に使う候補前後のマージン(秒) |
+| `--track-margin` | (撮影方向別) | 点群追跡のマージン(秒)を前後同じ値で明示する。既定は `front` が開始側-8秒/終了側+3秒、`rear` がその逆 |
+| `--max-lane-clearance` | `3.5` | 自動レビューで隣車線の通過として除外する離隔距離(m) |
 
 `overtaking_events.csv` が既にある場合、段階1は自動でスキップされる。
 
@@ -166,27 +167,67 @@ GUIのStep1〜6を人が順に操作する代わりに使う。
 1. **検出** — `detect_overtaking.py` をサブプロセス実行 (`--view` / `--out` / `--clip`)
 2. **GPS抽出** — 各動画のGoProテレメトリ → `out/gps/<動画名>/telemetry_gps.xlsx`。失敗しても続行
 3. **時刻同期** — 先頭動画のGPS UTCとPCAP開始時刻からオフセットを算出 → `out/sync.json`
-4. **自動レビュー** — 候補の採用判定 → `out/reviewed_overtaking_events.csv`
-   (現段階は暫定で全候補を採用する)
-5. **点群自動追跡** — `lidar_autotrack` プラグインで車両を追跡 → `out/lidar/overtaking_*.csv`
-6. **edit CSV** — 最近接点の軌跡と解析Excel → `out/lidar_edit/`
+4. **点群自動追跡** — 候補と車両を1対1に割り当てて追跡 → `out/lidar/overtaking_*.csv`
+5. **edit CSV** — 最近接点の軌跡と解析Excel → `out/lidar_edit/`
+6. **自動レビュー** — LiDARの結果で採否を判定 → `out/reviewed_overtaking_events.csv`
 7. **最終Excel** — `out/final/<出力フォルダ名>_final.xlsx`
 8. **レポート** — `out/pipeline_report.json` と `out/pipeline_report.txt`
+
+自動レビューは点群の結果を使うため追跡より後に置く。動画だけでは隣車線の車や誤検知を
+切り分けられないが、離隔距離まで求まれば機械的に落とせる。
 
 レポートには各段階の成否、オフセット値、候補数、警告、**人手が必要な項目**の一覧が出る。
 段階2〜7は個別の失敗で止まらず、その候補を「手動作業が必要」としてレポートへ記録して続行する。
 
+### イベント↔車両の割り当て
+
+追い越しが連続する車列では、1つの追跡窓に複数の車が入る。スコア最大の車を選ぶと
+「同じ車が複数の候補へ出力される」「隣のイベントの車を掴む」が起きるため、次の順で
+1対1に割り当てる。
+
+1. 候補ごとに追跡窓を走査し、追い越し車らしいトラックを**全部**集める
+   (`track_overtaking` の `candidates`)
+2. 動画の最接近時刻 `peak_t_s` + 時刻オフセットを**期待通過時刻**とする。実際の通過時刻
+   との系統ずれ(GPS同期誤差・カメラの見え方)は全候補の中央値から測って補正する
+   (260701/ID1 では約 +1.7 秒)
+3. 期待通過時刻との差が小さいペアから確定していくグリーディ割り当て。同じ車を取り合った
+   ら期待時刻に近い候補が勝ち、負けた候補は次点(車列の2台目)を選び直す
+   (`exclude_track_keys`)
+4. 出力直前に、`track_key` と矩形の軌跡の重なりの両方で同一車両の重複を止める
+
+どの候補にも割り当たらなかった追い越し車は、**動画検出の取りこぼしの可能性**として
+レポートの人手項目に挙げる。
+
+### 自動レビューの判定
+
+| 条件 | 判定 |
+|------|------|
+| LiDARで対応する車両が見つからない | 除外 |
+| 離隔距離 LC > `--max-lane-clearance` (既定3.5m) | 除外 (隣車線の通過) |
+| 追跡の確信度 < 0.5 | 未確認 (レポートの人手項目へ) |
+| それ以外 | 採用 |
+
+離隔距離は edit 解析の実測値を優先し、求まらない場合だけ追跡時の目安値を使う。
+`reviewed_overtaking_events.csv` には除外以外(採用・未確認)を出力し、最終Excelには
+採用だけが並ぶ。
+
 ### 点群自動追跡プラグイン
 
-段階5は `lidar_autotrack` モジュールを任意の依存として読み込む。モジュールが無い場合は
+段階4は `lidar_autotrack` モジュールを任意の依存として読み込む。モジュールが無い場合は
 その候補を「GUIで手動選択が必要」としてレポートに記録し、残りの段階を続行する。
 
 ```python
 from lidar_pcap import VelodynePcap
 
 def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
-                     side: str = "right") -> dict:
+                     side: str = "right",
+                     expected_pass_time: float | None = None,
+                     exclude_track_keys: list[str] | None = None) -> dict:
     """追い越し区間のフレームごとに車両を囲う矩形を返す。
+
+    expected_pass_time: 期待通過時刻(pcap相対秒)。指定するとスコア最大ではなく
+        「|Y|<3m を横断する時刻がこれに最も近いトラック」を選ぶ
+    exclude_track_keys: 他イベントへ割り当て済みのトラックを除いて次点を選ぶ
 
     戻り値: {
         "ok": bool,
@@ -194,9 +235,16 @@ def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
                     "bounds": {"min_x":.., "max_x":.., "min_y":.., "max_y":..}}],
         "confidence": float,
         "warnings": [str],
+        "pass_time": float | None,   # 選んだトラックが |Y|<3m を横断した時刻
+        "track_key": str | None,     # 同一車両を指す識別子
+        "candidates": [{"track_key", "pass_time", "score", "median_x", "lc_estimate"}],
     }
     """
 ```
+
+後ろ3つのキーと引数2つは任意。受け取らない古いプラグインでも動くよう、呼び出し側は
+署名を見て渡すかどうかを決める。通過側は日本では常に右(+X)なので、候補CSVの `side` 列
+(カメラの見え方 front=left / rear=right)ではなく常に `"right"` を渡す。
 
 ### 撮影方向の自動判定 (detect_view.py)
 
@@ -387,13 +435,16 @@ GoProの向き・画角で変わるため既定では無効になっている。
 .\portable\python\python.exe test_logic.py
 .\portable\python\python.exe web_gui.py --check
 .\portable\python\python.exe test_pipeline.py
+.\portable\python\python.exe test_autotrack.py
 .\portable\python\python.exe test_detect_view.py
 ```
 
 - `test_logic.py` … 判定ロジック(`classify_overtaking`)を YOLO/動画なしの合成軌跡で検証する
 - `web_gui.py --check` … GUI画面・PCAP読み込み・edit CSV・最終Excel生成を検証する
 - `test_pipeline.py` … `run_pipeline.py` の段階0〜8を、合成PCAPと一時フォルダで検証する
-  (YOLO検出と撮影方向の自動判定はスタブ化する)
+  (YOLO検出と撮影方向の自動判定はスタブ化する)。イベント↔車両の割り当てと自動レビューもここで確認する
+- `test_autotrack.py` … 点群追跡(`lidar_autotrack`)を、numpyで合成した点群
+  (地面+静止物+通過車両、車列の2台目を含む)で検証する
 - `test_detect_view.py` … `detect_view.py` の判定ロジックをスタブで、フロー計算そのものを
   合成動画(拡大／縮小するテクスチャ)で検証する(実データ・GPU不要)
 

@@ -208,17 +208,21 @@ def read_events_csv(csv_path: Path, media_registry: dict[str, Path], base_url: s
     return rows
 
 
-def save_reviewed_events(out_dir: Path, events: list[dict], offset: float) -> Path:
+def save_reviewed_events(out_dir: Path, events: list[dict], offset: float,
+                         allow_empty: bool = False) -> Path:
     if not events:
         raise ValueError("保存する追い越し候補がありません")
     # 「除外」にした候補はレビュー結果CSVに出力しない
-    events = [e for e in events if str(e.get("review_status", "")) != "除外"]
-    if not events:
+    kept = [e for e in events if str(e.get("review_status", "")) != "除外"]
+    if not kept and not allow_empty:
         raise ValueError("除外していない追い越し候補がありません")
+    # allow_empty（全自動実行）では全件除外でも見出しだけのCSVを残す。これが無いと
+    # 下流の final_export が検出CSVへフォールバックし、除外した候補まで最終Excelへ出る。
+    fields_source, events = events[0], kept
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "reviewed_overtaking_events.csv"
     ignored = {"clip_url", "veloview_display"}
-    fields = [key for key in events[0] if key not in ignored]
+    fields = [key for key in fields_source if key not in ignored]
     for key in ("review_status", "veloview_t_start", "veloview_peak_t", "veloview_t_end"):
         if key not in fields:
             fields.append(key)

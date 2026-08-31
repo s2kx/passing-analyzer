@@ -127,7 +127,11 @@ def sheet_cell(sheet_xml: str, ref: str) -> str:
 
 
 def dummy_tracker(calls: list | None = None):
-    """契約どおりのダミー ``track_overtaking``。合成PCAPの唯一の点を囲う。"""
+    """候補一覧を返さない旧契約のダミー ``track_overtaking``。
+
+    ``expected_pass_time`` / ``exclude_track_keys`` を受け取らない古いプラグインでも
+    パイプラインが動くこと（後方互換）を確かめるために使う。
+    """
 
     def track_overtaking(pcap, first_frame, last_frame, side="right"):
         if calls is not None:
@@ -144,6 +148,80 @@ def dummy_tracker(calls: list | None = None):
         }
 
     return track_overtaking
+
+
+def scripted_tracker(vehicles: dict[str, list[dict]], calls: list | None = None,
+                     confidence: float = 0.9):
+    """新契約のダミー ``track_overtaking``。
+
+    ``vehicles`` は ``track_key -> [{"pass_time", "lc_estimate", "score"}]`` ではなく
+    「実在する車の一覧」を表す ``[{"track_key", "pass_time", "lc_estimate", "score"}]``。
+    追跡窓（フレーム番号）に通過時刻が入る車だけを候補として返し、``select_overtaking``
+    と同じ規則（期待通過時刻に近い順、除外キーを飛ばす）で 1 本を選ぶ。
+    """
+    cars = vehicles if isinstance(vehicles, list) else list(vehicles.values())
+
+    def track_overtaking(pcap, first_frame, last_frame, side="right",
+                         expected_pass_time=None, exclude_track_keys=None):
+        if calls is not None:
+            calls.append({"first": first_frame, "last": last_frame, "side": side,
+                          "expected": expected_pass_time,
+                          "exclude": list(exclude_track_keys or [])})
+        low = pcap.frames[first_frame].timestamp
+        high = pcap.frames[last_frame].timestamp
+        inside = [car for car in cars if low <= car["pass_time"] <= high]
+        if expected_pass_time is None:
+            inside.sort(key=lambda car: -car["score"])
+        else:
+            inside.sort(key=lambda car: (abs(car["pass_time"] - expected_pass_time),
+                                         -car["score"]))
+        candidates = [{key: value for key, value in car.items() if key != "confidence"}
+                      for car in inside]
+        excluded = set(exclude_track_keys or ())
+        chosen = next((car for car in inside if car["track_key"] not in excluded), None)
+        if chosen is None:
+            return {"ok": False, "frames": [], "confidence": 0.0, "warnings": [],
+                    "pass_time": None, "track_key": None, "candidates": candidates}
+        # 車ごとに違う位置の矩形にする（同じ車かどうかを軌跡で判定する側のため）。
+        # 合成PCAPの点は Y=2.5〜8m にあるので、どの車の矩形にも点は入る。
+        center = chosen["pass_time"] * 3.0
+        return {
+            "ok": True,
+            "frames": [
+                {"index": index,
+                 "bounds": {"min_x": -20.0, "max_x": 20.0,
+                            "min_y": -20.0 + center, "max_y": 20.0 + center}}
+                for index in range(first_frame, last_frame + 1)
+            ],
+            "confidence": chosen.get("confidence", confidence),
+            "warnings": [], "pass_time": chosen["pass_time"],
+            "track_key": chosen["track_key"], "candidates": candidates,
+        }
+
+    return track_overtaking
+
+
+def car(track_key: str, pass_time: float, lc_estimate: float = 1.2,
+        score: float = 0.9, confidence: float = 0.9) -> dict:
+    """``scripted_tracker`` へ渡す 1 台分の車の定義。"""
+    return {"track_key": track_key, "pass_time": pass_time, "score": score,
+            "lc_estimate": lc_estimate, "median_x": lc_estimate,
+            "confidence": confidence}
+
+
+def read_reviewed(out_dir: Path) -> list[dict]:
+    """レビュー結果CSVを読む。"""
+    with (out_dir / "reviewed_overtaking_events.csv").open(
+        "r", encoding="utf-8-sig", newline=""
+    ) as stream:
+        return list(csv.DictReader(stream))
+
+
+def event_row(event_id: str, start: float, peak: float, end: float,
+              side: str = "right") -> str:
+    """候補CSVの1行を作る。"""
+    return (f"{event_id},普通,car,{side},{start},{peak},{end},{end - start},"
+            f"0.1,0,GX010001.MP4,{start},{end}\n")
 
 
 # ── テスト ────────────────────────────────────────────────────────────────────
@@ -215,7 +293,7 @@ def test_pipeline_end_to_end():
         sync = json.loads((out_dir / "sync.json").read_text(encoding="utf-8"))
         assert sync["source"] == "fallback" and sync["pcap_start_unix"] == PCAP_START_UNIX
 
-        # 段階4: 全候補を採用してレビューCSVを書く
+        # 段階6: 点群が取れた候補を採用してレビューCSVを書く
         assert status["review"] == "ok", status
         with (out_dir / "reviewed_overtaking_events.csv").open(
             "r", encoding="utf-8-sig", newline=""
@@ -225,7 +303,8 @@ def test_pipeline_end_to_end():
         assert reviewed[0]["danger_level"] == "0", reviewed
         assert reviewed[0]["veloview_t_start"] == "00:00:00.500", reviewed
 
-        # 段階5: マージン1.5秒を足したフレーム範囲でダミー追跡を呼び、点群CSVを書く
+        # 段階4: 撮影方向別マージンを足したフレーム範囲でダミー追跡を呼び、点群CSVを書く
+        # 通過側は日本では常に右なので、候補CSVの side 列によらず "right" を渡す
         assert status["autotrack"] == "ok", status
         assert calls == [(0, 5, "right")], calls
         lidar_csv = out_dir / "lidar" / "overtaking_001.csv"
@@ -263,7 +342,8 @@ def test_pipeline_end_to_end():
         assert "自動パイプライン レポート" in text
         assert "[人手が必要な項目]" in text
         assert any("危険感" in item for item in data["manual_actions"]), data["manual_actions"]
-        assert any("自動レビュー" in item for item in data["manual_actions"]), data["manual_actions"]
+        review = next(s for s in data["stages"] if s["name"] == "review")
+        assert (review["accepted"], review["rejected"]) == (1, 0), review
         print("  OK: 段階4〜8をend-to-endで実行して最終Excelまで生成")
 
 
@@ -283,7 +363,8 @@ def test_offset_option_and_frame_range():
         status = {stage["name"]: stage["status"] for stage in report.to_dict()["stages"]}
         assert status["sync"] == "ok", status
         # 2.0+1.0-0.5=2.5秒 → フレーム2または3、3.0+1.0+0.5=4.5秒 → フレーム4または5
-        assert calls == [(2, 4, "left")] or calls == [(3, 5, "left")], calls
+        # 候補CSVの side は "left" だが、物理的な通過側は常に右なので "right" を渡す
+        assert calls == [(2, 4, "right")] or calls == [(3, 5, "right")], calls
         sync = json.loads((out_dir / "sync.json").read_text(encoding="utf-8"))
         assert sync["offset"] == 1.0 and sync["source"] == "manual", sync
         print("  OK: --offset の手動指定とフレーム範囲の変換")
@@ -339,6 +420,212 @@ def test_autotrack_failure_keeps_pipeline_running():
         assert any("追跡できません" in item for item in data["warnings"]), data["warnings"]
         assert any("手動選択" in item for item in data["manual_actions"]), data["manual_actions"]
         print("  OK: 点群追跡の失敗でパイプラインを止めない")
+
+
+def test_track_window_is_asymmetric_toward_approach():
+    """追跡窓は車が近づいてくる側（front なら開始側）へ長く取る。"""
+    event = {"t_start_s": "20.0", "t_end_s": "24.0"}
+    front = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                           pcap_path=Path("."), view="front")
+    rear = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                          pcap_path=Path("."), view="rear")
+    fixed = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                           pcap_path=Path("."), view="front", track_margin=5.0)
+    assert front.track_margins() == (8.0, 3.0), front.track_margins()
+    assert rear.track_margins() == (3.0, 8.0), rear.track_margins()
+    assert run_pipeline.event_window(front, event, 1.0) == (13.0, 28.0)
+    assert run_pipeline.event_window(rear, event, 1.0) == (18.0, 33.0)
+    # --track-margin を明示した場合は従来どおり前後同じ
+    assert run_pipeline.event_window(fixed, event, 1.0) == (16.0, 30.0)
+    print("  OK: front は開始側 -8秒 / 終了側 +3秒、rear は逆の非対称窓")
+
+
+def test_events_are_assigned_to_distinct_vehicles():
+    """窓が重なる2候補に、期待通過時刻で別々の車を割り当てる。
+
+    2 台とも両方の窓に入るので、スコア最大で選ぶと同じ車が2回出てしまう。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5)
+                         + event_row("002", 3.5, 4.0, 4.5))
+
+        calls: list = []
+        cars = [car("f10x+1.8", 1.0, lc_estimate=1.1, score=0.95),
+                car("f40x+2.0", 4.0, lc_estimate=1.4, score=0.50)]
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(config, tracker=scripted_tracker(cars, calls))
+        data = report.to_dict()
+
+        track = next(s for s in data["stages"] if s["name"] == "autotrack")
+        assert track["assigned"] == {"001": "f10x+1.8", "002": "f40x+2.0"}, track["assigned"]
+        assert len(set(track["assigned"].values())) == 2, track["assigned"]
+        # 期待通過時刻（動画の peak_t_s + オフセット）をプラグインへ渡している
+        assert [round(c["expected"], 1) for c in calls[:2]] == [1.0, 4.0], calls
+        assert sorted(p.name for p in (out_dir / "lidar").glob("overtaking_*.csv")) == [
+            "overtaking_001.csv", "overtaking_002.csv"
+        ]
+        reviewed = read_reviewed(out_dir)
+        assert [row["review_status"] for row in reviewed] == ["採用", "採用"], reviewed
+        print("  OK: 窓が重なる2候補へ別々の車を割り当て（重複なし）")
+
+
+def test_second_vehicle_of_a_convoy_is_picked_up():
+    """同じ車を取り合ったら期待通過時刻が近い方が勝ち、負けた方は2台目を拾う。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        # 2候補とも1台目(通過2.0s)に近いが、002 は 2台目(通過4.0s)を取るべき
+        write_events_csv(out_dir, event_row("001", 1.5, 2.2, 2.8)
+                         + event_row("002", 2.0, 2.6, 3.2))
+
+        calls: list = []
+        cars = [car("f20x+1.8", 2.0, lc_estimate=1.0, score=0.95),
+                car("f40x+2.2", 4.0, lc_estimate=1.5, score=0.60)]
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(config, tracker=scripted_tracker(cars, calls))
+        data = report.to_dict()
+
+        track = next(s for s in data["stages"] if s["name"] == "autotrack")
+        assert track["assigned"] == {"001": "f20x+1.8", "002": "f40x+2.2"}, track["assigned"]
+        # 2台目を拾うため、1台目を除外して選び直している
+        retried = [c for c in calls if c["exclude"]]
+        assert retried and retried[-1]["exclude"] == ["f20x+1.8"], calls
+        assert len(read_reviewed(out_dir)) == 2
+        print("  OK: 車列で1台目を取り合った候補が2台目を拾う")
+
+
+def test_duplicate_vehicle_output_is_blocked():
+    """同じ車を2候補へ出力しようとしたら、2件目を除外して重複を作らない。
+
+    候補一覧を返さない旧プラグインは、どちらの候補でも同じ矩形列を返す。
+    ``track_key`` が無くても軌跡の重なりで同一車両と分かるので出力は1件になる。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5)
+                         + event_row("002", 3.5, 4.0, 4.5))
+
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(config, tracker=dummy_tracker())
+        data = report.to_dict()
+
+        exported = sorted(p.name for p in (out_dir / "lidar").glob("overtaking_*.csv"))
+        assert exported == ["overtaking_001.csv"], exported
+        review = next(s for s in data["stages"] if s["name"] == "review")
+        assert (review["accepted"], review["rejected"]) == (1, 1), review
+        assert "同じ車両" in review["reasons"]["002"], review["reasons"]
+        reviewed = read_reviewed(out_dir)
+        assert [row["event_id"] for row in reviewed] == ["001"], reviewed
+        # 除外した候補は最終Excelにも出ない（2行目までで終わる）
+        with ZipFile(out_dir / "final" / "out_auto_final.xlsx") as book:
+            sheet_xml = book.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert sheet_cell(sheet_xml, "C2") == "ID1", sheet_xml[:200]
+        assert sheet_cell(sheet_xml, "C3") == "", "除外した候補が最終Excelに出ている"
+        print("  OK: 同一車両の重複出力を1件へ抑える")
+
+
+def test_auto_review_classifies_by_lidar_result():
+    """自動レビューが LiDAR の結果で採用・未確認・除外を振り分ける。"""
+    config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                            pcap_path=Path("."), view="front")
+    events = [{"event_id": str(index)} for index in range(1, 6)]
+    tracking = {
+        "1": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2},
+        "2": {"ok": False, "reason": "追跡窓の中に対応する追い越し車両が見つかりませんでした"},
+        "3": {"ok": True, "confidence": 0.9, "lc_estimate": 4.4},   # 隣車線
+        "4": {"ok": True, "confidence": 0.3, "lc_estimate": 1.0},   # 確信度が低い
+        "5": {"ok": True, "confidence": 0.9, "lc_estimate": 1.0},   # 実測LCで隣車線と判明
+    }
+    analyses = {
+        "1": {"metrics": {"lc": 1.35}},
+        "5": {"metrics": {"lc": 3.9}},
+    }
+    reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses)
+    assert [row["review_status"] for row in reviewed] == [
+        "採用", "除外", "除外", "未確認", "除外"
+    ], reviewed
+    assert "見つかりません" in reviewed[1]["review_reason"], reviewed[1]
+    assert "隣車線" in reviewed[2]["review_reason"], reviewed[2]
+    assert "確信度" in reviewed[3]["review_reason"], reviewed[3]
+    # 実測LC（edit解析）は追跡時の目安より優先する
+    assert "3.90m" in reviewed[4]["review_reason"], reviewed[4]
+    assert all(row["danger_level"] == "0" for row in reviewed), reviewed
+    print("  OK: LiDAR結果で採用・未確認・除外を判定（実測LC優先）")
+
+
+def test_unassigned_vehicle_is_reported_as_a_detection_gap():
+    """どの候補にも割り当たらない車は、動画検出の取りこぼしとしてレポートへ挙げる。
+
+    実データ(260701/ID1)で未検出だった車列の2台目は、LiDAR には居るのに動画側の
+    候補が無い状態だった。採否は決められないので人手項目として残す。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5)
+                         + event_row("002", 3.5, 4.0, 4.5))
+
+        cars = [car("f10x+1.8", 1.0), car("f40x+2.0", 4.0),
+                car("f25x+1.9", 2.5, lc_estimate=1.0, score=0.95)]   # 候補の無い車
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(config, tracker=scripted_tracker(cars))
+        data = report.to_dict()
+
+        assert data["info"]["割り当て先の無い車(動画検出の取りこぼし候補)"] == 1, data["info"]
+        assert any("取りこぼし" in item and "2.5s" in item for item in data["manual_actions"]), \
+            data["manual_actions"]
+        # 隣車線相当・評価値の低い車は挙げない（誤検出が多いため）
+        quiet = run_pipeline.unassigned_vehicles(
+            {"001": [car("f60x+4.4", 6.0, lc_estimate=4.4, score=0.95),
+                     car("f80x+1.5", 8.0, lc_estimate=1.5, score=0.40)]}, {},
+        )
+        assert quiet == [], quiet
+        print("  OK: 割り当て先の無い車を検出の取りこぼし候補として報告")
+
+
+def test_measured_lc_overrides_the_tracking_estimate():
+    """edit解析で LC が求まれば、追跡時の目安ではなく実測値でしきい値判定する。
+
+    合成PCAPの軌跡から求まる実測 LC は 1.0m。追跡側が隣車線相当（4.2m）と
+    見積もっても、実測が範囲内なら採用する（逆も同じ）。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        cars = [car("f10x+4.2", 1.0, lc_estimate=4.2)]
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(config, tracker=scripted_tracker(cars))
+        review = next(s for s in report.to_dict()["stages"] if s["name"] == "review")
+        assert (review["accepted"], review["rejected"]) == (1, 0), review
+        analysis = run_pipeline.run_edit_csv(config, report)["001"]
+        measured = analysis["metrics"]["lc"]
+        assert 0.0 < measured < run_pipeline.MAX_LANE_CLEARANCE, measured
+        print("  OK: 実測LCが求まれば追跡時の目安より優先する")
+
+
+def test_low_confidence_track_is_flagged_for_review():
+    """確信度が低い候補は「未確認」にして人手項目へ回す（最終Excelには出さない）。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        cars = [car("f10x+1.8", 1.0, lc_estimate=1.1, confidence=0.35)]
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        report = execute_pipeline(config, tracker=scripted_tracker(cars))
+        data = report.to_dict()
+
+        review = next(s for s in data["stages"] if s["name"] == "review")
+        assert (review["accepted"], review["unreviewed"]) == (0, 1), review
+        assert any("確信度" in item for item in data["manual_actions"]), data["manual_actions"]
+        reviewed = read_reviewed(out_dir)
+        assert [row["review_status"] for row in reviewed] == ["未確認"], reviewed
+        print("  OK: 確信度 < 0.5 は未確認としてレポートの人手項目へ")
 
 
 def test_danger_level_is_blank_unless_reviewed():

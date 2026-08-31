@@ -18,11 +18,15 @@ GUI(`web_gui.py`)で人が Step1〜6 を順に操作していた作業を、1コ
     1. 検出        detect_overtaking.py をサブプロセス実行
     2. GPS抽出     各動画の GoPro テレメトリ → out/gps/<stem>/telemetry_gps.xlsx
     3. 時刻同期    GoPro GPS と PCAP からオフセットを算出 → out/sync.json
-    4. 自動レビュー 候補の採用判定 → out/reviewed_overtaking_events.csv
-    5. 点群追跡    lidar_autotrack プラグインで車両を追跡 → out/lidar/overtaking_*.csv
-    6. edit CSV    最近接点軌跡と解析Excel → out/lidar_edit/
+    4. 点群追跡    候補と車両を1対1に割り当てて追跡 → out/lidar/overtaking_*.csv
+    5. edit CSV    最近接点軌跡と解析Excel → out/lidar_edit/
+    6. 自動レビュー LiDARの結果で採否を判定 → out/reviewed_overtaking_events.csv
     7. 最終Excel   out/final/<出力フォルダ名>_final.xlsx
     8. レポート    out/pipeline_report.json / out/pipeline_report.txt
+
+自動レビューは点群追跡と edit CSV の結果を使って判定するため、追跡より後に置く。
+動画だけでは隣車線の車や誤検知を切り分けられないが、LiDAR の離隔距離まで求まれば
+「そもそも車が見つからない」「離隔距離が隣車線相当」を機械的に落とせる。
 
 危険感は全自動実行では空欄にする（人が後から最終Excelへ入力する）。
 """
@@ -30,8 +34,11 @@ GUI(`web_gui.py`)で人が Step1〜6 を順に操作していた作業を、1コ
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import math
 import os
+import statistics
 import subprocess
 import sys
 import time
@@ -45,7 +52,12 @@ from detect_view import (
     DetectViewError,
     detect_view,
 )
-from edit_csv import write_edit_analysis_xlsx, write_edit_csv
+from edit_csv import (
+    analyze_edit_points,
+    read_edit_points,
+    write_edit_analysis_xlsx,
+    write_edit_csv,
+)
 from final_export import generate_final_workbook
 from lidar_pcap import VelodynePcap
 from web_gui import (
@@ -59,11 +71,39 @@ from web_gui import (
 APP_DIR = Path(__file__).resolve().parent
 VIDEO_SUFFIXES = {".mp4", ".mov"}
 # 実データ検証(260701/ID1)より: 1.5秒では接近区間が窓に入らずフェーズ2が
-# フォールバックになりやすい。5秒で追跡成功が大きく増える(5/66→15/66相当)。
+# フォールバックになりやすい。5秒で追跡成功が大きく増える。--track-margin を
+# 明示した場合の前後共通マージンで、既定では view 別の非対称マージンを使う。
 DEFAULT_TRACK_MARGIN = 5.0
 # 撮影方向は指定が無ければ段階0で自動判定する。判定不能のときだけこの値を仮定する
 # （既定値を front / rear のどちらかに固定すると自動判定が走らなくなる点に注意）。
 DEFAULT_VIEW = "front"
+
+# 追跡窓は接近側へ長く取る。TTC は接近区間（フェーズ2）から求めるため、車が
+# 後方 Y<0 から近づいてくる時間を窓へ入れないとフォールバックになり値が狂う。
+# front 撮影では車が映る前から後方にいるので開始側を、rear 撮影では映ってから
+# 抜けるまでが長いので終了側を伸ばす。(開始側, 終了側) の秒数。
+VIEW_TRACK_MARGINS = {"front": (8.0, 3.0), "rear": (3.0, 8.0)}
+
+# 自動レビューのしきい値。
+# 日本の追い越しは隣車線でなければ 2.5m 程度まで（正解データの LC は全て 2.45m
+# 以下）。これを超える通過は隣車線の車を掴んだものとみなして除外する。
+MAX_LANE_CLEARANCE = 3.5
+# 追跡の確信度がこれ未満なら「未確認」にして人手確認へ回す。
+MIN_TRACK_CONFIDENCE = 0.5
+
+# イベントと車両の割り当て。
+# 期待通過時刻からこれ以上離れた車は、そのイベントの車とみなさない（秒）。
+PASS_MATCH_TOLERANCE = 6.0
+# 通過時刻がこれ以内なら、別イベントの走査で見つかった同じ車とみなす（秒）。
+# 車列の2台目とは 4〜9 秒空くので、それより十分小さく取る。
+VEHICLE_MERGE_GAP = 1.0
+# 期待通過時刻の系統ずれを推定する際、これ以上離れた候補は外れ値として使わない（秒）。
+BIAS_SAMPLE_LIMIT = 10.0
+# どの候補にも割り当たらなかった車を「動画検出の取りこぼしかも」と挙げる評価値の下限。
+ORPHAN_MIN_SCORE = 0.85
+# 出力直前の重複チェック。同じフレームで矩形の中心がこの距離以内なら同じ車とみなす（m）。
+SAME_VEHICLE_DISTANCE = 2.0
+SAME_VEHICLE_MIN_FRAMES = 3
 
 STATUS_LABELS = {
     "ok": "完了",
@@ -105,7 +145,18 @@ class PipelineConfig:
     redetect: bool = False
     skip_gps: bool = False
     offset_override: float | None = None
-    track_margin: float = DEFAULT_TRACK_MARGIN
+    # None なら view 別の非対称マージン（VIEW_TRACK_MARGINS）を使う。
+    track_margin: float | None = None
+    # 自動レビューで隣車線の通過とみなす離隔距離のしきい値(m)。
+    max_lane_clearance: float = MAX_LANE_CLEARANCE
+
+    def track_margins(self) -> tuple[float, float]:
+        """追跡窓の (開始側, 終了側) マージン秒を返す。"""
+        if self.track_margin is not None:
+            return float(self.track_margin), float(self.track_margin)
+        return VIEW_TRACK_MARGINS.get(
+            self.view, (DEFAULT_TRACK_MARGIN, DEFAULT_TRACK_MARGIN)
+        )
 
 
 def _subdir(session_dir: Path, name: str) -> Path | None:
@@ -232,7 +283,8 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         redetect=bool(args.redetect),
         skip_gps=bool(args.skip_gps),
         offset_override=args.offset,
-        track_margin=float(args.track_margin),
+        track_margin=None if args.track_margin is None else float(args.track_margin),
+        max_lane_clearance=float(args.max_lane_clearance),
     )
 
 
@@ -563,44 +615,7 @@ def run_sync(config: PipelineConfig, pcap: VelodynePcap, report: PipelineReport)
     return offset
 
 
-# ── 段階4: 自動レビュー ───────────────────────────────────────────────────────
-
-def auto_review_events(events: list[dict], config: PipelineConfig) -> list[dict]:
-    """候補の採用・除外を自動判定する。
-
-    現段階は暫定で全候補を「採用」にする。危険感(``danger_level``)は全自動実行では
-    付けない（"0" のまま＝最終Excelでは空欄）。クリップ内容を見て自動判定する実装は
-    ここを差し替えることで組み込める。``events`` は ``web_gui.read_events_csv`` の
-    返す行（辞書）の一覧で、戻り値は ``review_status`` を設定した同じ行の一覧。
-    """
-    for event in events:
-        event["review_status"] = "採用"
-        event["danger_level"] = str(event.get("danger_level") or "0")
-    return events
-
-
-def run_review(config: PipelineConfig, events_csv: Path, offset: float,
-               report: PipelineReport) -> list[dict]:
-    events = read_events_csv(events_csv, {}, "")
-    if not events:
-        report.stage("review", "4.自動レビュー", "failed", f"{events_csv.name} に候補がありません")
-        raise PipelineError(f"追い越し候補がありません: {events_csv}")
-    reviewed = auto_review_events(events, config)
-    accepted = [e for e in reviewed if e.get("review_status") == "採用"]
-    path = save_reviewed_events(config.out_dir, reviewed, offset)
-    report.stage(
-        "review", "4.自動レビュー", "ok",
-        f"候補 {len(events)} 件のうち {len(accepted)} 件を採用しました",
-        path=str(path), total=len(events), accepted=len(accepted),
-    )
-    report.manual(
-        f"自動レビューは全候補({len(accepted)}件)を採用しています。"
-        "誤検知が残っていないかクリップ(out/clips)で確認してください"
-    )
-    return accepted
-
-
-# ── 段階5: 点群自動追跡 ───────────────────────────────────────────────────────
+# ── 段階4: 点群自動追跡とイベント↔車両の割り当て ─────────────────────────────
 
 def load_autotracker() -> tuple[object | None, str]:
     """``lidar_autotrack.track_overtaking`` を読み込む（未実装なら None）。
@@ -608,13 +623,22 @@ def load_autotracker() -> tuple[object | None, str]:
     契約::
 
         track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
-                         side: str = "right") -> {
+                         side: str = "right",
+                         expected_pass_time: float | None = None,
+                         exclude_track_keys: list[str] | None = None) -> {
             "ok": bool,
             "frames": [{"index": int,
                         "bounds": {"min_x":.., "max_x":.., "min_y":.., "max_y":..}}],
             "confidence": float,
             "warnings": [str],
+            "pass_time": float | None,     # 選択トラックが |Y|<3m を横断した時刻
+            "track_key": str | None,       # 同一車両を指す識別子
+            "candidates": [{"track_key", "pass_time", "score",
+                            "median_x", "lc_estimate"}],
         }
+
+    後ろ 3 つのキーと引数 2 つは任意。受け取らない古いプラグインでも動くよう、
+    呼び出し側は署名を見て渡すかどうかを決める。
     """
     try:
         from lidar_autotrack import track_overtaking
@@ -632,116 +656,486 @@ def _event_seconds(event: dict, key: str, default: float = 0.0) -> float:
         return default
 
 
-def run_autotrack(config: PipelineConfig, pcap: VelodynePcap, accepted: list[dict],
-                  offset: float, report: PipelineReport, tracker=None) -> list[Path]:
-    """採用候補ごとに点群を自動追跡し、out/lidar/overtaking_<id>.csv を書き出す。"""
+def _tracker_accepts(tracker, name: str) -> bool:
+    """プラグインが指定の任意引数を受け取れるか調べる（後方互換のため）。"""
+    try:
+        return name in inspect.signature(tracker).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def event_window(config: PipelineConfig, event: dict, offset: float) -> tuple[float, float]:
+    """1 候補の追跡窓（pcap 相対秒）を返す。"""
+    start_margin, end_margin = config.track_margins()
+    return (_event_seconds(event, "t_start_s") + offset - start_margin,
+            _event_seconds(event, "t_end_s") + offset + end_margin)
+
+
+def expected_pass_times(events: list[dict], offset: float, bias: float = 0.0) -> dict[str, float]:
+    """候補ごとの「車が横に並ぶはずの時刻」（pcap 相対秒）を返す。
+
+    動画の最接近時刻 ``peak_t_s`` を時刻オフセットで pcap 時刻へ移し、系統ずれ
+    ``bias`` を足す。この時刻に最も近い車をそのイベントの車とみなす。
+    """
+    return {
+        str(event.get("event_id", "")):
+            _event_seconds(event, "peak_t_s") + offset + bias
+        for event in events
+    }
+
+
+def estimate_pass_bias(expected: dict[str, float], candidate_sets: dict[str, list[dict]],
+                       limit: float = BIAS_SAMPLE_LIMIT) -> float:
+    """期待通過時刻の系統ずれ（秒）を推定する。
+
+    期待通過時刻は「動画の最接近時刻 + 時刻オフセット」で作るが、GPS同期の誤差や
+    カメラの見え方（前向きでは車が映る前から後方にいる）で LiDAR の実際の通過時刻
+    と数秒ずれる。全候補について「最も近い車との差」を集めて中央値を取れば、
+    個々の誤対応に引きずられずにこのずれだけを測れる。260701/ID1 では約 +2.7 秒。
+    """
+    deltas = []
+    for event_id, candidates in candidate_sets.items():
+        want = expected.get(event_id)
+        times = [c["pass_time"] for c in candidates if c.get("pass_time") is not None]
+        if want is None or not times:
+            continue
+        nearest = min(times, key=lambda value: abs(value - want))
+        if abs(nearest - want) <= limit:
+            deltas.append(nearest - want)
+    return float(statistics.median(deltas)) if len(deltas) >= 3 else 0.0
+
+
+def group_vehicles(candidate_sets: dict[str, list[dict]],
+                   merge_gap: float = VEHICLE_MERGE_GAP) -> list[list[tuple[str, dict]]]:
+    """全候補の追跡結果を通過時刻でまとめ、実車両ごとのグループにする。
+
+    イベントごとに追跡窓が違うため、同じ車でも走査のたびに ``track_key`` が僅かに
+    ぶれうる。通過時刻が ``merge_gap`` 秒以内の候補は同じ車とみなして 1 つの
+    グループにし、「1 台の車は 1 つのイベントにしか出力しない」を保証する単位に
+    する。車列の 2 台目とは 4 秒以上空くので取り違えない。
+    """
+    items = [
+        (event_id, candidate)
+        for event_id, candidates in candidate_sets.items()
+        for candidate in candidates
+        if candidate.get("pass_time") is not None
+    ]
+    items.sort(key=lambda item: item[1]["pass_time"])
+    groups: list[list[tuple[str, dict]]] = []
+    for entry in items:
+        if groups and entry[1]["pass_time"] - groups[-1][-1][1]["pass_time"] <= merge_gap:
+            groups[-1].append(entry)
+        else:
+            groups.append([entry])
+    return groups
+
+
+def assign_events(expected: dict[str, float], candidate_sets: dict[str, list[dict]],
+                  tolerance: float = PASS_MATCH_TOLERANCE,
+                  merge_gap: float = VEHICLE_MERGE_GAP) -> dict[str, dict]:
+    """イベントと車両を 1 対 1 に割り当てる。
+
+    期待通過時刻との差が小さいペアから順に確定していくグリーディ法。既に使った
+    イベントと車両は飛ばすため、同じ車が複数イベントへ出力される重複が起きず、
+    同じ車を取り合った場合は期待通過時刻に近い方のイベントが勝つ。差が
+    ``tolerance`` を超えるペアは組まない（＝そのイベントは車なしになる）。
+
+    戻り値は ``event_id -> {"track_key", "pass_time", "lc_estimate", "score",
+    "vehicle", "delta"}``。割り当たらなかったイベントは含まない。
+    """
+    pairs: list[tuple[float, str, int, dict]] = []
+    for vehicle, members in enumerate(group_vehicles(candidate_sets, merge_gap)):
+        # 同じ車について同じイベントが複数の候補を持つことはないが、念のため近い方を採る
+        best: dict[str, tuple[float, dict]] = {}
+        for event_id, candidate in members:
+            want = expected.get(event_id)
+            if want is None:
+                continue
+            delta = abs(candidate["pass_time"] - want)
+            if delta <= tolerance and (event_id not in best or delta < best[event_id][0]):
+                best[event_id] = (delta, candidate)
+        pairs.extend((delta, event_id, vehicle, candidate)
+                     for event_id, (delta, candidate) in best.items())
+
+    pairs.sort(key=lambda item: (item[0], item[1]))
+    used_events: set[str] = set()
+    used_vehicles: set[int] = set()
+    assignment: dict[str, dict] = {}
+    for delta, event_id, vehicle, candidate in pairs:
+        if event_id in used_events or vehicle in used_vehicles:
+            continue
+        used_events.add(event_id)
+        used_vehicles.add(vehicle)
+        assignment[event_id] = {
+            "track_key": candidate["track_key"],
+            "pass_time": candidate["pass_time"],
+            "lc_estimate": candidate.get("lc_estimate"),
+            "score": candidate.get("score"),
+            "vehicle": vehicle,
+            "delta": round(delta, 3),
+        }
+    return assignment
+
+
+def unassigned_vehicles(candidate_sets: dict[str, list[dict]], assignment: dict[str, dict],
+                        max_clearance: float = MAX_LANE_CLEARANCE,
+                        min_score: float = ORPHAN_MIN_SCORE,
+                        merge_gap: float = VEHICLE_MERGE_GAP) -> list[dict]:
+    """どの候補にも割り当てられなかった「追い越し車らしい車」を返す。
+
+    動画検出が車列の2台目を取りこぼすと、LiDAR には車が居るのに割り当て先の候補が
+    無い状態になる。実データ(260701/ID1)ではこれが未検出の追い越しの正体だった。
+    採否は決められないので、レポートの人手項目として「動画検出の取りこぼしかも
+    しれない車」を挙げる。隣車線相当（``max_clearance`` 超）と評価値の低い車は
+    誤検出が多いので除く。
+    """
+    used = {value.get("vehicle") for value in assignment.values()}
+    orphans = []
+    for vehicle, members in enumerate(group_vehicles(candidate_sets, merge_gap)):
+        if vehicle in used:
+            continue
+        best = max(members, key=lambda item: item[1].get("score") or 0.0)[1]
+        clearance = best.get("lc_estimate")
+        if (best.get("score") or 0.0) < min_score:
+            continue
+        if isinstance(clearance, (int, float)) and clearance > max_clearance:
+            continue
+        orphans.append(best)
+    return sorted(orphans, key=lambda candidate: candidate["pass_time"])
+
+
+def keys_before(candidates: list[dict], track_key: str) -> list[str]:
+    """``candidates`` の採用順で ``track_key`` より前にあるキーを返す。
+
+    ``track_overtaking`` は ``candidates`` を採用順に返すので、ここで返したキーを
+    ``exclude_track_keys`` に渡せば、狙ったトラックが選ばれる。
+    """
+    keys = [candidate["track_key"] for candidate in candidates]
+    return keys[:keys.index(track_key)] if track_key in keys else []
+
+
+def _scan_event(tracker, pcap: VelodynePcap, config: PipelineConfig, event: dict,
+                offset: float, report: PipelineReport, expected: float | None,
+                exclude: list[str] | None = None) -> dict | None:
+    """1 候補分の追跡を実行する。窓外・例外は理由を記録して ``None`` を返す。"""
+    event_id = str(event.get("event_id", ""))
+    start_s, end_s = event_window(config, event, offset)
+    if end_s < 0 or start_s > pcap.duration:
+        report.warn(
+            f"候補 {event_id}: 追い越し時刻 {start_s:.1f}〜{end_s:.1f}s がPCAPの"
+            f"収録範囲(0〜{pcap.duration:.1f}s)から外れています"
+        )
+        report.manual(f"候補 {event_id}: 時刻オフセットを確認し、手動選択が必要です")
+        return None
+    first = pcap.nearest_frame(start_s)
+    last = pcap.nearest_frame(end_s)
+    options: dict = {}
+    if expected is not None and _tracker_accepts(tracker, "expected_pass_time"):
+        options["expected_pass_time"] = expected
+    if exclude and _tracker_accepts(tracker, "exclude_track_keys"):
+        options["exclude_track_keys"] = list(exclude)
+    try:
+        # 通過側は日本では常に右(+X)。detect_overtaking.py の side 列はカメラの
+        # 見え方(front=left/rear=right)を表しており物理的な通過側ではないため、
+        # トラッカーへは渡さない。
+        result = tracker(pcap, first, last, side="right", **options) or {}
+    except Exception as exc:  # noqa: BLE001 - 1候補の失敗で止めない
+        report.warn(f"候補 {event_id}: 点群の自動追跡でエラー: {exc}")
+        report.manual(f"候補 {event_id}: 点群の自動追跡に失敗したため手動選択が必要です")
+        return None
+    result["first_frame"], result["last_frame"] = first, last
+    return result
+
+
+def run_autotrack(config: PipelineConfig, pcap: VelodynePcap, events: list[dict],
+                  offset: float, report: PipelineReport, tracker=None) -> dict[str, dict]:
+    """全候補の点群を追跡し、イベントと車両を1対1に割り当てて点群CSVを書き出す。
+
+    処理は 2 段構え。まず候補ごとに窓を走査して「その窓に居た追い越し車らしい
+    トラック」を全部集め（1回目）、集めた情報でイベントと車両の割り当てを決めてから、
+    1回目の選択と違う車になったイベントだけ選び直す（2回目）。こうすると、車列で
+    追跡窓が重なっても同じ車が複数イベントへ出力されず、2台目も拾える。
+
+    戻り値は ``event_id -> {"ok", "confidence", "pass_time", "track_key",
+    "lc_estimate", "path", "reason"}``。段階6の自動レビューがこれを使う。
+    """
     if tracker is None:
         tracker, load_error = load_autotracker()
     else:
         load_error = ""
-    lidar_dir = config.out_dir / "lidar"
 
     if tracker is None:
         report.stage(
-            "autotrack", "5.点群追跡", "skipped",
-            f"lidar_autotrack が利用できません（{load_error}）",
-            exported=[],
+            "autotrack", "4.点群追跡", "skipped",
+            f"lidar_autotrack が利用できません（{load_error}）", exported=[],
         )
         report.warn(f"点群の自動追跡モジュールがありません: {load_error}")
-        for event in accepted:
+        for event in events:
             report.manual(
                 f"候補 {event.get('event_id', '?')}: 点群の自動追跡ができないため"
                 "GUIで手動選択が必要です"
             )
-        return []
+        return {}
 
-    exported: list[Path] = []
-    failures = 0
-    for event in accepted:
-        event_id = event.get("event_id", "")
-        start_s = _event_seconds(event, "t_start_s") + offset - config.track_margin
-        end_s = _event_seconds(event, "t_end_s") + offset + config.track_margin
-        if end_s < 0 or start_s > pcap.duration:
-            failures += 1
-            report.warn(
-                f"候補 {event_id}: 追い越し時刻 {start_s:.1f}〜{end_s:.1f}s がPCAPの"
-                f"収録範囲(0〜{pcap.duration:.1f}s)から外れています"
+    ordered = sorted(events, key=lambda event: _event_seconds(event, "peak_t_s"))
+    raw_expected = expected_pass_times(ordered, offset)
+
+    # 1回目: 窓ごとに走査して候補を集める
+    results: dict[str, dict] = {}
+    candidate_sets: dict[str, list[dict]] = {}
+    for event in ordered:
+        event_id = str(event.get("event_id", ""))
+        result = _scan_event(tracker, pcap, config, event, offset, report,
+                             raw_expected.get(event_id))
+        if result is None:
+            continue
+        results[event_id] = result
+        candidate_sets[event_id] = list(result.get("candidates") or [])
+
+    if not any(candidate_sets.values()):
+        # 候補一覧を返さない旧プラグイン。割り当ては組めないので走査結果をそのまま使う
+        # （同じ車の重複は _export_tracks の track_key チェックだけで防ぐ）。
+        assignment = {
+            event_id: {"track_key": result.get("track_key"), "vehicle": index,
+                       "pass_time": result.get("pass_time"), "lc_estimate": None,
+                       "score": None, "delta": 0.0}
+            for index, (event_id, result) in enumerate(results.items())
+            if result.get("ok")
+        }
+        return _export_tracks(config, pcap, ordered, results, assignment,
+                              raw_expected, report)
+
+    # 期待通過時刻の系統ずれを測り、それを補正した時刻で割り当てる
+    bias = estimate_pass_bias(raw_expected, candidate_sets)
+    expected = {event_id: want + bias for event_id, want in raw_expected.items()}
+    assignment = assign_events(expected, candidate_sets)
+    if bias:
+        report.info["期待通過時刻の系統ずれ(秒)"] = round(bias, 2)
+    _report_unassigned_vehicles(config, candidate_sets, assignment, offset, report)
+
+    # 2回目: 1回目と違う車になったイベントだけ、先に選ばれる車を除外して選び直す
+    for event in ordered:
+        event_id = str(event.get("event_id", ""))
+        target = assignment.get(event_id)
+        result = results.get(event_id)
+        if result is None:
+            continue
+        if target is None:
+            result["ok"] = False
+            result.setdefault("warnings", []).append(
+                "追跡窓の中に見つかった車はすべて他のイベントへ割り当てられました"
+                if candidate_sets.get(event_id) else
+                "追跡窓の中に追い越し車らしいトラックがありませんでした"
             )
-            report.manual(f"候補 {event_id}: 時刻オフセットを確認し、手動選択が必要です")
             continue
-        first = pcap.nearest_frame(start_s)
-        last = pcap.nearest_frame(end_s)
-        try:
-            result = tracker(pcap, first, last, side=str(event.get("side") or "right"))
-        except Exception as exc:  # noqa: BLE001 - 1候補の失敗で止めない
-            failures += 1
-            report.warn(f"候補 {event_id}: 点群の自動追跡でエラー: {exc}")
-            report.manual(f"候補 {event_id}: 点群の自動追跡に失敗したため手動選択が必要です")
+        if result.get("track_key") == target["track_key"]:
             continue
+        exclude = keys_before(candidate_sets[event_id], target["track_key"])
+        retry = _scan_event(tracker, pcap, config, event, offset, report,
+                            expected.get(event_id), exclude)
+        if retry is not None:
+            results[event_id] = retry
 
-        result = result or {}
+    return _export_tracks(config, pcap, ordered, results, assignment, expected, report)
+
+
+def frame_centers(frames: list[dict]) -> dict[int, tuple[float, float]]:
+    """矩形列を ``フレーム番号 -> 中心座標`` にする（同一車両の判定に使う）。"""
+    centers: dict[int, tuple[float, float]] = {}
+    for frame in frames:
+        bounds = frame.get("bounds") or {}
+        try:
+            centers[int(frame["index"])] = (
+                (float(bounds["min_x"]) + float(bounds["max_x"])) / 2,
+                (float(bounds["min_y"]) + float(bounds["max_y"])) / 2,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return centers
+
+
+def same_vehicle(left: dict[int, tuple[float, float]], right: dict[int, tuple[float, float]],
+                 distance: float = SAME_VEHICLE_DISTANCE,
+                 min_frames: int = SAME_VEHICLE_MIN_FRAMES) -> bool:
+    """2 つの矩形列が同じ車を囲っているかを軌跡の重なりで判定する。
+
+    ``track_key`` は追跡窓が違うとぶれうるため、最後の重複チェックは軌跡そのもので
+    行う。同じフレームで矩形の中心が ``distance`` m 以内に居るフレームが過半数を
+    占めれば同じ車とみなす。
+    """
+    shared = set(left) & set(right)
+    if len(shared) < min_frames:
+        return False
+    near = sum(
+        1 for index in shared
+        if math.dist(left[index], right[index]) <= distance
+    )
+    return near >= len(shared) * 0.6
+
+
+def _report_unassigned_vehicles(config: PipelineConfig, candidate_sets: dict[str, list[dict]],
+                                assignment: dict[str, dict], offset: float,
+                                report: PipelineReport) -> list[dict]:
+    """割り当て先の無い追い越し車を、動画検出の取りこぼしとしてレポートへ挙げる。"""
+    orphans = unassigned_vehicles(candidate_sets, assignment, config.max_lane_clearance)
+    if not orphans:
+        return []
+    report.info["割り当て先の無い車(動画検出の取りこぼし候補)"] = len(orphans)
+    for candidate in orphans:
+        # pcap時刻 = gopro時刻 + offset なので、動画時刻は引き算で戻す
+        video_time = candidate["pass_time"] - offset
+        report.manual(
+            f"LiDARの {candidate['pass_time']:.1f}s（動画 {video_time:.1f}s 付近）に"
+            f"追い越し車がいますが、対応する検出候補がありません"
+            f"（離隔距離の目安 {candidate.get('lc_estimate')}m）。"
+            "車列の2台目など動画検出の取りこぼしの可能性があります"
+        )
+    return orphans
+
+
+def _drop_stale_exports(config: PipelineConfig, tracking: dict[str, dict],
+                        report: PipelineReport) -> None:
+    """今回車両を割り当てられなかった候補の、前回実行の点群CSVを消す。
+
+    同じ出力フォルダへ再実行したとき、古い ``overtaking_<id>.csv`` が残っていると
+    段階5がそれを拾い、除外したはずの候補の解析結果が残ってしまう。
+    """
+    lidar_dir = config.out_dir / "lidar"
+    edit_dir = config.out_dir / "lidar_edit"
+    for event_id, entry in tracking.items():
+        if entry.get("ok"):
+            continue
+        for stale in (lidar_dir / f"overtaking_{event_id}.csv",
+                      edit_dir / f"overtaking_{event_id}_edit.csv",
+                      edit_dir / f"overtaking_{event_id}_edit_analysis.xlsx"):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError as exc:  # noqa: PERF203 - 消せなくても続行する
+                report.warn(f"前回の出力を削除できません: {stale.name}: {exc}")
+
+
+def _export_tracks(config: PipelineConfig, pcap: VelodynePcap, events: list[dict],
+                   results: dict[str, dict], assignment: dict[str, dict],
+                   expected: dict[str, float], report: PipelineReport) -> dict[str, dict]:
+    """割り当て済みの追跡結果を点群CSVへ書き出し、レビュー用の要約を返す。"""
+    lidar_dir = config.out_dir / "lidar"
+    tracking: dict[str, dict] = {}
+    exported: list[Path] = []
+    used_keys: dict[str, str] = {}
+    used_paths: dict[str, dict[int, tuple[float, float]]] = {}
+
+    for event in events:
+        event_id = str(event.get("event_id", ""))
+        result = results.get(event_id)
+        entry = {"ok": False, "confidence": 0.0, "pass_time": None, "track_key": None,
+                 "lc_estimate": None, "path": "", "reason": "点群を追跡できませんでした"}
+        tracking[event_id] = entry
+        if result is None:
+            entry["reason"] = "追跡窓がPCAPの範囲外か、追跡でエラーが起きました"
+            continue
         for message in result.get("warnings") or []:
             report.warn(f"候補 {event_id}: {message}")
         frames = list(result.get("frames") or [])
         if not result.get("ok") or not frames:
-            failures += 1
-            report.manual(
-                f"候補 {event_id}: 点群を自動追跡できなかったため手動選択が必要です"
+            entry["reason"] = "追跡窓の中に対応する追い越し車両が見つかりませんでした"
+            continue
+
+        track_key = result.get("track_key")
+        # 万一同じ車が2回出てきたら後勝ちを許さず、ここで確実に止める。キーの一致だけ
+        # では追跡窓のぶれを取りこぼすため、軌跡の重なりでも同一車両を検出する。
+        centers = frame_centers(frames)
+        duplicate = used_keys.get(track_key) if track_key else None
+        if duplicate is None:
+            duplicate = next(
+                (other for other, other_centers in used_paths.items()
+                 if same_vehicle(centers, other_centers)), None
             )
+        if duplicate is not None:
+            entry["reason"] = f"同じ車両を候補 {duplicate} へ割り当て済みです"
             continue
         try:
             path, frame_count, written, points = pcap.export_overtaking(
                 lidar_dir, event_id, frames
             )
         except Exception as exc:  # noqa: BLE001 - 1候補の失敗で止めない
-            failures += 1
             report.warn(f"候補 {event_id}: 点群CSVを書き出せません: {exc}")
-            report.manual(f"候補 {event_id}: 点群CSVの書き出しに失敗したため手動選択が必要です")
+            entry["reason"] = f"点群CSVを書き出せませんでした: {exc}"
             continue
+
+        if track_key:
+            used_keys[track_key] = event_id
+        used_paths[event_id] = centers
         exported.append(path)
-        confidence = result.get("confidence")
+        target = assignment.get(event_id) or {}
+        # LC の目安は実際に選ばれたトラックのものを使う（選び直しで割り当て時と
+        # 別のトラックになった場合に備え、候補一覧から引き直す）
+        chosen = next((candidate for candidate in result.get("candidates") or []
+                       if candidate.get("track_key") == track_key), None)
+        entry.update({
+            "ok": True, "reason": "",
+            "confidence": float(result.get("confidence") or 0.0),
+            "pass_time": result.get("pass_time"),
+            "track_key": track_key,
+            "lc_estimate": (chosen or target).get("lc_estimate"),
+            "path": str(path),
+        })
+        want = expected.get(event_id)
+        pass_time = result.get("pass_time")
+        gap = "" if want is None or pass_time is None else f" (期待との差 {pass_time - want:+.1f}s)"
         print(
-            f"[track] 候補 {event_id}: フレーム {first}〜{last} / "
-            f"{written}/{frame_count} フレーム, {points} 点",
+            f"[track] 候補 {event_id}: フレーム {result['first_frame']}〜"
+            f"{result['last_frame']} / {written}/{frame_count} フレーム, {points} 点"
+            f"{gap}",
             flush=True,
         )
         if written < frame_count:
             report.warn(
                 f"候補 {event_id}: {frame_count} フレーム中 {written} フレームしか点を選択できませんでした"
             )
-        if isinstance(confidence, (int, float)) and confidence < 0.5:
-            report.manual(
-                f"候補 {event_id}: 自動追跡の確信度が低いため（{confidence:.2f}）目視確認を推奨します"
-            )
 
-    status = "ok" if exported and not failures else ("warning" if exported else "failed")
+    _drop_stale_exports(config, tracking, report)
+    missing = len(events) - len(exported)
+    status = "ok" if exported and not missing else ("warning" if exported else "failed")
     report.stage(
-        "autotrack", "5.点群追跡", status,
-        f"{len(exported)}/{len(accepted)} 件の点群CSVを書き出しました",
-        exported=[str(p) for p in exported], failed=failures,
+        "autotrack", "4.点群追跡", status,
+        f"候補 {len(events)} 件のうち {len(exported)} 件に車両を割り当てました",
+        exported=[str(p) for p in exported], failed=missing,
+        assigned={event_id: value["track_key"] for event_id, value in tracking.items()
+                  if value["ok"]},
     )
-    return exported
+    return tracking
 
 
-# ── 段階6: edit CSV ───────────────────────────────────────────────────────────
+# ── 段階5: edit CSV ───────────────────────────────────────────────────────────
 
-def run_edit_csv(config: PipelineConfig, report: PipelineReport) -> list[dict]:
-    """GUIの generate_all_edit_csv 相当。out/lidar_edit/ へ出力する。"""
+def _event_id_from_lidar_csv(path: Path) -> str:
+    """``overtaking_<id>.csv`` から候補IDを取り出す。"""
+    return path.stem[len("overtaking_"):]
+
+
+def run_edit_csv(config: PipelineConfig, report: PipelineReport) -> dict[str, dict]:
+    """GUIの generate_all_edit_csv 相当。out/lidar_edit/ へ出力する。
+
+    戻り値は ``event_id -> {"path", "analysis_path", "metrics", "error"}``。
+    ``metrics`` は ``edit_csv.analyze_edit_points`` の結果で、段階6の自動レビューが
+    離隔距離 LC の判定に使う。
+    """
     lidar_dir = config.out_dir / "lidar"
     targets = [
         path for path in sorted(lidar_dir.glob("overtaking_*.csv"))
         if not path.stem.endswith("_edit")
     ] if lidar_dir.is_dir() else []
     if not targets:
-        report.stage("edit", "6.edit CSV", "skipped", "対象の overtaking_*.csv がありません")
+        report.stage("edit", "5.edit CSV", "skipped", "対象の overtaking_*.csv がありません")
         report.manual("out/lidar/ に点群CSVがありません。GUIで点群を選択・出力してください")
-        return []
+        return {}
 
     edit_dir = config.out_dir / "lidar_edit"
     edit_dir.mkdir(parents=True, exist_ok=True)
-    generated: list[dict] = []
+    generated: dict[str, dict] = {}
     failed = 0
     for target in targets:
+        event_id = _event_id_from_lidar_csv(target)
         try:
             path = move_edit_csv_to_dir(write_edit_csv(target), edit_dir)
         except Exception as exc:  # noqa: BLE001 - 1件の失敗で止めない
@@ -749,27 +1143,114 @@ def run_edit_csv(config: PipelineConfig, report: PipelineReport) -> list[dict]:
             report.warn(f"{target.name}: edit.csvを生成できません: {exc}")
             report.manual(f"{target.name}: edit.csvを生成できないため手動確認が必要です")
             continue
-        entry = {"source": str(target), "path": str(path)}
+        entry: dict = {"source": str(target), "path": str(path), "metrics": None}
         try:
+            entry["metrics"] = analyze_edit_points(read_edit_points(path))
             entry["analysis_path"] = str(write_edit_analysis_xlsx(path))
         except Exception as exc:  # noqa: BLE001 - 解析だけの失敗は警告に留める
-            entry["analysis_error"] = str(exc)
+            entry["error"] = str(exc)
             report.warn(f"{path.name}: 解析Excelを生成できません: {exc}")
             report.manual(
                 f"{path.name}: フェーズ判定ができませんでした。点群の選択範囲を手動で見直してください"
             )
-        generated.append(entry)
+        generated[event_id] = entry
 
-    analysis_failed = sum(1 for entry in generated if entry.get("analysis_error"))
+    analysis_failed = sum(1 for entry in generated.values() if entry.get("error"))
     status = "ok" if generated and not failed and not analysis_failed else \
         ("warning" if generated else "failed")
     report.stage(
-        "edit", "6.edit CSV", status,
+        "edit", "5.edit CSV", status,
         f"{len(generated)}/{len(targets)} 件のedit.csvを生成しました"
         f"（解析Excel失敗 {analysis_failed} 件）",
-        generated=generated, failed=failed,
+        generated=[{k: v for k, v in entry.items() if k != "metrics"}
+                   for entry in generated.values()],
+        failed=failed,
     )
     return generated
+
+
+# ── 段階6: 自動レビュー ───────────────────────────────────────────────────────
+
+def _analysis_lc(analysis: dict | None) -> float | None:
+    """edit 解析から離隔距離 LC を取り出す（解析できていなければ None）。"""
+    metrics = (analysis or {}).get("metrics") or {}
+    value = metrics.get("lc")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def auto_review_events(events: list[dict], config: PipelineConfig,
+                       tracking: dict[str, dict] | None = None,
+                       analyses: dict[str, dict] | None = None) -> list[dict]:
+    """LiDAR の追跡結果を突き合わせて候補の採用・除外を自動判定する。
+
+    動画だけでは誤検知と本物を切り分けられないが、点群まで通せば次を機械的に
+    落とせる。判定は ``review_status`` と、理由の ``review_reason`` に入れる。
+
+    * LiDAR で対応する車両が見つからない → 「除外」（誤検知か同期ずれ）
+    * 離隔距離 LC が ``config.max_lane_clearance`` を超える → 「除外」（隣車線の通過）
+    * 追跡の確信度が ``MIN_TRACK_CONFIDENCE`` 未満 → 「未確認」（人手で確認する）
+    * それ以外 → 「採用」
+
+    危険感(``danger_level``)は全自動実行では付けない（"0" のまま＝最終Excelでは空欄）。
+    ``events`` は ``web_gui.read_events_csv`` の返す行の一覧で、戻り値は
+    ``review_status`` を設定した同じ行の一覧。
+    """
+    tracking = tracking or {}
+    analyses = analyses or {}
+    for event in events:
+        event_id = str(event.get("event_id", ""))
+        track = tracking.get(event_id) or {}
+        event["danger_level"] = str(event.get("danger_level") or "0")
+        if not track.get("ok"):
+            event["review_status"] = "除外"
+            event["review_reason"] = track.get("reason") or "LiDARで対応する車両が見つかりません"
+            continue
+        # 実測の LC（edit 解析）を優先し、無ければ追跡時の目安値で判定する
+        lc = _analysis_lc(analyses.get(event_id))
+        if lc is None:
+            lc = track.get("lc_estimate")
+        limit = config.max_lane_clearance
+        if isinstance(lc, (int, float)) and lc > limit:
+            event["review_status"] = "除外"
+            event["review_reason"] = (
+                f"離隔距離 {lc:.2f}m が {limit}m を超えます（隣車線の通過）"
+            )
+            continue
+        confidence = float(track.get("confidence") or 0.0)
+        if confidence < MIN_TRACK_CONFIDENCE:
+            event["review_status"] = "未確認"
+            event["review_reason"] = f"追跡の確信度が低い（{confidence:.2f}）ため目視確認が必要です"
+            continue
+        event["review_status"] = "採用"
+        event["review_reason"] = ""
+    return events
+
+
+def run_review(config: PipelineConfig, events: list[dict], tracking: dict[str, dict],
+               analyses: dict[str, dict], offset: float,
+               report: PipelineReport) -> list[dict]:
+    reviewed = auto_review_events(events, config, tracking, analyses)
+    counts = {status: [e for e in reviewed if e.get("review_status") == status]
+              for status in ("採用", "未確認", "除外")}
+    path = save_reviewed_events(config.out_dir, reviewed, offset, allow_empty=True)
+    report.stage(
+        "review", "6.自動レビュー", "ok" if counts["採用"] else "warning",
+        f"候補 {len(reviewed)} 件のうち 採用 {len(counts['採用'])} / "
+        f"未確認 {len(counts['未確認'])} / 除外 {len(counts['除外'])} 件",
+        path=str(path), total=len(reviewed),
+        accepted=len(counts["採用"]), unreviewed=len(counts["未確認"]),
+        rejected=len(counts["除外"]),
+        reasons={str(e.get("event_id", "")): e.get("review_reason", "")
+                 for e in reviewed if e.get("review_status") != "採用"},
+    )
+    for event in counts["未確認"]:
+        report.manual(
+            f"候補 {event.get('event_id', '?')}: {event.get('review_reason', '')}"
+            "（クリップと点群を確認し、採用なら最終Excelへ追記してください）"
+        )
+    if not counts["採用"]:
+        report.warn("採用された候補がありません。時刻オフセットと検出結果を確認してください")
+    return counts["採用"]
 
 
 # ── 段階7: 最終Excel ──────────────────────────────────────────────────────────
@@ -825,9 +1306,15 @@ def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None) -> Pi
         offset = run_sync(config, pcap, report)
         report.info["時刻オフセット(秒)"] = offset
 
-        accepted = run_review(config, events_csv, offset, report)
-        run_autotrack(config, pcap, accepted, offset, report, tracker=tracker)
-        run_edit_csv(config, report)
+        events = read_events_csv(events_csv, {}, "")
+        if not events:
+            report.stage("review", "6.自動レビュー", "failed",
+                         f"{events_csv.name} に候補がありません")
+            raise PipelineError(f"追い越し候補がありません: {events_csv}")
+        # 自動レビューは点群の結果で判定するため、追跡・edit CSV の後に置く
+        tracking = run_autotrack(config, pcap, events, offset, report, tracker=tracker)
+        analyses = run_edit_csv(config, report)
+        run_review(config, events, tracking, analyses, offset, report)
         run_final_export(config, pcap, offset, report)
     except PipelineError as exc:
         report.stage("abort", "中断", "failed", str(exc))
@@ -864,8 +1351,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-gps", action="store_true", help="段階2のGPS抽出を行わない")
     parser.add_argument("--offset", type=float, default=None,
                         help="時刻オフセット(秒)を手動指定する（GPS自動同期の代わり）")
-    parser.add_argument("--track-margin", type=float, default=DEFAULT_TRACK_MARGIN,
-                        help=f"点群追跡の前後マージン秒（既定: {DEFAULT_TRACK_MARGIN}）")
+    parser.add_argument("--track-margin", type=float, default=None,
+                        help="点群追跡の前後マージン秒。省略時は撮影方向別の非対称マージン"
+                             f"（front {VIEW_TRACK_MARGINS['front']} / "
+                             f"rear {VIEW_TRACK_MARGINS['rear']} = 開始側/終了側）")
+    parser.add_argument("--max-lane-clearance", type=float, default=MAX_LANE_CLEARANCE,
+                        help="自動レビューで隣車線の通過として除外する離隔距離(m)"
+                             f"（既定: {MAX_LANE_CLEARANCE}）")
     return parser.parse_args(argv)
 
 

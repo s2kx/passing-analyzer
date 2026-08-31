@@ -24,6 +24,13 @@ LiDAR は自転車上で動いているため点群は相対座標であり、�
 
 ``--list-tracks`` で全トラックの軌跡と却下理由を、``--ascii <frame>`` でそのフレームの
 上面図を表示できる（いずれも動作確認用）。
+
+追い越しイベントが連続する車列では、1 つの追跡窓に複数の車が入る。呼び出し側が
+``expected_pass_time``（そのイベントで車が横に並ぶはずの時刻）と
+``exclude_track_keys``（他のイベントへ割り当て済みの車）を渡すと、スコア最大では
+なく「期待時刻に最も近い、まだ使われていない車」を選ぶ。戻り値の ``candidates``
+には必須条件を満たした全トラックの要約が入るので、呼び出し側で 1 対 1 の割り当てを
+組める。
 """
 
 from __future__ import annotations
@@ -88,6 +95,11 @@ MAX_BOX_GROWTH = 2.0
 
 # 静止物の見かけ速度がこの値を超えたら、その向きから前進方向の符号を決める。
 EGO_SPEED_FOR_SIGN = 0.7
+
+# track_key の照合許容。追跡窓が違うと同じ車でも通過フレーム・横位置が僅かにぶれる。
+# VLP-16 は約 10Hz なので 3 フレーム = 約 0.3 秒。
+TRACK_KEY_FRAME_TOLERANCE = 3
+TRACK_KEY_LATERAL_TOLERANCE = 1.0
 
 
 def _as_xyz(points) -> np.ndarray:
@@ -462,6 +474,25 @@ class TrackSummary:
     entered_zone: bool
     passed_zone: bool
     points: int
+    # 通過区間（|Y| < 3m）へ入った時刻とフレーム番号。下流のフェーズ3と同じ定義なので、
+    # 動画イベントの期待通過時刻との照合にそのまま使える。区間へ入っていなければ None。
+    pass_time: float | None = None
+    pass_frame: int | None = None
+    # 通過区間にいる間の最小 |X|（離隔距離 LC の目安、m）。隣車線の車を弾くのに使う。
+    lateral_min: float = float("inf")
+
+    @property
+    def track_key(self) -> str:
+        """同一車両を指す識別子。
+
+        イベントごとに追跡窓が違うため、窓で切られる開始フレームでは同じ車が別の
+        キーになってしまう。窓に依存しない「通過区間へ入った絶対フレーム番号」と
+        横位置から決めることで、窓が違っても同じ車は同じキーになる。窓の端で
+        僅かにぶれても同じ車と分かるよう、照合は ``track_key_matches`` で行う。
+        """
+        if self.pass_frame is None:
+            return f"t{self.track.first_frame}x{self.median_x:+.1f}"
+        return f"f{self.pass_frame}x{self.median_x:+.1f}"
 
 
 def _fit_speed(times: np.ndarray, values: np.ndarray) -> float:
@@ -492,6 +523,19 @@ def summarize_track(track: Track) -> TrackSummary:
     inside = gap < PASS_ZONE
     entered = bool(inside.any())
     passed = bool(entered and np.any(gap[int(np.argmax(inside)) + 1:] >= PASS_ZONE))
+    # 通過時刻は「最初に |Y| < 3m へ入った」時刻。edit_csv のフェーズ3と同じ定義。
+    pass_time = pass_frame = None
+    lateral_min = float("inf")
+    if entered:
+        first = int(np.argmax(inside))
+        pass_time = float(times[first])
+        pass_frame = int(track.clusters[first].frame)
+        # 通過区間にいる間の最小 |X|。矩形が原点を跨ぐフレームは 0 とみなす。
+        in_zone = [c for c, near in zip(track.clusters, inside) if near]
+        lateral_min = min(
+            0.0 if c.min_x <= 0 <= c.max_x else min(abs(c.min_x), abs(c.max_x))
+            for c in in_zone
+        )
     return TrackSummary(
         track=track, frames=len(track.clusters), span=track.frame_span,
         speed_x=_fit_speed(times, xs), speed_y=_fit_speed(times, ys),
@@ -502,6 +546,7 @@ def summarize_track(track: Track) -> TrackSummary:
         monotonic=monotonic, continuity=len(track.clusters) / max(1, track.frame_span),
         entered_zone=entered, passed_zone=passed,
         points=int(sum(c.count for c in track.clusters)),
+        pass_time=pass_time, pass_frame=pass_frame, lateral_min=lateral_min,
     )
 
 
@@ -595,10 +640,76 @@ def score_track(summary: TrackSummary, forward: int, ego_speed_y: float,
     return float(min(1.0, max(0.0, score))), []
 
 
-def select_overtaking(tracks: list[Track], side: str = "right") -> dict:
+def candidate_summary(summary: TrackSummary, score: float) -> dict:
+    """呼び出し側の割り当て・診断用に、トラック 1 本の要約を辞書で返す。"""
+    return {
+        "track_key": summary.track_key,
+        "pass_time": summary.pass_time,
+        "score": round(float(score), 3),
+        "median_x": round(float(summary.median_x), 3),
+        "lc_estimate": (None if summary.lateral_min == float("inf")
+                        else round(float(summary.lateral_min), 3)),
+    }
+
+
+def _parse_track_key(key: str) -> tuple[str, int, float] | None:
+    """``track_key`` を ``(種別, フレーム番号, 横位置)`` に分解する。"""
+    text = str(key)
+    if not text or text[0] not in "ft" or "x" not in text:
+        return None
+    head, _, tail = text[1:].partition("x")
+    try:
+        return text[0], int(head), float(tail)
+    except ValueError:
+        return None
+
+
+def track_key_matches(key: str, other: str,
+                      frame_tolerance: int = TRACK_KEY_FRAME_TOLERANCE,
+                      lateral_tolerance: float = TRACK_KEY_LATERAL_TOLERANCE) -> bool:
+    """2 つの ``track_key`` が同じ車を指すかを判定する。
+
+    追跡窓が違うと、同じ車でも通過区間へ入ったと判定されるフレームや横位置の
+    中央値が僅かにぶれる。完全一致だけで比べると同じ車を別物と扱ってしまうため、
+    フレーム・横位置の近さで照合する。
+    """
+    if key == other:
+        return True
+    left, right = _parse_track_key(key), _parse_track_key(other)
+    if left is None or right is None or left[0] != right[0]:
+        return False
+    return (abs(left[1] - right[1]) <= frame_tolerance
+            and abs(left[2] - right[2]) <= lateral_tolerance)
+
+
+def rank_candidates(scored: list[tuple[float, TrackSummary]],
+                    expected_pass_time: float | None = None) -> list[tuple[float, TrackSummary]]:
+    """採用順にトラックを並べ替える。
+
+    ``expected_pass_time`` を指定しない場合はスコアの大きい順。指定した場合は
+    「通過時刻が期待時刻に近い順」で、同じ近さならスコアの大きい順にする。車列で
+    複数の車が 1 つの窓に入るとき、スコア最大の車が必ずしもそのイベントの車とは
+    限らないため、期待時刻を優先する。
+    """
+    if expected_pass_time is None:
+        return sorted(scored, key=lambda item: -item[0])
+    return sorted(scored, key=lambda item: (
+        abs((item[1].pass_time if item[1].pass_time is not None else 0.0) - expected_pass_time),
+        -item[0],
+    ))
+
+
+def select_overtaking(tracks: list[Track], side: str = "right",
+                      expected_pass_time: float | None = None,
+                      exclude_track_keys=None) -> dict:
     """トラック群から追い越し車両を 1 本選ぶ。
 
+    ``expected_pass_time``（pcap 相対秒）を渡すと、必須条件を満たすトラックのうち
+    通過時刻がその時刻に最も近いものを選ぶ。``exclude_track_keys`` に他イベントへ
+    割り当て済みのキーを渡すと、それを除いた次点を選ぶ（車列の2台目を拾うため）。
+
     戻り値は ``{"summary", "score", "forward", "ego_speed_y", "candidates", "warnings"}``。
+    ``candidates`` は必須条件を満たした全トラックの要約（除外したものも含む）。
     候補が無ければ ``summary`` は ``None``。
     """
     summaries = [summarize_track(t) for t in tracks if t.clusters]
@@ -611,19 +722,40 @@ def select_overtaking(tracks: list[Track], side: str = "right") -> dict:
         score, _reasons = score_track(summary, forward, ego, side)
         if score > 0.0:
             scored.append((score, summary))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    if not scored:
-        return {"summary": None, "score": 0.0, "forward": forward, "ego_speed_y": ego,
-                "candidates": [], "warnings": warnings}
-    if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.05:
-        warnings.append(f"追い越し車らしい候補が{len(scored)}件あり、評価値が接近しています")
-    best_score, best = scored[0]
+    ranked = rank_candidates(scored, expected_pass_time)
+    candidates = [candidate_summary(summary, score) for score, summary in ranked]
+    empty = {"summary": None, "score": 0.0, "forward": forward, "ego_speed_y": ego,
+             "candidates": candidates, "warnings": warnings}
+    if not ranked:
+        return empty
+
+    excluded = [str(key) for key in (exclude_track_keys or ())]
+    available = [item for item in ranked
+                 if not any(track_key_matches(item[1].track_key, key) for key in excluded)]
+    if not available:
+        warnings.append(
+            f"追い越し車らしい候補{len(ranked)}件はすべて他のイベントへ割り当て済みです"
+        )
+        return empty
+
+    if expected_pass_time is None:
+        if len(available) > 1 and available[0][0] - available[1][0] < 0.05:
+            warnings.append(f"追い越し車らしい候補が{len(available)}件あり、評価値が接近しています")
+    else:
+        rival = [item for item in available[1:]
+                 if abs((item[1].pass_time or 0.0) - expected_pass_time)
+                 - abs((available[0][1].pass_time or 0.0) - expected_pass_time) < 1.0]
+        if rival:
+            warnings.append(
+                f"期待通過時刻 {expected_pass_time:.1f}s の近くに候補が{len(rival) + 1}件あります"
+            )
+    best_score, best = available[0]
     if best.median_x * _side_sign(side) <= 0:
         warnings.append("選択した車両の X 符号が side 指定と一致しません（座標系の向きに注意）")
     if not best.passed_zone:
         warnings.append("通過区間（|Y| < 3m）を抜けるまで追えていません（フェーズ4が求まらない可能性）")
     return {"summary": best, "score": best_score, "forward": forward, "ego_speed_y": ego,
-            "candidates": scored, "warnings": warnings}
+            "candidates": candidates, "warnings": warnings}
 
 
 # --- 5. 矩形生成 --------------------------------------------------------------
@@ -715,42 +847,64 @@ def scan_frames(pcap, first: int, last: int) -> dict:
 
 
 # --- 6. 公開 API --------------------------------------------------------------
-def track_overtaking(pcap, first_frame: int, last_frame: int, side: str = "right") -> dict:
+def _failed(warnings: list[str], candidates: list[dict] | None = None) -> dict:
+    """追跡できなかったときの戻り値。キーの構成は成功時と同じにそろえる。"""
+    return {"ok": False, "frames": [], "confidence": 0.0, "warnings": warnings,
+            "pass_time": None, "track_key": None, "candidates": candidates or []}
+
+
+def track_overtaking(pcap, first_frame: int, last_frame: int, side: str = "right",
+                     expected_pass_time: float | None = None,
+                     exclude_track_keys=None) -> dict:
     """PCAP のフレーム区間から追い越し車両を追跡し、フレーム別矩形を返す。
 
     ``pcap`` は ``VelodynePcap`` インスタンス。戻り値は次の形式で、``frames`` は
     ``VelodynePcap.export_overtaking`` にそのまま渡せる。
 
         {"ok": bool, "frames": [{"index": int, "bounds": {...}}],
-         "confidence": float, "warnings": [str]}
+         "confidence": float, "warnings": [str],
+         "pass_time": float | None, "track_key": str | None,
+         "candidates": [{"track_key", "pass_time", "score", "median_x", "lc_estimate"}]}
+
+    ``expected_pass_time``（pcap 相対秒）を渡すと、必須条件を満たすトラックのうち
+    通過時刻（``|Y| < 3m`` を横断する時刻）がその時刻に最も近いものを選ぶ。省略時は
+    従来どおりスコア最大のトラックを選ぶ。``exclude_track_keys`` に他イベントへ
+    割り当て済みの ``track_key`` を渡すと、それを除いた次点を選ぶ。
+
+    ``candidates`` には必須条件を満たした全トラックの要約が採用順に入る（除外した
+    ものも含む）。呼び出し側はこれを使ってイベントと車両の 1 対 1 割り当てを組める。
 
     追い越し車両が見つからない場合は ``ok=False``、``frames=[]`` を返す。
     """
     warnings: list[str] = []
     total = len(getattr(pcap, "frames", []) or [])
     if total == 0:
-        return {"ok": False, "frames": [], "confidence": 0.0, "warnings": ["LiDARフレームがありません"]}
+        return _failed(["LiDARフレームがありません"])
     first = max(0, min(int(first_frame), int(last_frame)))
     last = min(total - 1, max(int(first_frame), int(last_frame)))
     if last <= first:
-        return {"ok": False, "frames": [], "confidence": 0.0, "warnings": ["フレーム区間が不正です"]}
+        return _failed(["フレーム区間が不正です"])
 
     scan = scan_frames(pcap, first, last)
     warnings.extend(scan["warnings"])
-    result = select_overtaking(scan["tracks"], side=side)
+    result = select_overtaking(scan["tracks"], side=side,
+                               expected_pass_time=expected_pass_time,
+                               exclude_track_keys=exclude_track_keys)
     warnings.extend(result["warnings"])
+    candidates = result["candidates"]
     summary = result["summary"]
     if summary is None:
         warnings.append("追い越し車両らしいトラックが見つかりませんでした")
-        return {"ok": False, "frames": [], "confidence": 0.0, "warnings": warnings}
+        return _failed(warnings, candidates)
     frames = track_to_frames(summary.track, first_frame=first, last_frame=last)
     if not frames:
         warnings.append("矩形を生成できませんでした")
-        return {"ok": False, "frames": [], "confidence": 0.0, "warnings": warnings}
+        return _failed(warnings, candidates)
     if len(frames) < MIN_TRACK_FRAMES:
         warnings.append("追跡できたフレーム数が少なく、結果が不安定な可能性があります")
     return {"ok": True, "frames": frames, "confidence": round(float(result["score"]), 3),
-            "warnings": warnings}
+            "warnings": warnings, "pass_time": summary.pass_time,
+            "track_key": summary.track_key, "candidates": candidates}
 
 
 # --- コマンドライン -----------------------------------------------------------
@@ -807,6 +961,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--side", default="right", choices=("right", "left"), help="追い越し側")
     parser.add_argument("--dump-csv", default="", help="生成した矩形列のCSV出力先")
     parser.add_argument("--list-tracks", action="store_true", help="全トラックの軌跡概要を表示する")
+    parser.add_argument("--expected-pass-time", type=float, default=None, metavar="SEC",
+                        help="期待通過時刻(pcap相対秒)。最も近い通過時刻のトラックを選ぶ")
+    parser.add_argument("--exclude-track", action="append", default=[], metavar="KEY",
+                        help="割り当て済みの track_key を除外する（複数指定可）")
     parser.add_argument("--ascii", type=int, default=None, metavar="FRAME",
                         help="指定フレームの上面図をASCIIで表示する（地面除去の確認用）")
     args = parser.parse_args(argv)
@@ -820,7 +978,9 @@ def main(argv: list[str] | None = None) -> int:
     first = max(0, min(args.first, args.last))
     last = min(len(pcap.frames) - 1, max(args.first, args.last))
     scan = scan_frames(pcap, first, last)
-    selection = select_overtaking(scan["tracks"], side=args.side)
+    selection = select_overtaking(scan["tracks"], side=args.side,
+                                  expected_pass_time=args.expected_pass_time,
+                                  exclude_track_keys=args.exclude_track)
     ground = scan["ground_z"]
     print(f"走査: フレーム{first}-{last} {scan['frames']}枚 {scan['elapsed']:.1f}秒 "
           f"({scan['elapsed'] / max(1, scan['frames']) * 1000:.0f}ms/フレーム) "
@@ -842,6 +1002,14 @@ def main(argv: list[str] | None = None) -> int:
         for _score, line in sorted(rows, key=lambda item: -item[0])[:25]:
             print("  " + line)
 
+    if selection["candidates"]:
+        print(f"候補: {len(selection['candidates'])}本（採用順）")
+        for candidate in selection["candidates"][:10]:
+            pass_time = candidate["pass_time"]
+            print(f"  {candidate['track_key']:>14} 通過 "
+                  f"{'不明' if pass_time is None else f'{pass_time:8.2f}s'} "
+                  f"score {candidate['score']:.3f} LC目安 {candidate['lc_estimate']}")
+
     warnings = list(scan["warnings"]) + list(selection["warnings"])
     summary = selection["summary"]
     if summary is None:
@@ -856,9 +1024,12 @@ def main(argv: list[str] | None = None) -> int:
         print("矩形を生成できませんでした")
         return 1
     result = {"ok": True, "frames": frames,
-              "confidence": round(float(selection["score"]), 3), "warnings": warnings}
+              "confidence": round(float(selection["score"]), 3), "warnings": warnings,
+              "pass_time": summary.pass_time, "track_key": summary.track_key}
     print(f"検出: {len(frames)}フレーム (フレーム{frames[0]['index']}-{frames[-1]['index']}) "
-          f"confidence {result['confidence']:.3f}")
+          f"confidence {result['confidence']:.3f} "
+          f"track {summary.track_key} 通過 "
+          f"{'不明' if summary.pass_time is None else f'{summary.pass_time:.2f}s'}")
     for warning in result["warnings"]:
         print("  警告: " + warning)
     if args.dump_csv:
