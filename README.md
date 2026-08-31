@@ -252,6 +252,22 @@ GUIのStep1〜6を人が順に操作する代わりに使う。
 `reviewed_overtaking_events.csv` には除外以外(採用・未確認)を出力し、最終Excelには
 採用だけが並ぶ。
 
+### 車種の決め直し
+
+自動レビューの直前に、車を割り当てられた行の車種を**点群で測った車体寸法**で決め直す
+(`run_pipeline.lidar_vehicle_class`)。動画側の判定(YOLOのクラス投票と黄色ナンバー検出)は
+ミニバンを`truck`と呼ぶ・トラック後部の黄色い標示を軽のナンバーと見る、の2方向へ外れる。
+
+| 条件 | 車種 |
+|------|------|
+| 車体長 × 車高 >= 9.0 m² (側面のシルエット面積) | 大型 |
+| 2.50m <= 車体長 <= 3.50m かつ 1.20m <= 車幅 <= 1.80m | 軽 (軽自動車規格 3.40×1.48m) |
+| それ以外 | 普通 |
+
+寸法が測れていない行(追跡失敗・旧プラグイン)、人がレビューで直した行
+(`class_reviewed`)、LiDAR発の`L###`行(車種は空欄)は書き換えない。
+しきい値の根拠と過学習の確認は `docs/計算方法.md` の 3.1 にある。
+
 ### 点群自動追跡プラグイン
 
 段階4は `lidar_autotrack` モジュールを任意の依存として読み込む。モジュールが無い場合は
@@ -278,10 +294,14 @@ def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
         "warnings": [str],
         "pass_time": float | None,   # 選んだトラックが |Y|<3m を横断した時刻
         "track_key": str | None,     # 同一車両を指す識別子
-        "candidates": [{"track_key", "pass_time", "score", "median_x", "lc_estimate"}],
+        "candidates": [{"track_key", "pass_time", "score", "median_x", "lc_estimate",
+                        "length", "width", "height", "near_length", "points"}],
     }
     """
 ```
+
+`candidates` の `length` / `width` / `height` は点群で測った車体寸法(m)で、
+呼び出し側の車種判定に使う(下記「車種の決め直し」)。
 
 後ろ3つのキーと引数2つは任意。受け取らない古いプラグインでも動くよう、呼び出し側は
 署名を見て渡すかどうかを決める。通過側は日本では常に右(+X)なので、候補CSVの `side` 列
