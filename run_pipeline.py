@@ -22,6 +22,7 @@ GUI(`web_gui.py`)で人が Step1〜6 を順に操作していた作業を、1コ
     5. edit CSV    最近接点軌跡と解析Excel → out/lidar_edit/
     6. 自動レビュー LiDARの結果で採否を判定 → out/reviewed_overtaking_events.csv
     7. 最終Excel   out/final/<出力フォルダ名>_final.xlsx
+    7b. 閲覧用レポート クリップと点群を見る out/report.html（--no-report で省略）
     8. レポート    out/pipeline_report.json / out/pipeline_report.txt
 
 自動レビューは点群追跡と edit CSV の結果を使って判定するため、追跡より後に置く。
@@ -34,6 +35,11 @@ LiDAR には追い越し車が居るのに動画側の候補が無い（車列�
 取りこぼし）場合は、``L001`` … の候補IDで点群CSVまで書き出し、レビューCSVへ
 ``review_status="未確認"`` の行として起票する。最終Excelは採用行だけなので、
 人が確認して採用に変えるまでは出力に混ざらない。``--no-lidar-extra`` で無効化できる。
+
+段階7b は結果の閲覧用に ``out/report.html`` を作る（``make_report.py``）。イベント
+ごとに動画クリップ（``clips/`` への相対参照）と切り抜いた点群のビューア（上面図・
+側面図のフレーム送り）が並ぶ1枚のHTMLで、ダブルクリックで開ける。既存の出力から
+``python make_report.py --out <出力先>`` で作り直せる。``--no-report`` で省略。
 """
 
 from __future__ import annotations
@@ -65,6 +71,7 @@ from edit_csv import (
 )
 from final_export import generate_final_workbook
 from lidar_pcap import VelodynePcap
+from make_report import ReportError, generate_report
 from web_gui import (
     detection_python,
     move_edit_csv_to_dir,
@@ -203,6 +210,8 @@ class PipelineConfig:
     sync_check: bool = True
     # 検証で「信頼できる推定値が現行値と3秒超ずれる」ときに推定値へ差し替えるか。
     auto_offset: bool = False
+    # 段階7b で閲覧用HTMLレポート（report.html）を作るか。
+    report_html: bool = True
 
     def track_margins(self) -> tuple[float, float]:
         """追跡窓の (開始側, 終了側) マージン秒を返す。
@@ -350,6 +359,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         lidar_extra=bool(getattr(args, "lidar_extra", True)),
         sync_check=bool(getattr(args, "sync_check", True)),
         auto_offset=bool(getattr(args, "auto_offset", False)),
+        report_html=bool(getattr(args, "report_html", True)),
     )
 
 
@@ -1870,6 +1880,53 @@ def run_final_export(config: PipelineConfig, pcap: VelodynePcap, offset: float,
     return result
 
 
+# ── 段階7b: 閲覧用HTMLレポート ────────────────────────────────────────────────
+
+def run_report_html(config: PipelineConfig, report: PipelineReport) -> dict:
+    """``out/report.html``（動画クリップ + 点群ビューア）を作る。
+
+    ここまでの成果物（レビューCSV・clips・lidar・lidar_edit）だけを読むので、
+    後から ``python make_report.py --out <出力先>`` で作り直すこともできる。
+    クリップが残っていない場合は動画欄が「クリップなし」になるだけで、
+    点群ビューだけのレポートとして成立する。
+    """
+    if not config.report_html:
+        report.stage("report_html", "7b.閲覧用レポート", "skipped",
+                     "--no-report が指定されました")
+        return {}
+    # 段階8（pipeline_report.json の保存）はこの後なので、実行中の値を直接渡す。
+    session_info = {
+        "session": config.session_dir.name,
+        "subject_id": config.subject_id,
+        "collection_date": config.collection_date,
+        "view": config.view or DEFAULT_VIEW,
+        "started_at": datetime.fromtimestamp(report.started_at).isoformat(timespec="seconds"),
+    }
+    try:
+        result = generate_report(config.out_dir, session_info=session_info)
+    except ReportError as exc:
+        report.stage("report_html", "7b.閲覧用レポート", "failed", str(exc))
+        report.warn(f"閲覧用レポートを生成できません: {exc}")
+        return {}
+    except Exception as exc:  # noqa: BLE001 - レポート生成の失敗で実行結果を失わない
+        report.stage("report_html", "7b.閲覧用レポート", "failed", f"予期しないエラー: {exc}")
+        report.warn(f"閲覧用レポートを生成できません: {exc}")
+        return {}
+    status = "ok" if result["clips"] else "warning"
+    message = (
+        f"{Path(result['path']).name} に {result['events']} 件"
+        f"（採用 {result['accepted']} / 未確認 {result['unreviewed']}）を出力しました。"
+        f"クリップ {result['clips']} 件 / 点群 {result['data_files']} 件"
+    )
+    if not result["clips"]:
+        message += "（clips/ が無いため動画は「クリップなし」表示）"
+    report.stage("report_html", "7b.閲覧用レポート", status, message, **result)
+    report.info["閲覧用レポート"] = result["path"]
+    print(f"[report] {result['path']} をブラウザで開くとクリップと点群を確認できます",
+          flush=True)
+    return result
+
+
 # ── パイプライン本体 ──────────────────────────────────────────────────────────
 
 def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None,
@@ -1904,6 +1961,7 @@ def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None,
         # LiDAR発の「未確認」行は候補行の後ろへ足す（列は候補行から作るため順序が重要）
         run_review(config, events + extra_events, tracking, analyses, offset, report)
         run_final_export(config, pcap, offset, report)
+        run_report_html(config, report)
     except PipelineError as exc:
         report.stage("abort", "中断", "failed", str(exc))
         report.warn(str(exc))
@@ -1957,6 +2015,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=True,
                         help="動画側に候補の無い車をレビューCSVへ「未確認」で"
                              "起票しない（既定は起票する）")
+    parser.add_argument("--no-report", dest="report_html", action="store_false",
+                        default=True,
+                        help="段階7bの閲覧用HTMLレポート（report.html）を作らない"
+                             "（既定は作る）")
     return parser.parse_args(argv)
 
 

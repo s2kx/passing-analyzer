@@ -1146,6 +1146,58 @@ def test_view_auto_detection_is_skipped_with_skip_detect():
         print("  OK: --skip-detect 時は自動判定を行わない")
 
 
+def test_report_html_is_generated_after_the_final_workbook():
+    """段階7bで report.html と点群の js を作り、パスをレポートへ残す。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, "001,普通,car,right,0.5,2.5,4.5,4.0,0.1,0,GX010001.MP4,0.5,4.5\n")
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        data = execute_pipeline(config, tracker=dummy_tracker()).to_dict()
+        stages = {stage["name"]: stage for stage in data["stages"]}
+
+        # 段階7（最終Excel）の後、段階8（レポート）の前に置く
+        names = [stage["name"] for stage in data["stages"]]
+        assert names.index("final") < names.index("report_html") < names.index("report"), names
+        # クリップは合成セッションに無いので warning（動画欄は「クリップなし」）
+        assert stages["report_html"]["status"] == "warning", stages["report_html"]
+        assert stages["report_html"]["events"] == 1, stages["report_html"]
+
+        html_path = out_dir / "report.html"
+        assert html_path.is_file(), html_path
+        assert stages["report_html"]["path"] == str(html_path), stages["report_html"]
+        assert data["info"]["閲覧用レポート"] == str(html_path), data["info"]
+        html = html_path.read_text(encoding="utf-8")
+        assert 'data-id="001"' in html and "クリップなし" in html, html[:400]
+        # 段階8（pipeline_report.json の保存）より前に走るので、ヘッダの情報は
+        # 実行中の config から渡す（前回実行分の json を読ませない）
+        header = html[:html.index("</header>")]
+        assert "セッション: ID1" in header and "被験者: ID1" in header, header
+        assert "撮影方向: front" in header and "解析実行: 20" in header, header
+        assert "http://" not in html and "https://" not in html, "外部CDNを参照している"
+        js_path = out_dir / "report_data" / "event_001.js"
+        assert js_path.is_file(), js_path
+        assert js_path.read_text(encoding="utf-8").startswith("window.__EVT="), js_path
+        print("  OK: 段階7bで閲覧用HTMLレポートを生成")
+
+
+def test_no_report_option_skips_the_html():
+    """--no-report で段階7bを省く。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, "001,普通,car,right,0.5,2.5,4.5,4.0,0.1,0,GX010001.MP4,0.5,4.5\n")
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--no-report"]))
+        assert config.report_html is False, config
+        data = execute_pipeline(config, tracker=dummy_tracker()).to_dict()
+        stages = {stage["name"]: stage for stage in data["stages"]}
+        assert stages["report_html"]["status"] == "skipped", stages["report_html"]
+        assert not (out_dir / "report.html").exists()
+        assert stages["final"]["status"] == "ok", stages
+        print("  OK: --no-report で閲覧用レポートを省略する")
+
+
 def report_text(session: Path) -> str:
     return (session / "out_auto" / "pipeline_report.txt").read_text(encoding="utf-8")
 
