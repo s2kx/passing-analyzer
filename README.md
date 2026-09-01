@@ -44,6 +44,29 @@ PC上へ自動作成する。利用者が実行するファイルは `起動.bat
 GitHub から取得した作業フォルダでは、起動時に更新確認も行う。ローカル変更が無い場合だけ
 `git pull --ff-only` で自動更新し、作業中の変更がある場合は自動更新をスキップする。
 
+### 別のPCへ持ち運ぶとき（外付けSSD運用）
+
+このフォルダは外付けSSDに置いて複数のPCで使うことを想定している。実行環境は
+`portable\python`（embeddable Python）に一本化してあり、`python313._pth` が相対パスしか
+見ないので、**別のPCに挿してもドライブレターが変わっても動く**。
+
+- **`.venv` は使わない**。venv は作成時のPython本体の絶対パスを `pyvenv.cfg` の `home =` へ
+  焼き込むため、そのPythonが無いPCでは必ず壊れる。コマンドは
+  `portable\python\python.exe` で実行する。
+- pip も `Scripts\pip.exe` ではなく `portable\python\python.exe -m pip` を使う。
+  `Scripts\*.exe` は作成時の絶対パスを埋め込んでいるので、フォルダを移すと動かない。
+- 新しいPCでは最初に `起動.bat --check` を実行し、Python・CUDAが見えるか確認する。
+  NVIDIA GPUが無いPCでもCPUで動く（検出は大幅に遅くなる）。
+- git が `dubious ownership` を出したら、そのPCで一度だけ次を実行する。
+
+```powershell
+git config --global --add safe.directory "E:/松本研究室/programming/LiDAR解析ソフト"
+```
+
+PC依存の値（GUIの前回設定 `gui_settings.json`、`portable\python`、解析出力）はすべて
+`.gitignore` 済みなので、SSDを挿し替えても衝突しない。`起動.bat` と `全自動実行.bat` は
+自分の場所（`%~dp0`）を基準に動くので、置き場所を変えても書き換え不要。
+
 ## 使い方
 
 ```powershell
@@ -120,9 +143,9 @@ GUIを開かず起動環境だけ確認する場合:
 GUIのStep1〜6を人が順に操作する代わりに使う。
 
 ```powershell
-.venv\Scripts\python.exe run_pipeline.py E:\データ\260701\ID1
-.venv\Scripts\python.exe run_pipeline.py E:\データ\260701\ID1 --view rear --organize-id 1
-.venv\Scripts\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect   # 検出済みの続きから
+portable\python\python.exe run_pipeline.py E:\データ\260701\ID1
+portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --view rear --organize-id 1
+portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect   # 検出済みの続きから
 ```
 
 ### 実行ファイル (全自動実行.bat)
@@ -378,9 +401,9 @@ def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
 (明示指定が常に優先)。単体でも使える:
 
 ```powershell
-.venv\Scripts\python.exe detect_view.py E:\データ\260701\ID1\GOPRO\GX010731.MP4
-.venv\Scripts\python.exe detect_view.py <動画...> --json          # 結果をJSONで出す
-.venv\Scripts\python.exe detect_view.py <動画...> --with-detection # 検出件数も参考表示
+portable\python\python.exe detect_view.py E:\データ\260701\ID1\GOPRO\GX010731.MP4
+portable\python\python.exe detect_view.py <動画...> --json          # 結果をJSONで出す
+portable\python\python.exe detect_view.py <動画...> --with-detection # 検出件数も参考表示
 ```
 
 **原理: 背景オプティカルフローの放射方向**。自転車が前進しているとき、
@@ -429,7 +452,7 @@ def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
 通過区間 |Y|<3m の帯・離隔距離LCの位置・フェーズ1〜4の点を補助線で表示）が並ぶ。
 ヘッダにはセッション名・実行日時・採用/未確認の件数、カードには離隔距離LC・通過時間・相対速度・
 TTC・車種・レビュー理由が出る。既存の出力フォルダからは
-`.venv\Scripts\python.exe make_report.py --out output\ID1` でいつでも作り直せる
+`portable\python\python.exe make_report.py --out output\ID1` でいつでも作り直せる
 （`--max-points-per-frame` / `--max-points-total` で点群の間引き量を変えられる）。
 **ダブルクリックで開ける file:// 前提**なので外部CDNもネット接続も使わず、点群だけは
 `report_data\event_NNN.js`（`window.__EVT["001"]=...` の代入文）に分けてカードを開いたときに
