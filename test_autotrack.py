@@ -5,7 +5,7 @@
 PCAP を使わず、numpy で合成した点群（地面平面 + 静止障害物 + 通過車両）で
 地面除去・クラスタリング・トラッキング・同定・矩形生成を検証する。
 
-    .venv\\Scripts\\python.exe test_autotrack.py
+    portable\\python\\python.exe test_autotrack.py
 """
 
 import numpy as np

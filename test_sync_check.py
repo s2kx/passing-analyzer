@@ -5,7 +5,7 @@
 実データを使わず、合成した点群と合成した速度プロファイルで
 「自車速度の推定」→「相互相関でのオフセット推定」の全経路を検証する。
 
-    .venv\\Scripts\\python.exe test_sync_check.py
+    portable\\python\\python.exe test_sync_check.py
 """
 
 import math

@@ -7,9 +7,9 @@ report.html と report_data/event_*.js の生成を検証する。実データ�
 ``output/ID1``）が見つかる環境では、その reviewed CSV と点群CSV を一時フォルダへ
 写して読み込めることも確かめる（**実データのフォルダには一切書き込まない**）。
 
-    .venv\\Scripts\\python.exe test_make_report.py
+    portable\\python\\python.exe test_make_report.py
 
-実データの場所は自動で探す（このファイルから上のフォルダの ``output/ID1``）。
+実データの場所は自動で探す（このファイルから上のフォルダの ``output`` 配下）。
 別のフォルダを使うときは環境変数 ``REPORT_REAL_OUT`` に出力フォルダを指定する。
 """
 from __future__ import annotations
@@ -424,18 +424,27 @@ def test_cli_regenerates_the_report():
         print("  OK: 単体CLIで既存出力から再生成できる")
 
 
-# ── 実データ（メイン側の output/ID1 を読むだけ。書き込みは一時フォルダへ）──────
+# ── 実データ（output/ 配下の実行結果を読むだけ。書き込みは一時フォルダへ）──────
 
 def real_output_dir() -> Path | None:
+    """読み取りに使える実データの出力フォルダを1つ返す（無ければ ``None``）。
+
+    セッションごとに `output/<名前>` や `output/<まとめ>/<名前>` へ出すので、
+    特定のIDを決め打ちせず `output` の下から reviewed CSV のあるフォルダを探す。
+    候補が複数あるときは名前順で最初のものを使う（どれでも読めれば十分）。
+    """
     value = os.environ.get("REPORT_REAL_OUT", "")
     if value:
         path = Path(value)
         return path if path.is_dir() else None
     here = Path(__file__).resolve().parent
     for base in [here, *here.parents]:
-        candidate = base / "output" / "ID1"
-        if (candidate / "reviewed_overtaking_events.csv").is_file():
-            return candidate
+        root = base / "output"
+        if not root.is_dir():
+            continue
+        found = sorted(root.glob("*/reviewed_overtaking_events.csv"))             + sorted(root.glob("*/*/reviewed_overtaking_events.csv"))
+        if found:
+            return found[0].parent
     return None
 
 
@@ -446,7 +455,8 @@ def test_real_output_folder_is_readable():
     """
     source = real_output_dir()
     if source is None:
-        print("  SKIP: 実データの output/ID1 が見つからないので省略")
+        print("  SKIP: 実データの出力フォルダ（output/**/reviewed_overtaking_events.csv）が"
+              "見つからないので省略")
         return
     with tempfile.TemporaryDirectory() as temp_value:
         out_dir = Path(temp_value) / "real"

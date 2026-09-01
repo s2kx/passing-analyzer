@@ -6,7 +6,7 @@
 フロー計算そのものは合成動画(拡大／縮小するテクスチャ)で検証する。
 `detect_overtaking.py` のサブプロセスもスタブ化する。
 
-    .venv\\Scripts\\python.exe test_detect_view.py
+    portable\\python\\python.exe test_detect_view.py
 """
 from __future__ import annotations
 

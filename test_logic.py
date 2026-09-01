@@ -11,7 +11,7 @@ YOLO や動画を使わず、合成した track 軌跡・合成した最近接�
   4) 追い越し方向へ移動 (front=中央へ左流れ / rear=左端へ左流れ)
   5) 逆向きに横切る車は除外 (front=左端で消える / rear=右端から現れる)
 
-    .venv\\Scripts\\python.exe test_logic.py
+    portable\\python\\python.exe test_logic.py
 """
 import math
 from argparse import Namespace

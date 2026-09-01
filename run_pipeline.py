@@ -250,7 +250,8 @@ class PipelineConfig:
     # 段階3.5 の時刻同期の自己検証を行うか。
     sync_check: bool = True
     # 検証で「信頼できる推定値が現行値と3秒超ずれる」ときに推定値へ差し替えるか。
-    auto_offset: bool = False
+    # 段階3のGPMFベースの値はLiDAR収録PCの時計ずれを見られないため、既定で差し替える。
+    auto_offset: bool = True
     # 段階7b で閲覧用HTMLレポート（report.html）を作るか。
     report_html: bool = True
 
@@ -404,7 +405,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         turn_yaw_rate=float(getattr(args, "turn_yaw_rate", EGO_TURN_YAW_RATE)),
         lidar_extra=bool(getattr(args, "lidar_extra", True)),
         sync_check=bool(getattr(args, "sync_check", True)),
-        auto_offset=bool(getattr(args, "auto_offset", False)),
+        auto_offset=bool(getattr(args, "auto_offset", True)),
         report_html=bool(getattr(args, "report_html", True)),
     )
 
@@ -783,8 +784,9 @@ def run_sync_check(config: PipelineConfig, pcap: VelodynePcap, offset: float,
 
     * ``SYNC_CHECK_TOLERANCE`` 以内 … 記録のみ（同期の精度内）
     * ``SYNC_CHECK_MISMATCH`` 以内 … 警告（割り当ての取り違えが増えうる）
-    * それ超 … レポートへ推定値を明示し人手項目にする。``--auto-offset`` が
-      指定されていて推定値が信用できるなら、その場で差し替えて先へ進む
+    * それ超 … 推定値が信用できるなら**既定でその場で差し替えて**先へ進む。
+      GPMF 側はPCの時計ずれを見られないので、独立に測った推定値のほうを採る。
+      ``--no-auto-offset`` を付けた場合だけ差し替えず、警告と人手項目を残す
 
     戻り値は以降の段階で使うオフセット（差し替えなければ引数のまま）。
     """
@@ -865,7 +867,7 @@ def run_sync_check(config: PipelineConfig, pcap: VelodynePcap, offset: float,
 
     if config.auto_offset:
         report.stage("synccheck", "3.5.同期の自己検証", "warning",
-                     f"--auto-offset により推定値 {estimated:+.3f} 秒へ差し替えました"
+                     f"自己検証の推定値 {estimated:+.3f} 秒へ差し替えました"
                      f"（現行 {offset:+.3f} 秒 / 差 {difference:+.3f} 秒）",
                      applied=True, **detail)
         report.warn(
@@ -885,8 +887,8 @@ def run_sync_check(config: PipelineConfig, pcap: VelodynePcap, offset: float,
     )
     report.manual(
         f"時刻オフセットを確認してください。自己検証の推定値は {float(estimated):+.3f} 秒です"
-        f"（段階3の値 {offset:+.3f} 秒）。--offset {float(estimated):.3f} を指定するか、"
-        "--auto-offset を付けて再実行すると推定値で処理できます"
+        f"（段階3の値 {offset:+.3f} 秒）。--no-auto-offset を外して再実行すれば推定値で"
+        f"処理できます（推定値を直接指定するなら --offset {float(estimated):.3f}）"
     )
     return offset
 
@@ -2331,9 +2333,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=True,
                         help="段階3.5の時刻同期の自己検証を行わない"
                              "（1セッション約3分かかる。既定は検証する）")
-    parser.add_argument("--auto-offset", action="store_true",
+    parser.add_argument("--auto-offset", dest="auto_offset", action="store_true",
+                        default=True,
+                        help="（既定で有効。以前からの指定をそのまま受け付ける）")
+    parser.add_argument("--no-auto-offset", dest="auto_offset", action="store_false",
                         help="自己検証の推定オフセットが信頼でき、現行値と"
-                             f"{SYNC_CHECK_MISMATCH:g}秒超ずれている場合に推定値へ差し替える")
+                             f"{SYNC_CHECK_MISMATCH:g}秒超ずれていても差し替えず、"
+                             "警告と人手項目だけ残す")
     parser.add_argument("--no-lidar-extra", dest="lidar_extra", action="store_false",
                         default=True,
                         help="動画側に候補の無い車をレビューCSVへ「未確認」で"

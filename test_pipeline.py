@@ -5,7 +5,7 @@
 YOLO も実データも使わず、合成した最小PCAPと一時フォルダで段階4〜8を検証する。
 段階1（YOLO検出）は ``--skip-detect`` 相当のパスで通す。
 
-    .venv\\Scripts\\python.exe test_pipeline.py
+    portable\\python\\python.exe test_pipeline.py
 """
 from __future__ import annotations
 
@@ -577,12 +577,13 @@ def stub_sync_checker(estimated: float, peak: float = 0.9, prominence: float = 0
     return check_session
 
 
-def test_sync_check_reports_a_large_offset_mismatch():
-    """自己検証の推定オフセットが大きくずれていたら警告と人手項目を出す。
+def test_sync_check_replaces_a_large_offset_mismatch_by_default():
+    """自己検証の推定オフセットが大きくずれていたら、既定でその値へ差し替える。
 
     段階3のオフセットは GoPro の GPMF 時刻と PCAP の記録時刻の引き算なので、
     LiDAR 収録PCの時計がずれていると丸ごとずれる（260701 では全5セッションで
-    +4.2〜5.2 秒ずれていた）。既定では差し替えずに人へ知らせる。
+    +4.2〜5.2 秒ずれていた）。GPMF 側からはこのずれを見られないので、点群から
+    独立に測った推定値のほうを採る。
     """
     with tempfile.TemporaryDirectory() as temp_value:
         session = make_session(Path(temp_value))
@@ -591,6 +592,7 @@ def test_sync_check_reports_a_large_offset_mismatch():
 
         calls: list = []
         config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        assert config.auto_offset is True, config
         report = execute_pipeline(
             config, tracker=scripted_tracker([car("f10x+1.2", 1.0)]),
             sync_checker=stub_sync_checker(4.4, calls=calls),
@@ -600,17 +602,44 @@ def test_sync_check_reports_a_large_offset_mismatch():
 
         assert stage["status"] == "warning", stage
         assert stage["estimated_offset"] == 4.4 and stage["trusted"] is True, stage
-        assert not stage.get("applied"), stage
-        assert any("--auto-offset" in item for item in data["manual_actions"]), \
-            data["manual_actions"]
-        assert data["info"]["時刻オフセット(秒)"] == 0.0, data["info"]
+        assert stage.get("applied") is True, stage
+        assert data["info"]["時刻オフセット(秒)"] == 4.4, data["info"]
+        sync = json.loads((out_dir / "sync.json").read_text(encoding="utf-8"))
+        assert sync["offset"] == 4.4, sync
         # 索引済みの PCAP を渡して再索引を避けている
         assert calls and "pcap" in calls[0]["options"], calls
-        print("  OK: 同期の自己検証で大きなずれを警告する")
+        print("  OK: 大きなずれは既定で自己検証の推定値へ差し替える")
+
+
+def test_no_auto_offset_keeps_the_stage3_offset():
+    """``--no-auto-offset`` なら差し替えず、警告と人手項目だけ残す。
+
+    段階3の値をそのまま使いたい場合（自己検証を参考値として見たい場合）の逃げ道。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        session = make_session(Path(temp_value))
+        out_dir = session / "out_auto"
+        write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
+
+        config = build_config(parse_args(
+            [str(session), "--skip-detect", "--skip-gps", "--no-auto-offset"]))
+        assert config.auto_offset is False, config
+        report = execute_pipeline(
+            config, tracker=scripted_tracker([car("f10x+1.2", 1.0)]),
+            sync_checker=stub_sync_checker(4.4),
+        )
+        data = report.to_dict()
+        stage = next(s for s in data["stages"] if s["name"] == "synccheck")
+
+        assert stage["status"] == "warning" and not stage.get("applied"), stage
+        assert data["info"]["時刻オフセット(秒)"] == 0.0, data["info"]
+        assert any("--no-auto-offset" in item for item in data["manual_actions"]), \
+            data["manual_actions"]
+        print("  OK: --no-auto-offset なら段階3のオフセットを保つ")
 
 
 def test_auto_offset_replaces_the_offset():
-    """--auto-offset なら、信用できる推定オフセットへその場で差し替える。"""
+    """以前からの ``--auto-offset`` 指定も、既定と同じ動作でそのまま受け付ける。"""
     with tempfile.TemporaryDirectory() as temp_value:
         session = make_session(Path(temp_value))
         out_dir = session / "out_auto"
