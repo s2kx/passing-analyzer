@@ -159,6 +159,7 @@ GUIのStep1〜6を人が順に操作する代わりに使う。
 | `--track-margin` | (撮影方向別) | 点群追跡のマージン(秒)を前後同じ値で明示する。既定は `front` が開始側-8秒/終了側+3秒、`rear` がその逆 |
 | `--max-lane-clearance` | `3.5` | 自動レビューで隣車線の通過として除外する離隔距離(m) |
 | `--no-lidar-extra` | off | 動画側に候補の無い車を `L###` の「未確認」行として起票しない |
+| `--no-report` | off | 段階7bの閲覧用HTMLレポート (`out\report.html`) を作らない |
 
 `overtaking_events.csv` が既にある場合、段階1は自動でスキップされる。
 
@@ -177,6 +178,7 @@ GUIのStep1〜6を人が順に操作する代わりに使う。
 5. **edit CSV** — 最近接点の軌跡と解析Excel → `out/lidar_edit/`
 6. **自動レビュー** — LiDARの結果で採否を判定 → `out/reviewed_overtaking_events.csv`
 7. **最終Excel** — `out/final/<出力フォルダ名>_final.xlsx`
+7b. **閲覧用レポート** — 動画クリップと点群を見る `out/report.html`（[下記](#結果閲覧用htmlレポート-make_reportpy)）
 8. **レポート** — `out/pipeline_report.json` と `out/pipeline_report.txt`
 
 自動レビューは点群の結果を使うため追跡より後に置く。動画だけでは隣車線の車や誤検知を
@@ -356,6 +358,25 @@ def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
 判定不能だった場合、パイプラインは `front` を仮定したうえで警告と
 「撮影方向を確認して `--view` で再実行」という人手項目をレポートへ残す。
 
+### 結果閲覧用HTMLレポート (make_report.py)
+
+段階7bは、解析結果を人が見て確かめるための1枚のHTML `out\report.html` を作る。イベント一覧を
+クリックで開くと、そのイベントの**動画クリップ**（`clips\event_NNN_side.mp4` を相対パスで参照。
+コピーしないので容量は増えない）と、**切り抜いた点群のビューア**（上面図 X-Y と側面図 Y-Z の2面。
+フレームスライダーと再生/停止でフレーム送り、色は Intensity と高さZ を切り替え、自転車=原点・
+通過区間 |Y|<3m の帯・離隔距離LCの位置・フェーズ1〜4の点を補助線で表示）が並ぶ。
+ヘッダにはセッション名・実行日時・採用/未確認の件数、カードには離隔距離LC・通過時間・相対速度・
+TTC・車種・レビュー理由が出る。既存の出力フォルダからは
+`.venv\Scripts\python.exe make_report.py --out output\ID1` でいつでも作り直せる
+（`--max-points-per-frame` / `--max-points-total` で点群の間引き量を変えられる）。
+**ダブルクリックで開ける file:// 前提**なので外部CDNもネット接続も使わず、点群だけは
+`report_data\event_NNN.js`（`window.__EVT["001"]=...` の代入文）に分けてカードを開いたときに
+`<script>` 要素で遅延読み込みする（file:// では `fetch` が使えないため）。点群は座標を小数2桁に
+丸め、1フレーム2000点・1イベント6万点を上限に等間隔で間引くので、1イベントあたり
+0.2〜0.8MB 程度（実データID1の24件で `report_data` 合計11MB、`report.html` 47KB、生成7秒）。
+`--skip-detect` などで `clips\` が残っていない場合は動画欄が「クリップなし」になり、点群だけの
+レポートとして成立する。
+
 ### 危険感の扱い
 
 危険感は被験者の申告値なので全自動実行では**空欄**にする。最終Excelの「危険感」列は
@@ -444,6 +465,8 @@ def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
   - `proximity_hint` … near/mid/far の目安
 - `out/clips/event_NNN_side.mp4` — 切り出しクリップ(`--clip` 時)
 - `out/annotated.mp4` — 可視化動画(`--overlay` 時)
+- `out/report.html` + `out/report_data/event_NNN.js` — 結果閲覧用のHTMLレポート
+  (`run_pipeline.py` の段階7b、または `make_report.py --out <出力先>`)
 
 ## 検出ロジック
 
@@ -498,6 +521,7 @@ GoProの向き・画角で変わるため既定では無効になっている。
 .\portable\python\python.exe test_pipeline.py
 .\portable\python\python.exe test_autotrack.py
 .\portable\python\python.exe test_detect_view.py
+.\portable\python\python.exe test_make_report.py
 ```
 
 - `test_logic.py` … 判定ロジック(`classify_overtaking`)を YOLO/動画なしの合成軌跡で検証する
@@ -508,6 +532,11 @@ GoProの向き・画角で変わるため既定では無効になっている。
   (地面+静止物+通過車両、車列の2台目を含む)で検証する
 - `test_detect_view.py` … `detect_view.py` の判定ロジックをスタブで、フロー計算そのものを
   合成動画(拡大／縮小するテクスチャ)で検証する(実データ・GPU不要)
+- `test_make_report.py` … `make_report.py` を合成した最小の出力フォルダで検証する
+  (report.html の必須要素、点群jsの構造、点数上限、クリップの有無、単体CLI)。
+  実データの `output/ID1` が見つかる環境では、その reviewed CSV と点群CSV を一時フォルダへ
+  写して読み込めることも確かめる(実データのフォルダには書き込まない。場所は環境変数
+  `REPORT_REAL_OUT` で変えられる)
 
 ## 既知の制約 / 今後
 
