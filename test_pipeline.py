@@ -1317,6 +1317,41 @@ def test_lidar_speed_series_is_used_without_gps():
         print("  OK: GPSが無ければLiDAR自車速度で停止を判定（推定失敗行は無視）")
 
 
+def test_gps_workbook_reader_is_shared_with_the_writer():
+    """GPSワークブックの読み取りは書き出し側（extract_telemetry）に一本化されている。
+
+    段階6の自車運動判定（run_pipeline）と段階3.5の自己検証（tools/sync_check）が
+    同じ xlsx を別々に解釈すると、片方だけ単位や列を取り違える。読み取りは
+    ``extract_telemetry.read_gps_workbook`` 1本にして、絞り込みだけ各側で行う。
+    """
+    from extract_telemetry import _write_simple_xlsx, read_gps_workbook
+
+    with tempfile.TemporaryDirectory() as temp_value:
+        path = Path(temp_value) / "telemetry_gps.xlsx"
+        # シート1しか無い（毎秒1行・k/s＝m/sの1/1000）ワークブック
+        headers = ["cts", "date", "GPS (Lat.) [deg]", "GPS (Long.) [deg]", "GPS (Alt.) [m]",
+                   "GPS (2D speed) [k/s]", "GPS (3D speed) [m/s]", "fix", "precision",
+                   "altitude system"]
+        _write_simple_xlsx(path, [("1", [
+            headers,
+            [2.0, "", 35.0, 139.0, 30.0, 0.005, 5.0, 3, 150, ""],
+            [1.0, "", 35.1, 139.1, 30.0, 0.004, 4.0, 0, 900, ""],
+        ])])
+        fixes = read_gps_workbook(path)
+        # 時刻順に並び、k/s は m/s へ直り、測位できていない行も残る
+        assert [fix.seconds for fix in fixes] == [1.0, 2.0], fixes
+        assert abs(fixes[1].speed - 5.0) < 1e-9, fixes[1]
+        assert [fix.fix for fix in fixes] == [0, 3], fixes
+
+        # run_pipeline 側は測位できていない行（fix < 2）を捨てる
+        track = run_pipeline.read_gps_track(path)
+        assert [row[0] for row in track] == [2.0], track
+        assert track[0][1:] == (35.0, 139.0, 5.0), track
+
+    assert read_gps_workbook(Path("存在しない.xlsx")) == []
+    print("  OK: GPSワークブックの読み取りは書き出し側に一本化")
+
+
 def test_event_without_local_time_does_not_use_gps():
     """動画内時刻の無い候補ではGPSを使わない（0秒として読むと停止と誤判定する）。"""
     with tempfile.TemporaryDirectory() as temp_value:

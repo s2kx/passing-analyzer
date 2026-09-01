@@ -27,6 +27,7 @@ import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as _xml_escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -709,6 +710,116 @@ def save_gps_workbook(streams: dict[str, TelemetryStream], out_dir: Path) -> Pat
         ("2", [headers_2] + _gps_rows_default(gps)),
     ])
     return out_path
+
+
+# ── GPSワークブックの読み取り ─────────────────────────────────────────────────
+#
+# 書き出した xlsx を読み返す側（run_pipeline の自車運動判定、tools/sync_check の
+# 時刻同期の自己検証）が同じ解釈をするよう、読み取りもここに置く。
+
+XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+
+@dataclass(frozen=True)
+class GpsFix:
+    """``telemetry_gps.xlsx`` の1行（測位1点）。"""
+
+    seconds: float      # 動画内の経過秒（cts）
+    latitude: float     # 緯度 [deg]
+    longitude: float    # 経度 [deg]
+    speed: float        # 2D速度 [m/s]
+    fix: int            # 測位状態。0=なし / 2=2D / 3=3D
+
+
+def _xlsx_cell_values(row, shared: list[str]) -> list[str]:
+    """xlsx の1行を列順の文字列リストにする（列参照の飛びを空文字で埋める）。"""
+    values: list[str] = []
+    for cell in row.findall(f"{XLSX_NS}c"):
+        ref = cell.get("r") or ""
+        index = 0
+        for ch in ref:
+            if ch.isalpha():
+                index = index * 26 + ord(ch.upper()) - 64
+        index = max(index - 1, len(values))
+        while len(values) < index:
+            values.append("")
+        kind = cell.get("t")
+        if kind == "inlineStr":
+            text = "".join(t.text or "" for t in cell.iter(f"{XLSX_NS}t"))
+        elif kind == "s":
+            node = cell.find(f"{XLSX_NS}v")
+            position = int(node.text) if node is not None and node.text else -1
+            text = shared[position] if 0 <= position < len(shared) else ""
+        else:
+            node = cell.find(f"{XLSX_NS}v")
+            text = node.text or "" if node is not None else ""
+        values.append(text)
+    return values
+
+
+def read_gps_workbook(path: Path) -> list[GpsFix]:
+    """``save_gps_workbook`` が書いた ``telemetry_gps.xlsx`` を読む。
+
+    間引き無しのシート2（約10Hz）を優先し、無ければシート1（毎秒1行）を使う。
+    列は見出し名で探し、速度の単位も見出しから決める（シート1の ``k/s`` は
+    m/s の1000倍）。数値として読めない行（見出し行・欠測）は捨てる。
+    ファイルが無い・壊れている場合は空リストを返す。
+
+    測位できていない行（``fix`` が 0）も落とさずに返すので、必要な呼び出し側で
+    絞ること。速度だけを使う用途では測位状態を問わない方が系列が途切れない。
+    """
+    path = Path(path)
+    if not path.is_file():
+        return []
+    try:
+        with ZipFile(path) as book:
+            names = book.namelist()
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in names:
+                root = ET.fromstring(book.read("xl/sharedStrings.xml"))
+                shared = ["".join(t.text or "" for t in si.iter(f"{XLSX_NS}t"))
+                          for si in root.findall(f"{XLSX_NS}si")]
+            sheet_name = ("xl/worksheets/sheet2.xml"
+                          if "xl/worksheets/sheet2.xml" in names
+                          else "xl/worksheets/sheet1.xml")
+            sheet = ET.fromstring(book.read(sheet_name))
+    except (OSError, KeyError, ET.ParseError):
+        return []
+    rows = sheet.findall(f".//{XLSX_NS}sheetData/{XLSX_NS}row")
+    if len(rows) < 2:
+        return []
+    headers = _xlsx_cell_values(rows[0], shared)
+
+    def column(keyword: str, default: int) -> int:
+        return next((i for i, header in enumerate(headers) if keyword in header), default)
+
+    time_col = column("cts", 0)
+    lat_col = column("Lat.", 2)
+    lon_col = column("Long.", 3)
+    speed_col = column("GPS (2D speed)", 5)
+    fix_col = column("fix", 7)
+    scale = 1000.0 if "k/s" in (headers[speed_col] if speed_col < len(headers) else "") else 1.0
+
+    fixes: list[GpsFix] = []
+    for row in rows[1:]:
+        values = _xlsx_cell_values(row, shared)
+        if max(time_col, speed_col) >= len(values):
+            continue
+        try:
+            seconds = float(values[time_col])
+            speed = float(values[speed_col]) * scale
+        except ValueError:
+            continue
+        def optional(index: int, default: float) -> float:
+            try:
+                return float(values[index])
+            except (IndexError, ValueError):
+                return default
+        fixes.append(GpsFix(seconds, optional(lat_col, float("nan")),
+                            optional(lon_col, float("nan")), speed,
+                            int(optional(fix_col, 0))))
+    fixes.sort(key=lambda fix: fix.seconds)
+    return fixes
 
 
 def save_telemetry(streams: dict[str, TelemetryStream], out_dir: Path) -> None:

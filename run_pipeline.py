@@ -58,11 +58,9 @@ import statistics
 import subprocess
 import sys
 import time
-import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 from detect_view import (
     DEFAULT_SAMPLE_SECONDS as VIEW_SAMPLE_SECONDS,
@@ -1782,57 +1780,20 @@ def refine_vehicle_classes(events: list[dict], tracking: dict[str, dict]) -> lis
 
 # ── 段階6の前段: 自車運動（停止・旋回）──────────────────────────────────────
 
-def _xlsx_number_rows(path: Path, sheet: str) -> list[list[float]]:
-    """簡易xlsxの1シートから、数値セルだけを行ごとに読む。
-
-    ``extract_telemetry._write_simple_xlsx`` は数値を ``<v>`` に直値で、文字列を
-    ``inlineStr`` で書く（共有文字列は使わない）。数値以外の行（見出し行）は
-    空リストになるので、呼び出し側は列数で弾ける。openpyxl は portable Python に
-    入っていないので zip と XML から直接読む。
-    """
-    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    rows: list[list[float]] = []
-    with zipfile.ZipFile(path) as book:
-        tree = ET.fromstring(book.read(sheet))
-    for row in tree.iter(f"{namespace}row"):
-        values: list[float] = []
-        for cell in row.findall(f"{namespace}c"):
-            value = cell.find(f"{namespace}v")
-            try:
-                values.append(float(value.text))
-            except (AttributeError, TypeError, ValueError):
-                values.append(float("nan"))
-        rows.append(values)
-    return rows
-
-
 def read_gps_track(path: Path) -> list[tuple[float, float, float, float]]:
     """``telemetry_gps.xlsx`` から ``(動画内秒, 緯度, 経度, 速度m/s)`` を読む。
 
-    ``extract_telemetry.save_gps_workbook`` が書く 2 シートのうち、間引き無しの
-    シート2（速度が m/s、約10Hz）を使う。測位できていない行（fix < 2）は捨てる。
-    読めない場合は空リストを返す（自車運動の足切りをまるごと省く）。
+    読み取り自体は書き出し側と同じ ``extract_telemetry.read_gps_workbook`` に任せ、
+    ここでは測位できていない行（``fix`` が 2 未満）だけ落とす。自車運動の判定は
+    位置から進行方位も出すので、測位状態の怪しい行は使わない。読めない場合は空を
+    返し、呼び出し側は LiDAR 側の時系列へ回る。
     """
-    if not path.is_file():
-        return []
     try:
-        rows = _xlsx_number_rows(path, "xl/worksheets/sheet2.xml")
-    except (OSError, KeyError, ET.ParseError):
+        from extract_telemetry import read_gps_workbook
+    except Exception:  # noqa: BLE001 - 依存欠落でも自車運動の判定を飛ばすだけ
         return []
-    track: list[tuple[float, float, float, float]] = []
-    for values in rows:
-        if len(values) < 8:
-            continue
-        seconds, latitude, longitude, speed, fix = (
-            values[0], values[2], values[3], values[5], values[7]
-        )
-        if any(value != value for value in (seconds, latitude, longitude, speed, fix)):
-            continue  # NaN（見出し行や欠測）
-        if fix < 2:
-            continue
-        track.append((seconds, latitude, longitude, speed))
-    track.sort()
-    return track
+    return [(fix.seconds, fix.latitude, fix.longitude, fix.speed)
+            for fix in read_gps_workbook(path) if fix.fix >= 2]
 
 
 def read_lidar_speed(path: Path) -> list[tuple[float, float]]:

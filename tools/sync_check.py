@@ -38,9 +38,7 @@ import argparse
 import json
 import sys
 import time
-import zipfile
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 import numpy as np
 
@@ -48,6 +46,7 @@ APP_DIR = Path(__file__).resolve().parent.parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+from extract_telemetry import read_gps_workbook  # noqa: E402
 from lidar_autotrack import estimate_ground_plane, filter_points  # noqa: E402
 from lidar_pcap import VelodynePcap  # noqa: E402
 
@@ -90,79 +89,17 @@ MIN_PROMINENCE = 0.15       # ピークが背景（探索範囲の中央値）�
 MAX_SEGMENT_SPREAD = 2.0    # 区間ごとの推定のばらつき上限 (秒)
 SEGMENTS = 3                # ドリフト確認のための分割数
 
-XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-
 
 # ── 1. GPS 速度時系列 ────────────────────────────────────────────────────────
-
-def _cell_values(row: ET.Element, shared: list[str]) -> list[str]:
-    """xlsx の 1 行を列順の文字列リストにする（列参照の飛びを埋める）。"""
-    values: list[str] = []
-    for cell in row.findall(f"{XLSX_NS}c"):
-        ref = cell.get("r") or ""
-        index = 0
-        for ch in ref:
-            if ch.isalpha():
-                index = index * 26 + ord(ch.upper()) - 64
-        index = max(index - 1, len(values))
-        while len(values) < index:
-            values.append("")
-        kind = cell.get("t")
-        if kind == "inlineStr":
-            text = "".join(t.text or "" for t in cell.iter(f"{XLSX_NS}t"))
-        elif kind == "s":
-            node = cell.find(f"{XLSX_NS}v")
-            position = int(node.text) if node is not None and node.text else -1
-            text = shared[position] if 0 <= position < len(shared) else ""
-        else:
-            node = cell.find(f"{XLSX_NS}v")
-            text = node.text or "" if node is not None else ""
-        values.append(text)
-    return values
-
 
 def read_gps_speed_rows(path: Path) -> list[tuple[float, float]]:
     """``telemetry_gps.xlsx`` から ``(cts秒, 2D速度 m/s)`` を読む。
 
-    ``extract_telemetry.save_gps_workbook`` が書く 2 シート構成を前提にする。
-    シート2 は間引き無し・m/s、シート1 は毎秒 1 行・k/s（＝m/s の 1/1000）。
+    読み取りは書き出し側と同じ ``extract_telemetry.read_gps_workbook`` に任せる
+    （間引き無しのシート2を優先し、単位は見出しから判定する）。速度の相互相関に
+    しか使わないので、測位状態（``fix``）では絞らない。系列が途切れる方が困る。
     """
-    if not path.is_file():
-        return []
-    with zipfile.ZipFile(path) as book:
-        names = book.namelist()
-        shared: list[str] = []
-        if "xl/sharedStrings.xml" in names:
-            root = ET.fromstring(book.read("xl/sharedStrings.xml"))
-            shared = [
-                "".join(t.text or "" for t in si.iter(f"{XLSX_NS}t"))
-                for si in root.findall(f"{XLSX_NS}si")
-            ]
-        sheet_name = "xl/worksheets/sheet2.xml"
-        if sheet_name not in names:
-            sheet_name = "xl/worksheets/sheet1.xml"
-        sheet = ET.fromstring(book.read(sheet_name))
-    rows = sheet.findall(f".//{XLSX_NS}sheetData/{XLSX_NS}row")
-    if len(rows) < 2:
-        return []
-    headers = _cell_values(rows[0], shared)
-    time_col = headers.index("cts") if "cts" in headers else 0
-    speed_col = next(
-        (i for i, header in enumerate(headers) if "GPS (2D speed)" in header), 5
-    )
-    scale = 1000.0 if "k/s" in (headers[speed_col] if speed_col < len(headers) else "") else 1.0
-    result: list[tuple[float, float]] = []
-    for row in rows[1:]:
-        values = _cell_values(row, shared)
-        if max(time_col, speed_col) >= len(values):
-            continue
-        try:
-            seconds = float(values[time_col])
-            speed = float(values[speed_col]) * scale
-        except ValueError:
-            continue
-        result.append((seconds, speed))
-    return result
+    return [(fix.seconds, fix.speed) for fix in read_gps_workbook(path)]
 
 
 def chapter_offsets(videos: list[Path]) -> tuple[dict[str, float], list[str]]:

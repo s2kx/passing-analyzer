@@ -19,7 +19,6 @@ from detect_view import (
     DECISION_CONFIDENCE,
     MIN_MOVING_PAIRS,
     DetectViewError,
-    SamplePlan,
     detect_view,
     detection_command_for_view,
     plan_samples,

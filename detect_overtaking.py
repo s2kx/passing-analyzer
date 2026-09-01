@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 GoPro 動画から「自動車に追い越される瞬間」を自動検出するパイプライン。
