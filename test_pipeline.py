@@ -205,13 +205,18 @@ def scripted_tracker(vehicles: dict[str, list[dict]], calls: list | None = None,
 
 def car(track_key: str, pass_time: float, lc_estimate: float = 1.2,
         score: float = 0.9, confidence: float = 0.9,
-        length: float = 4.4, width: float = 1.8, height: float = 1.5) -> dict:
+        length: float = 4.4, width: float = 1.8, height: float = 1.5,
+        median_x: float | None = None) -> dict:
     """``scripted_tracker`` へ渡す 1 台分の車の定義。
 
     寸法の既定は普通車（4.4m × 1.8m × 1.5m）。段階6aの車種判定で使う。
+    ``median_x``（横位置の中央値）は省略すると離隔距離の目安と同じ値にする。
+    実データでは通過中の最小値が ``lc_estimate``、中央値が ``median_x`` なので
+    両者は一致しない（車両のグループ化は ``median_x`` のほうを見る）。
     """
     return {"track_key": track_key, "pass_time": pass_time, "score": score,
-            "lc_estimate": lc_estimate, "median_x": lc_estimate,
+            "lc_estimate": lc_estimate,
+            "median_x": lc_estimate if median_x is None else median_x,
             "confidence": confidence, "length": length, "width": width,
             "height": height, "near_length": length, "points": 5000}
 
@@ -445,6 +450,48 @@ def test_track_window_is_asymmetric_toward_approach():
     # --track-margin を明示した場合は従来どおり前後同じ
     assert run_pipeline.event_window(fixed, event, 1.0) == (16.0, 30.0)
     print("  OK: front は開始側 -8秒 / 終了側 +3秒、rear は逆の非対称窓")
+
+
+def test_vehicles_in_different_lanes_are_not_merged():
+    """同時刻に別の車線を通る車は、別の車としてグループを分ける。
+
+    通過時刻だけで束ねると、隣の車線を車が流れている最中の追い越しで、同一車線の
+    車が隣車線の車と1台にまとめられる。束ねたグループは1つのイベントにしか
+    割り当てられず、残りは L### としても起票されないので、同一車線の車がどこにも
+    出てこなくなる（260701/ID1 の 608.6s。正解 LC 1.02m の車は f5503x+1.4 として
+    score 1.000 で追跡できていたのに、0.1〜0.8秒違いで通る隣車線の3台と束ねられ、
+    採用されたのは隣車線の車だった）。
+    """
+    # ID1 608.6s 付近の実測（lidar_autotrack --list-tracks の値）
+    candidates = {
+        "026": [car("f5438x+4.2", 547.03, lc_estimate=3.249, median_x=4.2),
+                car("f5474x+4.2", 550.63, lc_estimate=3.431, median_x=4.2)],
+        "028": [car("f5500x+3.0", 553.23, lc_estimate=1.426, median_x=3.0),
+                car("f5502x+3.4", 553.43, lc_estimate=3.710, median_x=3.4),
+                car("f5503x+1.4", 553.53, lc_estimate=0.869, median_x=1.4),  # 同一車線
+                car("f5511x+4.2", 554.33, lc_estimate=3.746, median_x=4.2)],
+    }
+    groups = run_pipeline.group_vehicles(candidates)
+    keys = [sorted(item[1]["track_key"] for item in group) for group in groups]
+    same_lane = [group for group in keys if "f5503x+1.4" in group]
+    assert len(same_lane) == 1 and same_lane[0] == ["f5503x+1.4"], keys
+
+    # 横位置が近い（同じ車が別の窓でぶれた）ものは今までどおり1台にまとめる
+    same_car = {
+        "001": [car("f100x+1.8", 10.0, lc_estimate=1.8)],
+        "002": [car("f103x+2.0", 10.3, lc_estimate=2.0)],
+    }
+    assert len(run_pipeline.group_vehicles(same_car)) == 1, run_pipeline.group_vehicles(same_car)
+
+    # 数珠つなぎで merge_gap より広い範囲が1台にならない
+    chained = {
+        "001": [car("a", 10.0, lc_estimate=1.5), car("b", 10.9, lc_estimate=1.5),
+                car("c", 11.8, lc_estimate=1.5)],
+    }
+    spans = [max(i[1]["pass_time"] for i in g) - min(i[1]["pass_time"] for i in g)
+             for g in run_pipeline.group_vehicles(chained)]
+    assert max(spans) <= run_pipeline.VEHICLE_MERGE_GAP, spans
+    print("  OK: 別の車線を同時刻に通る車を1台にまとめない")
 
 
 def test_events_are_assigned_to_distinct_vehicles():

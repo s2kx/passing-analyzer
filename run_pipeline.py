@@ -167,6 +167,15 @@ PASS_MATCH_TOLERANCE = 6.0
 # 通過時刻がこれ以内なら、別イベントの走査で見つかった同じ車とみなす（秒）。
 # 車列の2台目とは 4〜9 秒空くので、それより十分小さく取る。
 VEHICLE_MERGE_GAP = 1.0
+# 同じ車とみなすには横位置も近いことを要る（m）。時刻だけで束ねると、隣の車線を
+# 車が流れている最中の追い越しで、同一車線の車と隣車線の車が1台にまとめられる。
+# 束ねられたグループは1つのイベントにしか割り当てられず、残りは L### としても
+# 起票されないので、同一車線の車がどこにも出てこなくなる（260701/ID1 の 608.6s が
+# これ。正解 LC 1.02m の車は f5503x+1.4 として score 1.000 で追跡できていたのに、
+# 0.1〜0.8秒違いで通る隣車線の3台（X +3.0/+3.4/+4.2）と1台に束ねられていた）。
+# 値は「同じ車の横位置のぶれ」（TRACK_KEY_LATERAL_TOLERANCE = 1.0m）より少し広く、
+# 同一車線と隣車線の間隔（実測で 1.6m 以上）より狭い 1.5m にする。
+VEHICLE_MERGE_LATERAL = 1.5
 # 期待通過時刻の系統ずれを推定する際、これ以上離れた候補は外れ値として使わない（秒）。
 BIAS_SAMPLE_LIMIT = 10.0
 # どの候補にも割り当たらなかった車を「動画検出の取りこぼしかも」と挙げる評価値の下限。
@@ -1019,14 +1028,35 @@ def estimate_pass_bias(expected: dict[str, float], candidate_sets: dict[str, lis
     return float(statistics.median(deltas)) if len(deltas) >= 3 else 0.0
 
 
+def _same_vehicle_candidate(left: dict, right: dict, merge_gap: float,
+                            lateral: float) -> bool:
+    """2つの候補要約が同じ車かどうかを、通過時刻と横位置の近さで判定する。
+
+    横位置（``median_x``）が分からない候補は、従来どおり通過時刻だけで判断する。
+    """
+    if abs(float(left["pass_time"]) - float(right["pass_time"])) > merge_gap:
+        return False
+    left_x, right_x = left.get("median_x"), right.get("median_x")
+    if not isinstance(left_x, (int, float)) or not isinstance(right_x, (int, float)):
+        return True
+    return abs(float(left_x) - float(right_x)) <= lateral
+
+
 def group_vehicles(candidate_sets: dict[str, list[dict]],
-                   merge_gap: float = VEHICLE_MERGE_GAP) -> list[list[tuple[str, dict]]]:
-    """全候補の追跡結果を通過時刻でまとめ、実車両ごとのグループにする。
+                   merge_gap: float = VEHICLE_MERGE_GAP,
+                   lateral: float = VEHICLE_MERGE_LATERAL) -> list[list[tuple[str, dict]]]:
+    """全候補の追跡結果を実車両ごとのグループにまとめる。
 
     イベントごとに追跡窓が違うため、同じ車でも走査のたびに ``track_key`` が僅かに
-    ぶれうる。通過時刻が ``merge_gap`` 秒以内の候補は同じ車とみなして 1 つの
-    グループにし、「1 台の車は 1 つのイベントにしか出力しない」を保証する単位に
-    する。車列の 2 台目とは 4 秒以上空くので取り違えない。
+    ぶれうる。通過時刻が ``merge_gap`` 秒以内で、かつ横位置が ``lateral`` m 以内の
+    候補を同じ車とみなして 1 つのグループにし、「1 台の車は 1 つのイベントにしか
+    出力しない」を保証する単位にする。車列の 2 台目とは 4 秒以上空くので取り違えない。
+
+    横位置も見るのは、隣の車線を車が流れている最中の追い越しで、同一車線の車と
+    隣車線の車が同時刻に通るため（``VEHICLE_MERGE_LATERAL`` の説明を参照）。
+    判定はグループの先頭（いちばん早い候補）と比べて行う。直前の1件と比べると、
+    少しずつずれた候補が数珠つなぎになって ``merge_gap`` より広い範囲が1台に
+    なるため、グループの広がりは必ず ``merge_gap`` 以内になるようにする。
     """
     items = [
         (event_id, candidate)
@@ -1037,10 +1067,19 @@ def group_vehicles(candidate_sets: dict[str, list[dict]],
     items.sort(key=lambda item: item[1]["pass_time"])
     groups: list[list[tuple[str, dict]]] = []
     for entry in items:
-        if groups and entry[1]["pass_time"] - groups[-1][-1][1]["pass_time"] <= merge_gap:
-            groups[-1].append(entry)
-        else:
+        target = None
+        for group in reversed(groups):
+            anchor = group[0][1]
+            # items も groups も通過時刻順なので、先頭が届かなければ以前のグループも届かない
+            if float(entry[1]["pass_time"]) - float(anchor["pass_time"]) > merge_gap:
+                break
+            if _same_vehicle_candidate(entry[1], anchor, merge_gap, lateral):
+                target = group
+                break
+        if target is None:
             groups.append([entry])
+        else:
+            target.append(entry)
     return groups
 
 
