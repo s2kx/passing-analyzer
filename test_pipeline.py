@@ -33,15 +33,17 @@ from run_pipeline import (
 )
 
 
-# 追い越し車の軌跡（1秒刻み）。web_gui.py --check のフェーズ判定テストと同じ形。
+# 追い越し車の軌跡（1秒刻み）。後方から近づいて横に並び、前方へ抜けていく。
 #   フェーズ2 = 4行目(t=3), フェーズ3 = 5行目(t=4, |Y|<3), フェーズ4 = 6行目(t=5)
+# 通過区間（|Y| < 3m）を後ろから前へ抜けきる形にしてある。抜けきらない軌跡だと
+# 距離p3が MIN_PASS_PROGRESS を下回り、自動レビューが「未確認」にする。
 TRAJECTORY = [
-    (0.0, -0.5, 8.0),
-    (1.0, -1.0, 7.0),
-    (2.0, -1.5, 6.0),
-    (3.0, -2.0, 5.0),
-    (4.0, -2.5, 2.5),
-    (5.0, -1.0, 3.2),
+    (0.0, -0.5, -8.0),
+    (1.0, -1.0, -7.0),
+    (2.0, -1.5, -6.0),
+    (3.0, -2.0, -5.0),
+    (4.0, -2.5, -2.0),
+    (5.0, -1.0, 3.5),
 ]
 PCAP_START_UNIX = 1782000000.0
 TARGET_LASER = 1                    # VLP-16 チャンネル1 = 垂直角 +1度
@@ -1196,6 +1198,249 @@ def test_no_report_option_skips_the_html():
         assert not (out_dir / "report.html").exists()
         assert stages["final"]["status"] == "ok", stages
         print("  OK: --no-report で閲覧用レポートを省略する")
+
+
+def gps_workbook(path: Path, rows: list[tuple[float, float, float, float]]) -> Path:
+    """``extract_telemetry.save_gps_workbook`` と同じ形の xlsx を書く。
+
+    ``rows`` は ``(動画内秒, 緯度, 経度, 速度m/s)``。シート2（間引き無し）だけを
+    自車運動の判定に使うので、シート1は見出しだけで足りる。
+    """
+    from extract_telemetry import _write_simple_xlsx
+
+    headers = ["cts", "date", "GPS (Lat.) [deg]", "GPS (Long.) [deg]", "GPS (Alt.) [m]",
+               "GPS (2D speed) [m/s]", "GPS (3D speed) [m/s]", "fix", "precision",
+               "altitude system"]
+    sheet2 = [headers] + [
+        [seconds, "", latitude, longitude, 30.0, speed, speed, 3, 150, ""]
+        for seconds, latitude, longitude, speed in rows
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_simple_xlsx(path, [("1", [headers]), ("2", sheet2)])
+    return path
+
+
+def straight_ride(seconds: float, speed: float, count: int = 60,
+                  start: float = 0.0) -> list[tuple[float, float, float, float]]:
+    """北へ一定速度で直進する GPS 測位列（10Hz）。"""
+    rows = []
+    for index in range(count):
+        elapsed = start + index * 0.1
+        rows.append((elapsed, 35.0 + (elapsed - seconds) * speed / 111_320.0,
+                     139.0, speed))
+    return rows
+
+
+def test_stopped_ride_is_rejected():
+    """自転車が停止している間の候補は「除外」にする。
+
+    信号待ちの横を車が流れていく状況で、追い越しの前提（静止物が自車速度で
+    後退する）が崩れている。実データ260701/ID1の 388.4s（GPS 0.33m/s）がこの型で、
+    採用した他の19件は最低でも 4.35m/s あった。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        out_dir = Path(temp_value)
+        gps_workbook(out_dir / "gps" / "GX010001" / "telemetry_gps.xlsx",
+                     straight_ride(0.0, 0.05, count=120))
+        config = PipelineConfig(session_dir=Path("."), out_dir=out_dir, videos=[],
+                                pcap_path=Path("."), view="front")
+        ego = run_pipeline.load_ego_motion(config, 0.0)
+        events = [{"event_id": "001", "source_video": "GX010001.MP4",
+                   "t_start_s": 2.0, "t_end_s": 6.0,
+                   "local_t_start_s": 2.0, "local_t_end_s": 6.0}]
+        tracking = {"001": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
+        analyses = {"001": {"metrics": {"lc": 1.3, "relative_speed": 15.0,
+                                        "distance_p3": 6.0}}}
+
+        reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses, ego)
+        assert reviewed[0]["review_status"] == "除外", reviewed
+        assert "停止中" in reviewed[0]["review_reason"], reviewed[0]
+
+        # --no-ego-gate を付けたら足切りしない
+        config.ego_gate = False
+        reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses, ego)
+        assert reviewed[0]["review_status"] == "採用", reviewed
+        print("  OK: 停止中の候補を除外（--no-ego-gate で無効化）")
+
+
+def test_moving_ride_is_kept():
+    """走行中（GPSが読める）の候補はこれまでどおり採用する。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        out_dir = Path(temp_value)
+        gps_workbook(out_dir / "gps" / "GX010001" / "telemetry_gps.xlsx",
+                     straight_ride(0.0, 5.0, count=120))
+        config = PipelineConfig(session_dir=Path("."), out_dir=out_dir, videos=[],
+                                pcap_path=Path("."), view="front")
+        ego = run_pipeline.load_ego_motion(config, 0.0)
+        assert ego.sources == ["GPS"], ego.sources
+        events = [{"event_id": "001", "source_video": "GX010001.MP4",
+                   "t_start_s": 2.0, "t_end_s": 6.0,
+                   "local_t_start_s": 2.0, "local_t_end_s": 6.0}]
+        tracking = {"001": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
+        analyses = {"001": {"metrics": {"lc": 1.3, "relative_speed": 15.0,
+                                        "distance_p3": 6.0}}}
+        reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses, ego)
+        assert reviewed[0]["review_status"] == "採用", reviewed
+        speed, source = ego.speed(events[0])
+        assert abs(speed - 5.0) < 0.01 and source == "GPS", (speed, source)
+        assert (ego.yaw_rate(events[0]) or 0.0) < 1.0, ego.yaw_rate(events[0])
+        print("  OK: 走行中の候補は採用（GPS速度 5.0m/s）")
+
+
+def test_lidar_speed_series_is_used_without_gps():
+    """GPSが無いセッションでは段階3.5の自車速度で停止を判定する。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        out_dir = Path(temp_value)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # tools/sync_check.save_series と同じCSV。ok=0 の行は捨てられる。
+        (out_dir / "sync_series.npz").write_text(
+            "time_s,speed_ms,peak,prominence,ok\n"
+            "10.0000,0.0300,0.8,0.3,1\n"
+            "11.0000,22.0000,0.1,0.0,0\n"
+            "12.0000,0.0500,0.8,0.3,1\n",
+            encoding="utf-8",
+        )
+        config = PipelineConfig(session_dir=Path("."), out_dir=out_dir, videos=[],
+                                pcap_path=Path("."), view="front")
+        ego = run_pipeline.load_ego_motion(config, -5.0)
+        assert ego.sources == ["LiDAR自車速度"], ego.sources
+        # pcap時刻 = gopro時刻 + offset なので、gopro 16.0s → pcap 11.0s
+        events = [{"event_id": "001", "source_video": "GX010001.MP4",
+                   "t_start_s": 16.0, "t_end_s": 16.5,
+                   "local_t_start_s": 16.0, "local_t_end_s": 16.5}]
+        tracking = {"001": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
+        analyses = {"001": {"metrics": {"lc": 1.3, "relative_speed": 15.0,
+                                        "distance_p3": 6.0}}}
+        reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses, ego)
+        assert reviewed[0]["review_status"] == "除外", reviewed
+        assert "LiDAR自車速度" in reviewed[0]["review_reason"], reviewed[0]
+        print("  OK: GPSが無ければLiDAR自車速度で停止を判定（推定失敗行は無視）")
+
+
+def test_event_without_local_time_does_not_use_gps():
+    """動画内時刻の無い候補ではGPSを使わない（0秒として読むと停止と誤判定する）。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        out_dir = Path(temp_value)
+        # 走り出す前の停止（0〜4秒）と、その後の走行
+        rows = straight_ride(0.0, 0.05, count=40) + straight_ride(4.0, 5.0, count=80, start=4.0)
+        gps_workbook(out_dir / "gps" / "GX010001" / "telemetry_gps.xlsx", rows)
+        config = PipelineConfig(session_dir=Path("."), out_dir=out_dir, videos=[],
+                                pcap_path=Path("."), view="front")
+        ego = run_pipeline.load_ego_motion(config, 0.0)
+        event = {"event_id": "001", "source_video": "GX010001.MP4",
+                 "t_start_s": 8.0, "t_end_s": 9.0, "local_t_start_s": "", "local_t_end_s": ""}
+        assert ego.speed(event) == (None, ""), ego.speed(event)
+        assert ego.yaw_rate(event) is None, ego.yaw_rate(event)
+        tracking = {"001": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
+        analyses = {"001": {"metrics": {"lc": 1.3, "relative_speed": 15.0,
+                                        "distance_p3": 6.0}}}
+        reviewed = run_pipeline.auto_review_events([event], config, tracking, analyses, ego)
+        assert reviewed[0]["review_status"] == "採用", reviewed
+        print("  OK: 動画内時刻が無ければGPSを使わない")
+
+
+def test_turning_ride_is_flagged_for_review():
+    """曲がり角（旋回中）の候補は「未確認」にして人手確認へ回す。
+
+    旋回中はセンサのヨーで静止物が横へ流れ、追い越し車と見分けがつかない。
+    自車運動補正をしていないので、値は採用せず目視確認へ回す。
+    """
+    with tempfile.TemporaryDirectory() as temp_value:
+        out_dir = Path(temp_value)
+        # 5m/s で半径 10m ほどの角を曲がる（約 29度/秒）
+        rows = []
+        angle = 0.0
+        latitude, longitude = 35.0, 139.0
+        for index in range(80):
+            elapsed = index * 0.1
+            angle += math.radians(29.0) * 0.1
+            latitude += 5.0 * 0.1 * math.cos(angle) / 111_320.0
+            longitude += 5.0 * 0.1 * math.sin(angle) / (111_320.0 * math.cos(math.radians(35.0)))
+            rows.append((elapsed, latitude, longitude, 5.0))
+        gps_workbook(out_dir / "gps" / "GX010001" / "telemetry_gps.xlsx", rows)
+        config = PipelineConfig(session_dir=Path("."), out_dir=out_dir, videos=[],
+                                pcap_path=Path("."), view="front")
+        ego = run_pipeline.load_ego_motion(config, 0.0)
+        events = [{"event_id": "001", "source_video": "GX010001.MP4",
+                   "t_start_s": 2.0, "t_end_s": 6.0,
+                   "local_t_start_s": 2.0, "local_t_end_s": 6.0}]
+        tracking = {"001": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
+        analyses = {"001": {"metrics": {"lc": 1.3, "relative_speed": 15.0,
+                                        "distance_p3": 6.0}}}
+        yaw = ego.yaw_rate(events[0])
+        assert yaw is not None and yaw > 20.0, yaw
+        reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses, ego)
+        assert reviewed[0]["review_status"] == "未確認", reviewed
+        assert "旋回中" in reviewed[0]["review_reason"], reviewed[0]
+        print(f"  OK: 旋回中（{yaw:.0f}度/秒）の候補を未確認へ")
+
+
+def test_adjacent_lane_suspicion_is_flagged_for_review():
+    """同一車線と言い切れない離隔距離（2.6〜3.5m）は「未確認」にする。
+
+    260701/ID1 を正解12件と突き合わせると、正しく追えた11件の実測LCは 1.89m 以下、
+    正解に対応しない（隣車線の車を掴んだ）7件は 3.10m 以上だった。除外はせず、
+    人が点群を見て決められるよう残す。
+    """
+    config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                            pcap_path=Path("."), view="front")
+    events = [{"event_id": "1"}, {"event_id": "2"}, {"event_id": "3"}]
+    tracking = {key: {"ok": True, "confidence": 0.9, "lc_estimate": 1.0}
+                for key in ("1", "2", "3")}
+    analyses = {
+        "1": {"metrics": {"lc": 1.89, "relative_speed": 15.0, "distance_p3": 6.0}},
+        "2": {"metrics": {"lc": 3.10, "relative_speed": 15.0, "distance_p3": 6.0}},
+        "3": {"metrics": {"lc": 3.60, "relative_speed": 15.0, "distance_p3": 6.0}},
+    }
+    reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses)
+    assert [row["review_status"] for row in reviewed] == ["採用", "未確認", "除外"], reviewed
+    assert "同一車線の目安" in reviewed[1]["review_reason"], reviewed[1]
+    assert "隣車線" in reviewed[2]["review_reason"], reviewed[2]
+    print("  OK: 離隔距離 2.6〜3.5m を未確認、3.5m 超を除外")
+
+
+def test_truncated_pass_is_flagged_for_review():
+    """通過区間を抜けきれていない解析（距離p3が短い）は「未確認」にする。
+
+    追跡が通過区間の途中で切れると通過時間が短く出て、相対速度・TTCがまとめて
+    狂う。実データ260701/ID1の 389.8s が距離p3 2.51m でこの型（採用行は 5.27m 以上）。
+    """
+    config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                            pcap_path=Path("."), view="front")
+    events = [{"event_id": "1"}, {"event_id": "2"}, {"event_id": "3"}]
+    tracking = {key: {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}
+                for key in ("1", "2", "3")}
+    analyses = {
+        "1": {"metrics": {"lc": 1.3, "relative_speed": 15.0, "distance_p3": 2.51}},
+        "2": {"metrics": {"lc": 1.3, "relative_speed": 15.0, "distance_p3": 6.0}},
+        "3": {"metrics": {"lc": 1.3, "relative_speed": 15.0, "distance_p3": 6.0,
+                          "warnings": ["フェーズ2が見つからないため、フェーズ3直前の"
+                                       "有効点をフェーズ2として代用しました"]}},
+    }
+    reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses)
+    assert [row["review_status"] for row in reviewed] == ["未確認", "採用", "未確認"], reviewed
+    assert "抜けきれていません" in reviewed[0]["review_reason"], reviewed[0]
+    assert "代用" in reviewed[2]["review_reason"], reviewed[2]
+    print("  OK: 通過区間を抜けきれていない・フェーズを代用した解析を未確認へ")
+
+
+def test_ego_gate_is_skipped_without_any_series():
+    """GPSも自車速度も無ければ足切りせず、レポートへ警告だけ残す。"""
+    with tempfile.TemporaryDirectory() as temp_value:
+        out_dir = Path(temp_value)
+        config = PipelineConfig(session_dir=Path("."), out_dir=out_dir, videos=[],
+                                pcap_path=Path("."), view="front")
+        ego = run_pipeline.load_ego_motion(config, 0.0)
+        assert not ego.available(), ego
+        events = [{"event_id": "001", "source_video": "GX010001.MP4",
+                   "t_start_s": 2.0, "t_end_s": 6.0,
+                   "local_t_start_s": 2.0, "local_t_end_s": 6.0}]
+        tracking = {"001": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
+        analyses = {"001": {"metrics": {"lc": 1.3, "relative_speed": 15.0,
+                                        "distance_p3": 6.0}}}
+        reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses, ego)
+        assert reviewed[0]["review_status"] == "採用", reviewed
+        print("  OK: 時系列が無ければ自車運動の足切りを飛ばす")
 
 
 def report_text(session: Path) -> str:

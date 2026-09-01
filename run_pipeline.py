@@ -29,6 +29,11 @@ GUI(`web_gui.py`)で人が Step1〜6 を順に操作していた作業を、1コ
 動画だけでは隣車線の車や誤検知を切り分けられないが、LiDAR の離隔距離まで求まれば
 「そもそも車が見つからない」「離隔距離が隣車線相当」を機械的に落とせる。
 
+さらに段階2のGPS（無ければ段階3.5のLiDAR自車速度）から自車の運動を読み、
+「自転車が停止中」「旋回中」「通過区間を抜けきれていない」候補を落とす。停止中と
+旋回中は追い越しの前提（自転車が直進していて、静止物が自車速度で後退する）が
+崩れており、追跡も下流の計算も成り立たない。``--no-ego-gate`` で無効化できる。
+
 危険感は全自動実行では空欄にする（人が後から最終Excelへ入力する）。
 
 LiDAR には追い越し車が居るのに動画側の候補が無い（車列の2台目など検出の
@@ -53,9 +58,11 @@ import statistics
 import subprocess
 import sys
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from detect_view import (
     DEFAULT_SAMPLE_SECONDS as VIEW_SAMPLE_SECONDS,
@@ -100,8 +107,36 @@ VIEW_TRACK_MARGINS = {"front": (8.0, 3.0), "rear": (3.0, 8.0)}
 # 日本の追い越しは隣車線でなければ 2.5m 程度まで（正解データの LC は全て 2.45m
 # 以下）。これを超える通過は隣車線の車を掴んだものとみなして除外する。
 MAX_LANE_CLEARANCE = 3.5
+# 同一車線の追い越しと言い切れる離隔距離の上限(m)。これを超えて MAX_LANE_CLEARANCE
+# 以下の候補は、隣車線の車を掴んでいる疑いが濃いので「未確認」にする（除外はしない。
+# 実測LCが申告値より広く出ることがあり、機械的に捨てると本物を落とすため）。
+# 260701/ID1 を正解12件と突き合わせた実測: 正しく追えた11件の実測LCは 0.93〜1.89m、
+# 正解に対応しない（＝隣車線の車を掴んだ）7件は 3.10〜3.48m で、間は完全に空いている。
+# 正解46件の申告値も最大 2.45m・2番目は 2.03m なので、2.6m はその谷にある。
+REVIEW_LANE_CLEARANCE = 2.6
 # 追跡の確信度がこれ未満なら「未確認」にして人手確認へ回す。
 MIN_TRACK_CONFIDENCE = 0.5
+
+# 自車運動による足切り（段階6の前段で GPS / LiDAR から求める）。
+# 停止中は「静止物が自車速度で後退する」前提が崩れ、lidar_autotrack の
+# estimate_forward_sign が前進方向を +Y と決め打ちする（EGO_SPEED_FOR_SIGN 未満）。
+# 通過時間・相対速度・TTC はどれも成り立たないので、停止中の候補は除外する。
+# 260701/ID1 の 009 がこの型で、GPS 0.33m/s・LiDAR推定 0.03m/s。採用した他の19件は
+# 最低でも 4.35m/s あるので、1.0m/s で確実に分かれる。
+EGO_STOP_SPEED = 1.0            # これ未満は停止中とみなして除外する (m/s)
+EGO_SLOW_SPEED = 2.0            # これ未満は低速として「未確認」へ回す (m/s)
+# 曲がり角ではセンサのヨーで静止物が横へ流れ、追い越し車と同じ動きに見える。
+# 自車運動補正をしていない以上、旋回中の追跡結果は信用できないので人手確認へ回す。
+# ID1 の実測では採用行の最大が 16.9度/秒（緩いカーブ）で、明確な旋回は 20度/秒超
+# （曲がり角の 25〜42度/秒）。採用行を巻き込まない 20度/秒を既定にする。
+EGO_TURN_YAW_RATE = 20.0        # これを超える旋回中の候補は「未確認」へ回す (度/秒)
+EGO_WINDOW_MARGIN = 1.5         # 自車運動を見るイベント前後の余裕 (秒)
+EGO_MIN_SPEED_FOR_HEADING = 1.0  # 方位の計算に使う最低速度 (m/s)
+EGO_HEADING_BASELINE = 3.0      # 方位を1つ測るのに必要な移動距離 (m)
+# フェーズ3→4の Y 移動量の下限 (m)。通過区間（|Y| < 3m）を抜けきれば 6m 前後になる。
+# これを下回る解析は通過区間の途中で追跡が切れており、通過時間・距離p3・TTC が
+# 成り立たない。ID1 では採用行が 5.27〜6.51m、切れた追跡は 2.51m 以下だった。
+MIN_PASS_PROGRESS = 4.5
 
 # 段階3.5 時刻同期の自己検証（tools/sync_check.py）。
 # GPS速度とLiDAR点群から求めた自車速度の相互相関でオフセットを独立に推定し、
@@ -204,6 +239,14 @@ class PipelineConfig:
     track_margin: float | None = None
     # 自動レビューで隣車線の通過とみなす離隔距離のしきい値(m)。
     max_lane_clearance: float = MAX_LANE_CLEARANCE
+    # これを超える離隔距離の候補は「未確認」にする(m)。
+    review_lane_clearance: float = REVIEW_LANE_CLEARANCE
+    # 自車運動（停止・旋回）による足切りを行うか。
+    ego_gate: bool = True
+    # これ未満の自車速度は停止中とみなして除外する(m/s)。
+    stop_speed: float = EGO_STOP_SPEED
+    # これを超える旋回中の候補は「未確認」へ回す(度/秒)。
+    turn_yaw_rate: float = EGO_TURN_YAW_RATE
     # 割り当て先の無い車を LiDAR 発の「未確認」行として起票するか。
     lidar_extra: bool = True
     # 段階3.5 の時刻同期の自己検証を行うか。
@@ -356,6 +399,11 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         offset_override=args.offset,
         track_margin=None if args.track_margin is None else float(args.track_margin),
         max_lane_clearance=float(args.max_lane_clearance),
+        review_lane_clearance=float(getattr(args, "review_lane_clearance",
+                                             REVIEW_LANE_CLEARANCE)),
+        ego_gate=bool(getattr(args, "ego_gate", True)),
+        stop_speed=float(getattr(args, "stop_speed", EGO_STOP_SPEED)),
+        turn_yaw_rate=float(getattr(args, "turn_yaw_rate", EGO_TURN_YAW_RATE)),
         lidar_extra=bool(getattr(args, "lidar_extra", True)),
         sync_check=bool(getattr(args, "sync_check", True)),
         auto_offset=bool(getattr(args, "auto_offset", False)),
@@ -1732,6 +1780,215 @@ def refine_vehicle_classes(events: list[dict], tracking: dict[str, dict]) -> lis
     return changes
 
 
+# ── 段階6の前段: 自車運動（停止・旋回）──────────────────────────────────────
+
+def _xlsx_number_rows(path: Path, sheet: str) -> list[list[float]]:
+    """簡易xlsxの1シートから、数値セルだけを行ごとに読む。
+
+    ``extract_telemetry._write_simple_xlsx`` は数値を ``<v>`` に直値で、文字列を
+    ``inlineStr`` で書く（共有文字列は使わない）。数値以外の行（見出し行）は
+    空リストになるので、呼び出し側は列数で弾ける。openpyxl は portable Python に
+    入っていないので zip と XML から直接読む。
+    """
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    rows: list[list[float]] = []
+    with zipfile.ZipFile(path) as book:
+        tree = ET.fromstring(book.read(sheet))
+    for row in tree.iter(f"{namespace}row"):
+        values: list[float] = []
+        for cell in row.findall(f"{namespace}c"):
+            value = cell.find(f"{namespace}v")
+            try:
+                values.append(float(value.text))
+            except (AttributeError, TypeError, ValueError):
+                values.append(float("nan"))
+        rows.append(values)
+    return rows
+
+
+def read_gps_track(path: Path) -> list[tuple[float, float, float, float]]:
+    """``telemetry_gps.xlsx`` から ``(動画内秒, 緯度, 経度, 速度m/s)`` を読む。
+
+    ``extract_telemetry.save_gps_workbook`` が書く 2 シートのうち、間引き無しの
+    シート2（速度が m/s、約10Hz）を使う。測位できていない行（fix < 2）は捨てる。
+    読めない場合は空リストを返す（自車運動の足切りをまるごと省く）。
+    """
+    if not path.is_file():
+        return []
+    try:
+        rows = _xlsx_number_rows(path, "xl/worksheets/sheet2.xml")
+    except (OSError, KeyError, ET.ParseError):
+        return []
+    track: list[tuple[float, float, float, float]] = []
+    for values in rows:
+        if len(values) < 8:
+            continue
+        seconds, latitude, longitude, speed, fix = (
+            values[0], values[2], values[3], values[5], values[7]
+        )
+        if any(value != value for value in (seconds, latitude, longitude, speed, fix)):
+            continue  # NaN（見出し行や欠測）
+        if fix < 2:
+            continue
+        track.append((seconds, latitude, longitude, speed))
+    track.sort()
+    return track
+
+
+def read_lidar_speed(path: Path) -> list[tuple[float, float]]:
+    """段階3.5が保存した自車速度の時系列を ``(PCAP相対秒, m/s)`` で読む。
+
+    ``out/sync_series.npz`` は拡張子に反して ``tools/sync_check.save_series`` が
+    書くCSV（``time_s,speed_ms,peak,prominence,ok``）。推定に失敗した行（ok=0）は
+    捨てる。GPSが無いセッションでの停止判定の予備に使う。
+    """
+    if not path.is_file():
+        return []
+    series: list[tuple[float, float]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    for line in lines[1:]:
+        parts = line.split(",")
+        if len(parts) < 5:
+            continue
+        try:
+            if not int(parts[4]):
+                continue
+            series.append((float(parts[0]), float(parts[1])))
+        except ValueError:
+            continue
+    series.sort()
+    return series
+
+
+def _bearing_deg(start: tuple, end: tuple) -> float:
+    """2つの測位点 ``(秒, 緯度, 経度, 速度)`` を結ぶ進行方位（度）。"""
+    lat1, lon1 = math.radians(start[1]), math.radians(start[2])
+    lat2, lon2 = math.radians(end[1]), math.radians(end[2])
+    delta = lon2 - lon1
+    return math.degrees(math.atan2(
+        math.sin(delta) * math.cos(lat2),
+        math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(delta),
+    ))
+
+
+def _distance_m(start: tuple, end: tuple) -> float:
+    """2つの測位点の距離（m）。1セッションの範囲なので平面近似で足りる。"""
+    lat_m = (end[1] - start[1]) * 111_320.0
+    lon_m = (end[2] - start[2]) * 111_320.0 * math.cos(math.radians(start[1]))
+    return math.hypot(lat_m, lon_m)
+
+
+@dataclass
+class EgoMotion:
+    """イベント区間の自車速度と旋回の速さを引く（段階6が使う）。
+
+    ``tracks`` は動画stemごとの GPS 測位列（動画内秒）、``lidar`` は点群から
+    推定した自車速度（PCAP相対秒）。GPSを優先し、無ければ LiDAR 側を使う。
+    旋回は緯度経度からしか求まらないので GPS のみ。
+    """
+
+    tracks: dict[str, list[tuple[float, float, float, float]]] = field(default_factory=dict)
+    lidar: list[tuple[float, float]] = field(default_factory=list)
+    offset: float = 0.0
+    sources: list[str] = field(default_factory=list)
+
+    def available(self) -> bool:
+        return bool(self.tracks or self.lidar)
+
+    def _gps_window(self, event: dict, margin: float) -> list[tuple]:
+        """イベント区間（前後 ``margin`` 秒）に入る GPS 測位を返す。
+
+        GPS の時刻は動画1本ごとの経過秒なので、``source_video`` と動画内時刻
+        （``local_t_start_s``）の両方が揃っている候補にだけ使える。片方でも欠けて
+        いる古いCSVでは空を返し、呼び出し側は LiDAR 側の時系列へ回す。0秒として
+        扱うと、走り出す前の停止区間を見て「停止中」と誤判定してしまう。
+        """
+        stem = Path(str(event.get("source_video") or "")).stem
+        rows = self.tracks.get(stem)
+        if not rows:
+            return []
+        if not str(event.get("local_t_start_s") or "").strip():
+            return []
+        if not str(event.get("local_t_end_s") or "").strip():
+            return []
+        start = _event_seconds(event, "local_t_start_s") - margin
+        end = _event_seconds(event, "local_t_end_s") + margin
+        return [row for row in rows if start <= row[0] <= end]
+
+    def speed(self, event: dict,
+              margin: float = EGO_WINDOW_MARGIN) -> tuple[float | None, str]:
+        """イベント区間の自車速度の中央値と、その出どころを返す。
+
+        瞬間値ではなく中央値を使う。停止からの発進や停止直前が区間に混ざっても、
+        「その区間ずっと止まっていた」ものだけが停止と判定される。
+        """
+        rows = self._gps_window(event, margin)
+        if rows:
+            return float(statistics.median(row[3] for row in rows)), "GPS"
+        if self.lidar:
+            start = _event_seconds(event, "t_start_s") + self.offset - margin
+            end = _event_seconds(event, "t_end_s") + self.offset + margin
+            speeds = [speed for seconds, speed in self.lidar if start <= seconds <= end]
+            if speeds:
+                return float(statistics.median(speeds)), "LiDAR自車速度"
+        return None, ""
+
+    def yaw_rate(self, event: dict, margin: float = EGO_WINDOW_MARGIN) -> float | None:
+        """イベント区間で最も速い旋回（度/秒）。求められなければ ``None``。
+
+        測位点をそのまま繋ぐと 0.5m 刻みの位置誤差で方位が荒れるので、
+        ``EGO_HEADING_BASELINE`` 以上進むごとに方位を1つ測る。停止付近の方位は
+        意味を持たないため ``EGO_MIN_SPEED_FOR_HEADING`` 未満の測位は使わない。
+        """
+        rows = [row for row in self._gps_window(event, margin)
+                if row[3] >= EGO_MIN_SPEED_FOR_HEADING]
+        bearings: list[tuple[float, float]] = []
+        anchor = None
+        for row in rows:
+            if anchor is None:
+                anchor = row
+                continue
+            if _distance_m(anchor, row) >= EGO_HEADING_BASELINE:
+                bearings.append((row[0], _bearing_deg(anchor, row)))
+                anchor = row
+        if len(bearings) < 2:
+            return None
+        fastest = 0.0
+        for (start, first), (end, second) in zip(bearings, bearings[1:]):
+            span = end - start
+            if span <= 0:
+                continue
+            turn = abs((second - first + 540.0) % 360.0 - 180.0)
+            fastest = max(fastest, turn / span)
+        return fastest
+
+
+def load_ego_motion(config: PipelineConfig, offset: float) -> EgoMotion:
+    """段階2のGPSと段階3.5の自車速度から ``EgoMotion`` を組み立てる。
+
+    どちらも出力フォルダに残っている既存の成果物なので、追加の計算はしない。
+    ``--skip-gps`` と ``--skip-sync-check`` を両方指定した場合は空になり、
+    段階6の自車運動による足切りは自動で省かれる。
+    """
+    motion = EgoMotion(offset=float(offset))
+    gps_root = config.out_dir / "gps"
+    if gps_root.is_dir():
+        for book in sorted(gps_root.glob("*/telemetry_gps.xlsx")):
+            track = read_gps_track(book)
+            if track:
+                motion.tracks[book.parent.name] = track
+    if motion.tracks:
+        motion.sources.append("GPS")
+    series = read_lidar_speed(config.out_dir / "sync_series.npz")
+    if series:
+        motion.lidar = series
+        motion.sources.append("LiDAR自車速度")
+    return motion
+
+
 # ── 段階6: 自動レビュー ───────────────────────────────────────────────────────
 
 def _analysis_metric(analysis: dict | None, key: str) -> float | None:
@@ -1745,9 +2002,21 @@ def _analysis_lc(analysis: dict | None) -> float | None:
     return _analysis_metric(analysis, "lc")
 
 
+def _analysis_fallbacks(analysis: dict | None) -> list[str]:
+    """edit 解析の警告のうち、フェーズを代用したものだけを返す。
+
+    ``edit_csv.classify_phases`` はフェーズ2・4が見つからないとき前後の有効点で
+    代用する。代用が入った解析は距離p2（＝TTCの分子）や距離p3が実測ではなく、
+    値をそのまま最終Excelへ載せられない。
+    """
+    warnings = ((analysis or {}).get("metrics") or {}).get("warnings") or []
+    return [str(note) for note in warnings if "代用" in str(note)]
+
+
 def auto_review_events(events: list[dict], config: PipelineConfig,
                        tracking: dict[str, dict] | None = None,
-                       analyses: dict[str, dict] | None = None) -> list[dict]:
+                       analyses: dict[str, dict] | None = None,
+                       ego: "EgoMotion | None" = None) -> list[dict]:
     """LiDAR の追跡結果を突き合わせて候補の採用・除外を自動判定する。
 
     動画だけでは誤検知と本物を切り分けられないが、点群まで通せば次を機械的に
@@ -1755,9 +2024,19 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
 
     * LiDAR 発の行（``lidar_extra``、動画側に候補が無い車） → 常に「未確認」
     * LiDAR で対応する車両が見つからない → 「除外」（誤検知か同期ずれ）
+    * 自転車が停止中（自車速度 < ``config.stop_speed``） → 「除外」
     * 離隔距離 LC が ``config.max_lane_clearance`` を超える → 「除外」（隣車線の通過）
+    * 離隔距離 LC が ``config.review_lane_clearance`` を超える → 「未確認」
+    * フェーズ3→4で車が前進していない → 「未確認」
+    * 通過区間を抜けきれていない（距離p3 < ``MIN_PASS_PROGRESS``） → 「未確認」
+    * フェーズ2・4を代用している → 「未確認」（距離p2・TTCが実測でない）
+    * 自転車が低速（< ``EGO_SLOW_SPEED``）または旋回中
+      （> ``config.turn_yaw_rate``） → 「未確認」
     * 追跡の確信度が ``MIN_TRACK_CONFIDENCE`` 未満 → 「未確認」（人手で確認する）
     * それ以外 → 「採用」
+
+    自車運動（停止・低速・旋回）の判定には ``ego`` を渡す。``None`` の場合や
+    ``--no-ego-gate`` の場合、GPSも自車速度も無い場合はその3つを飛ばす。
 
     危険感(``danger_level``)は全自動実行では付けない（"0" のまま＝最終Excelでは空欄）。
     ``events`` は ``web_gui.read_events_csv`` の返す行の一覧で、戻り値は
@@ -1765,6 +2044,7 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
     """
     tracking = tracking or {}
     analyses = analyses or {}
+    use_ego = bool(config.ego_gate and ego is not None and ego.available())
     for event in events:
         event_id = str(event.get("event_id", ""))
         track = tracking.get(event_id) or {}
@@ -1780,6 +2060,22 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
             event["review_status"] = "除外"
             event["review_reason"] = track.get("reason") or "LiDARで対応する車両が見つかりません"
             continue
+        # 自転車が停止している間の「追い越し」は、信号待ちの横を車が流れていく状況で
+        # あって解析対象の追い越しではない。静止物が自車速度で後退する前提も崩れ、
+        # 前進方向の符号すら決められない（lidar_autotrack.estimate_forward_sign）ので、
+        # 追跡結果と下流の計算はどちらも成り立たない。LC より先に見るのは、停止中で
+        # あることのほうが理由として具体的で人が確認しやすいため。
+        ego_speed, ego_source = (None, "")
+        if use_ego:
+            ego_speed, ego_source = ego.speed(event)
+        if ego_speed is not None and ego_speed < config.stop_speed:
+            event["review_status"] = "除外"
+            event["review_reason"] = (
+                f"自転車が停止中です（自車速度 {ego_speed:.2f} m/s・{ego_source}）。"
+                "静止物が後退する前提が崩れており、通過時間・相対速度・TTCが"
+                "成り立ちません"
+            )
+            continue
         # 実測の LC（edit 解析）を優先し、無ければ追跡時の目安値で判定する
         lc = _analysis_lc(analyses.get(event_id))
         if lc is None:
@@ -1789,6 +2085,15 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
             event["review_status"] = "除外"
             event["review_reason"] = (
                 f"離隔距離 {lc:.2f}m が {limit}m を超えます（隣車線の通過）"
+            )
+            continue
+        # 隣車線と言い切れないが同一車線とも言い切れない離隔距離。実測LCは申告値より
+        # 広く出ることがあるので除外はせず、人が点群を見て決められるよう残す。
+        if isinstance(lc, (int, float)) and lc > config.review_lane_clearance:
+            event["review_status"] = "未確認"
+            event["review_reason"] = (
+                f"離隔距離 {lc:.2f}m が同一車線の目安 {config.review_lane_clearance}m を"
+                "超えます。隣車線の車を掴んでいる可能性があるため目視確認が必要です"
             )
             continue
         # フェーズ3→4で車が前進していない解析は成り立たない。通過区間の途中で追跡が
@@ -1802,6 +2107,42 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
                 f"フェーズ3→4で車が前進していません（相対速度 {speed:.1f} km/h）。"
                 "通過区間を抜けるまで追えておらず、通過時間・距離p3・TTCが"
                 "成り立たないため目視確認が必要です"
+            )
+            continue
+        # 通過区間（|Y| < 3m）を端から端まで抜ければ距離p3は 6m 前後になる。
+        # 途中で追跡が切れると通過時間が短く出て、相対速度・TTCがまとめて狂う。
+        progress = _analysis_metric(analyses.get(event_id), "distance_p3")
+        if progress is not None and progress < MIN_PASS_PROGRESS:
+            event["review_status"] = "未確認"
+            event["review_reason"] = (
+                f"通過区間を抜けきれていません（距離p3 {progress:.2f}m < "
+                f"{MIN_PASS_PROGRESS}m）。追跡が途中で切れており、通過時間・"
+                "相対速度・TTCが短く出るため目視確認が必要です"
+            )
+            continue
+        fallbacks = _analysis_fallbacks(analyses.get(event_id))
+        if fallbacks:
+            event["review_status"] = "未確認"
+            event["review_reason"] = (
+                f"フェーズを代用しています（{fallbacks[0]}）。距離p2・TTCが"
+                "実測ではないため目視確認が必要です"
+            )
+            continue
+        if ego_speed is not None and ego_speed < EGO_SLOW_SPEED:
+            event["review_status"] = "未確認"
+            event["review_reason"] = (
+                f"自転車が低速です（自車速度 {ego_speed:.2f} m/s・{ego_source}）。"
+                "発進直後や停止直前は追い越しの前提が崩れるため目視確認が必要です"
+            )
+            continue
+        # 曲がり角ではセンサのヨーで静止物が横へ流れ、追い越し車と見分けがつかない。
+        # 自車運動補正をしていないので、旋回中の追跡結果は採用せず人手へ回す。
+        yaw_rate = ego.yaw_rate(event) if use_ego else None
+        if yaw_rate is not None and yaw_rate > config.turn_yaw_rate:
+            event["review_status"] = "未確認"
+            event["review_reason"] = (
+                f"自転車が旋回中です（{yaw_rate:.0f} 度/秒 > {config.turn_yaw_rate:g} 度/秒）。"
+                "静止物が横へ流れて追い越し車と紛れるため目視確認が必要です"
             )
             continue
         confidence = float(track.get("confidence") or 0.0)
@@ -1820,7 +2161,15 @@ def run_review(config: PipelineConfig, events: list[dict], tracking: dict[str, d
     changes = refine_vehicle_classes(events, tracking)
     if changes:
         report.info["点群の寸法で直した車種"] = len(changes)
-    reviewed = auto_review_events(events, config, tracking, analyses)
+    ego = load_ego_motion(config, offset) if config.ego_gate else EgoMotion()
+    if config.ego_gate:
+        if ego.available():
+            report.info["自車運動の判定に使った時系列"] = " / ".join(ego.sources)
+        else:
+            report.warn(
+                "GPSも自車速度の時系列も無いため、停止中・旋回中の候補を落とせません"
+            )
+    reviewed = auto_review_events(events, config, tracking, analyses, ego)
     counts = {status: [e for e in reviewed if e.get("review_status") == status]
               for status in ("採用", "未確認", "除外")}
     path = save_reviewed_events(config.out_dir, reviewed, offset, allow_empty=True)
@@ -2004,6 +2353,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-lane-clearance", type=float, default=MAX_LANE_CLEARANCE,
                         help="自動レビューで隣車線の通過として除外する離隔距離(m)"
                              f"（既定: {MAX_LANE_CLEARANCE}）")
+    parser.add_argument("--review-lane-clearance", type=float, default=REVIEW_LANE_CLEARANCE,
+                        help="これを超える離隔距離の候補を「未確認」にする(m)"
+                             f"（既定: {REVIEW_LANE_CLEARANCE}。隣車線の車を掴んだ疑い）")
+    parser.add_argument("--no-ego-gate", dest="ego_gate", action="store_false",
+                        default=True,
+                        help="自車運動（停止・旋回）による足切りを行わない"
+                             "（既定は行う。GPSもLiDAR自車速度も無ければ自動で省略）")
+    parser.add_argument("--stop-speed", type=float, default=EGO_STOP_SPEED,
+                        help="これ未満の自車速度は停止中とみなして除外する(m/s)"
+                             f"（既定: {EGO_STOP_SPEED}）")
+    parser.add_argument("--turn-yaw-rate", type=float, default=EGO_TURN_YAW_RATE,
+                        help="これを超える旋回中の候補を「未確認」へ回す(度/秒)"
+                             f"（既定: {EGO_TURN_YAW_RATE:g}）")
     parser.add_argument("--skip-sync-check", dest="sync_check", action="store_false",
                         default=True,
                         help="段階3.5の時刻同期の自己検証を行わない"
