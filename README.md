@@ -125,6 +125,26 @@ GUIのStep1〜6を人が順に操作する代わりに使う。
 .venv\Scripts\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect   # 検出済みの続きから
 ```
 
+### 実行ファイル (全自動実行.bat)
+
+コマンドを打たずに同じ処理を起動する実行ファイル。`起動.bat` (GUI用) と対になる。
+
+- **ドラッグ＆ドロップ**: セッションフォルダを `全自動実行.bat` へ落とす
+- **ダブルクリック**: セッションフォルダのパスを聞いてくる (ウィンドウへフォルダを
+  ドロップして貼り付けてもよい)
+- **コマンドライン**:
+
+```powershell
+.\全自動実行.bat E:\データ\260701\ID1
+.\全自動実行.bat E:\データ\260701\ID1 --view rear --organize-id 1
+.\全自動実行.bat E:\データ\260701\ID1 --no-setup   # 環境の確認・準備を省略する
+```
+
+フォルダ以外の引数はそのまま `run_pipeline.py` へ渡す。`起動.bat` と同じく初回は
+`portable\python`・`yolov8n.pt`・`tools\ffmpeg.exe` を自動準備し (`--no-setup` で省略)、
+`portable\python` が使えない場合は `.venv\Scripts\python.exe` を使う。GitHubの更新確認は
+行わない。完了後に `report.html` を開くか聞いてくる。
+
 ### 入力フォルダの規約
 
 ```text
