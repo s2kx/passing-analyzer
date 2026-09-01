@@ -63,7 +63,7 @@ GitHub から取得した作業フォルダでは、起動時に更新確認も�
 git config --global --add safe.directory "E:/松本研究室/programming/LiDAR解析ソフト"
 ```
 
-PC依存の値（GUIの前回設定 `gui_settings.json`、`portable\python`、解析出力）はすべて
+PC依存の値（GUIの前回設定 `gui_settings.json` / `auto_gui_settings.json`、`portable\python`、解析出力）はすべて
 `.gitignore` 済みなので、SSDを挿し替えても衝突しない。`起動.bat` と `全自動実行.bat` は
 自分の場所（`%~dp0`）を基準に動くので、置き場所を変えても書き換え不要。
 
@@ -168,6 +168,35 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 `portable\python` が使えない場合は `.venv\Scripts\python.exe` を使う。GitHubの更新確認は
 行わない。完了後に `report.html` を開くか聞いてくる。
 
+### 専用GUI (全自動実行GUI.bat / auto_gui.py)
+
+全自動実行を画面から操作する専用GUI。従来のワークフローGUI（`起動.bat` / `web_gui.py`）
+とは**独立したアプリ**で、`全自動実行GUI.bat` のダブルクリックで起動する
+（画面は `web_ui_auto/`、前回の入力は `auto_gui_settings.json` に保存）。
+
+画面は2つ。
+
+1. **実行**: セッションフォルダを選び、必要なら撮影方向（既定は自動判定）・検出の扱い
+   （通常／スキップ／やり直す）・整理ID・被験者・収集日・**道路の車線数**・時刻オフセット・
+   追加オプション（`--skip-sync-check` など空白区切り）を指定して開始する。車線数は
+   `--lane-count` として渡り、全候補の「車線数」列の既定値になる（確認画面で候補ごとに
+   直せる）。段階の完了ごとに進捗バーと段階一覧が更新され（`PipelineReport.stage` が出す
+   `[stage]` 行を解析。検出中はYOLOのフレーム進捗も反映）、「中止」で検出の孫プロセスごと
+   止められる（taskkill /T）。実行済みの出力フォルダを開いて確認画面だけ使うこともできる
+2. **確認・修正**: 完了すると自動で切り替わる。追い越しデータ（reviewed CSV の候補）を
+   1件ずつクリップで確認し、採否（採用/除外/未確認。`A`/`D`/`W`、`←`/`→` で移動）と
+   車種を手動修正できる。加えて**危険感**（1〜3）と**道路の車線数**を候補ごとに入力する。
+   プレビューの「点群ビュー」タブでは、その候補の切り抜き点群を上面図（X-Y）と側面図
+   （Y-Z）で表示する（report.html のビューアと同じ表示。フレームスライダーと再生、
+   Intensity/高さZ の色切り替え、自転車=原点・通過区間 |Y|<3m・離隔距離LC・フェーズ点の
+   補助線。データは `out/lidar/overtaking_*.csv` から読むため `--no-report` でも使える。
+   `Space` は表示中のタブの再生/停止に効く）。
+   「修正をCSVへ保存」で `reviewed_overtaking_events.csv` へ書き戻し、
+   「最終Excelを再生成」で保存と最終Excel（末尾に「車線数」列。整理ID等は
+   実行レポートから引き継ぐ）までを通す。自動レビューの理由・警告・人手項目も画面に出る。
+   既定では「未確認」の条件はすべて除外されるため確認対象は採用行のみ。未確認を残して
+   GUIで採否を決めたい場合は、実行画面の追加オプションに `--keep-unconfirmed` を付ける
+
 ### 入力フォルダの規約
 
 ```text
@@ -192,6 +221,7 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 | `--subject` | セッションフォルダ名 | 被験者名またはID |
 | `--date` | セッションの親フォルダ名 | データ収集日 (`YYMMDD` / `YYYY-MM-DD`) |
 | `--organize-id` | (空) | 整理ID。空なら候補IDを使う |
+| `--lane-count` | (空) | 道路の車線数。全候補の「車線数」列（reviewed CSVと最終Excel）の既定値。`metadata.json` の `lane_count` でも指定できる |
 | `--videos` / `--pcap` | (自動発見) | 入力を明示指定する |
 | `--skip-detect` | off | 段階1のYOLO検出を行わない (既存CSVを使う) |
 | `--redetect` | off | 既存CSVがあっても検出をやり直す |
@@ -205,6 +235,7 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 | `--no-ego-gate` | off | 自車運動（停止・低速・旋回）による足切りを行わない |
 | `--stop-speed` | `1.0` | これ未満の自車速度は停止中とみなして除外する(m/s) |
 | `--turn-yaw-rate` | `20` | これを超える旋回中の候補を「未確認」にする(度/秒) |
+| `--keep-unconfirmed` | off | 自動レビューの「未確認」を従来どおりレビューCSVへ残す。既定は未確認の条件をすべて「除外」にする |
 | `--no-lidar-extra` | off | 動画側に候補の無い車を `L###` の「未確認」行として起票しない |
 | `--no-report` | off | 段階7bの閲覧用HTMLレポート (`out\report.html`) を作らない |
 
@@ -291,12 +322,18 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 レポートの人手項目に挙げ、あわせて `L001` … の候補IDで起票する。その車が見つかった
 追跡窓を通過時刻つきで走査し直し、`out/lidar/overtaking_L001.csv` → edit CSV →
 レビューCSVの `review_status="未確認"` の行、まで通す。最終Excelは採用行だけなので、
-人がクリップと点群を確認して採用に変えるまでは出力に混ざらない。起票が邪魔なときは
+人がクリップと点群を確認して採用に変えるまでは出力に混ざらない。既定では自動レビューが
+未確認をすべて除外へ落とすため、`L###` 行をレビューCSVへ残すには `--keep-unconfirmed`
+が必要（点群CSV・edit CSVとレポートの人手項目は既定でも残る）。起票が邪魔なときは
 `--no-lidar-extra` を付ける(前回実行の `L###` 出力も消える)。
 
 ### 自動レビューの判定
 
-上から順に見て、最初に当てはまった判定になる。
+上から順に見て、最初に当てはまった判定になる。表の「未確認」は条件の分類で、
+**既定ではこれらもすべて「除外」（不採用）へ落とし、人手確認を挟まない**。
+どの条件で落ちたかは `review_reason` とレポートの `reasons` に残る。従来どおり
+「未確認」としてレビューCSVへ残し、人がGUIで採否を決めたい場合は
+`--keep-unconfirmed` を付ける。
 
 | 条件 | 判定 |
 |------|------|
@@ -315,7 +352,8 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 
 離隔距離は edit 解析の実測値を優先し、求まらない場合だけ追跡時の目安値を使う。
 `reviewed_overtaking_events.csv` には除外以外(採用・未確認)を出力し、最終Excelには
-採用だけが並ぶ。
+採用だけが並ぶ。既定では未確認が発生しない（すべて除外へ落ちる）ため、レビューCSVは
+採用のみになる。`--keep-unconfirmed` を付けたときだけ未確認の行が残る。
 
 #### 自車運動（停止・低速・旋回）の判定
 
@@ -345,6 +383,9 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 
 正解12件のうち1件(608.6s)は、同一車線の車ではなく隣車線の車を掴んでいたため未確認へ
 回る。採用行に混ぜると離隔距離が 1.02m → 3.1m と誤るので、人が点群を見て直す。
+
+> この計測は未確認を残す従来動作（現在の `--keep-unconfirmed` 相当）でのもの。
+> 現在の既定では未確認の12件も除外になり、採用の11件だけが残る。
 
 ### 車種の決め直し
 
@@ -474,6 +515,12 @@ TTC・車種・レビュー理由が出る。既存の出力フォルダから�
 危険感は被験者の申告値なので全自動実行では**空欄**にする。最終Excelの「危険感」列は
 レビューで 1〜3 を明示した場合だけ「やや危険 / 危険 / 非常に危険」になり、未設定なら空欄。
 セルには従来どおり入力候補のリストが付いているので、後から人が選択して埋める。
+専用GUI（`全自動実行GUI.bat`）の確認画面で候補ごとに入力してから再生成してもよい。
+
+最終Excelの末尾には**「車線数」列**（S列）がある。道路の車線数は自動では求まらないため、
+`--lane-count`（専用GUIの実行画面の「道路の車線数」）で全候補の既定値を先に入れるか、
+専用GUIの確認画面で候補ごとに入力して「最終Excelを再生成」すると埋まる
+（reviewed CSV の `lane_count` 列から転記。既存列の位置・入力規則は変えていない）。
 
 ## 主なオプション
 
@@ -610,6 +657,7 @@ GoProの向き・画角で変わるため既定では無効になっている。
 ```powershell
 .\portable\python\python.exe test_logic.py
 .\portable\python\python.exe web_gui.py --check
+.\portable\python\python.exe auto_gui.py --check
 .\portable\python\python.exe test_pipeline.py
 .\portable\python\python.exe test_autotrack.py
 .\portable\python\python.exe test_detect_view.py
@@ -618,6 +666,8 @@ GoProの向き・画角で変わるため既定では無効になっている。
 
 - `test_logic.py` … 判定ロジック(`classify_overtaking`)を YOLO/動画なしの合成軌跡で検証する
 - `web_gui.py --check` … GUI画面・PCAP読み込み・edit CSV・最終Excel生成を検証する
+- `auto_gui.py --check` … 全自動実行の専用GUIを検証する（コマンド組み立て・`[stage]` 行の
+  解析・疑似コマンドでの実行・確認画面の保存で危険感/車線数がCSVと最終Excelへ残ること）
 - `test_pipeline.py` … `run_pipeline.py` の段階0〜8を、合成PCAPと一時フォルダで検証する
   (YOLO検出と撮影方向の自動判定はスタブ化する)。イベント↔車両の割り当てと自動レビューもここで確認する
 - `test_autotrack.py` … 点群追跡(`lidar_autotrack`)を、numpyで合成した点群

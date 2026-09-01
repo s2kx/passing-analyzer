@@ -1055,9 +1055,11 @@ class AppApi:
 class UiServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, api: AppApi):
+    def __init__(self, address, api, ui_dir: Path = UI_DIR):
         super().__init__(address, UiHandler)
         self.api = api
+        # 配信するUIフォルダ。auto_gui.py が web_ui_auto を配るために差し替える
+        self.ui_dir = Path(ui_dir)
 
 
 class UiHandler(BaseHTTPRequestHandler):
@@ -1073,9 +1075,10 @@ class UiHandler(BaseHTTPRequestHandler):
             self._serve_media(path.removeprefix("/media/"))
             return
         relative = "index.html" if path in {"", "/"} else path.lstrip("/")
-        target = (UI_DIR / relative).resolve()
+        ui_dir = self.server.ui_dir
+        target = (ui_dir / relative).resolve()
         try:
-            target.relative_to(UI_DIR.resolve())
+            target.relative_to(ui_dir.resolve())
         except ValueError:
             self.send_error(HTTPStatus.FORBIDDEN)
             return
@@ -1123,8 +1126,8 @@ class UiHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
 
-def start_server(api: AppApi, port: int = 0) -> tuple[UiServer, str]:
-    server = UiServer(("127.0.0.1", port), api)
+def start_server(api, port: int = 0, ui_dir: Path = UI_DIR) -> tuple[UiServer, str]:
+    server = UiServer(("127.0.0.1", port), api, ui_dir)
     base_url = f"http://127.0.0.1:{server.server_port}"
     api._base_url = base_url
     threading.Thread(target=server.serve_forever, daemon=True).start()

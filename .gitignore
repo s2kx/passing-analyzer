@@ -23,6 +23,7 @@ __pycache__/
 
 # GUIが前回の設定を保存するファイル (パスがPC依存になるため)
 gui_settings.json
+auto_gui_settings.json
 
 # Ultralytics キャッシュ
 .ultralytics/

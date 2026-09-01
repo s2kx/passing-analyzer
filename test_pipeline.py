@@ -292,7 +292,8 @@ def test_pipeline_end_to_end():
         write_events_csv(out_dir, "001,普通,car,right,0.5,2.5,4.5,4.0,0.1,0,GX010001.MP4,0.5,4.5\n")
 
         calls: list = []
-        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--lane-count", "2"]))
         report = execute_pipeline(config, tracker=dummy_tracker(calls))
         data = report.to_dict()
         status = {stage["name"]: stage["status"] for stage in data["stages"]}
@@ -313,6 +314,8 @@ def test_pipeline_end_to_end():
             reviewed = list(csv.DictReader(stream))
         assert len(reviewed) == 1 and reviewed[0]["review_status"] == "採用", reviewed
         assert reviewed[0]["danger_level"] == "0", reviewed
+        # --lane-count の指定値が全候補の「車線数」の既定になる
+        assert reviewed[0]["lane_count"] == "2", reviewed
         assert reviewed[0]["veloview_t_start"] == "00:00:00.500", reviewed
 
         # 段階4: 撮影方向別マージンを足したフレーム範囲でダミー追跡を呼び、点群CSVを書く
@@ -582,9 +585,13 @@ def test_duplicate_vehicle_output_is_blocked():
 
 
 def test_auto_review_classifies_by_lidar_result():
-    """自動レビューが LiDAR の結果で採用・未確認・除外を振り分ける。"""
+    """自動レビューが LiDAR の結果で採用・未確認・除外を振り分ける。
+
+    既定では「未確認」の条件もすべて不採用（除外）にするため、「未確認」が
+    そのまま残るのは ``--keep-unconfirmed`` を付けたときだけ。
+    """
     config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
-                            pcap_path=Path("."), view="front")
+                            pcap_path=Path("."), view="front", keep_unconfirmed=True)
     events = [{"event_id": str(index)} for index in range(1, 6)]
     tracking = {
         "1": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2},
@@ -607,7 +614,21 @@ def test_auto_review_classifies_by_lidar_result():
     # 実測LC（edit解析）は追跡時の目安より優先する
     assert "3.90m" in reviewed[4]["review_reason"], reviewed[4]
     assert all(row["danger_level"] == "0" for row in reviewed), reviewed
-    print("  OK: LiDAR結果で採用・未確認・除外を判定（実測LC優先）")
+
+    # 既定（keep_unconfirmed=False）では「未確認」の条件もすべて除外になる。
+    # 条件の理由は review_reason に残るので、内訳はレポートで追える。
+    defaults = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
+                              pcap_path=Path("."), view="front")
+    assert defaults.keep_unconfirmed is False, defaults
+    events = [{"event_id": str(index)} for index in range(1, 6)]
+    rejected = run_pipeline.auto_review_events(events, defaults, tracking, analyses)
+    assert [row["review_status"] for row in rejected] == [
+        "採用", "除外", "除外", "除外", "除外"
+    ], rejected
+    assert "確信度" in rejected[3]["review_reason"], rejected[3]
+    assert parse_args(["s"]).keep_unconfirmed is False
+    assert parse_args(["s", "--keep-unconfirmed"]).keep_unconfirmed is True
+    print("  OK: LiDAR結果で採用・除外を判定（未確認の条件は既定で除外）")
 
 
 def stub_sync_checker(estimated: float, peak: float = 0.9, prominence: float = 0.4,
@@ -757,10 +778,11 @@ def test_non_advancing_analysis_is_flagged_for_review():
 
     通過区間を抜けるまで追えず、代用のフェーズ4が後方の点になると距離p3・
     相対速度・TTC がすべて負になる。最終Excelへ「TTC が負の行」を入れないよう
-    「未確認」にする（実データ260701/ID1の281.9s、ID3の869.1sがこの型）。
+    「未確認」にする（実データ260701/ID1の281.9s、ID3の869.1sがこの型。
+    既定では未確認→除外に落ちるため --keep-unconfirmed 相当の設定で条件を見る）。
     """
     config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
-                            pcap_path=Path("."), view="front")
+                            pcap_path=Path("."), view="front", keep_unconfirmed=True)
     events = [{"event_id": "1"}, {"event_id": "2"}]
     tracking = {"1": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2},
                 "2": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
@@ -912,7 +934,8 @@ def test_lidar_only_vehicle_is_issued_as_an_unreviewed_row():
 
         cars = [car("f10x+1.8", 1.0), car("f40x+2.0", 4.0),
                 car("f25x+1.9", 2.5, lc_estimate=1.0, score=0.95)]   # 候補の無い車
-        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--keep-unconfirmed"]))
         assert config.lidar_extra is True, config
         report = execute_pipeline(config, tracker=scripted_tracker(cars))
         data = report.to_dict()
@@ -1007,7 +1030,8 @@ def test_low_confidence_track_is_flagged_for_review():
         write_events_csv(out_dir, event_row("001", 0.5, 1.0, 1.5))
 
         cars = [car("f10x+1.8", 1.0, lc_estimate=1.1, confidence=0.35)]
-        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps"]))
+        config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
+                                          "--keep-unconfirmed"]))
         report = execute_pipeline(config, tracker=scripted_tracker(cars))
         data = report.to_dict()
 
@@ -1470,7 +1494,7 @@ def test_turning_ride_is_flagged_for_review():
             rows.append((elapsed, latitude, longitude, 5.0))
         gps_workbook(out_dir / "gps" / "GX010001" / "telemetry_gps.xlsx", rows)
         config = PipelineConfig(session_dir=Path("."), out_dir=out_dir, videos=[],
-                                pcap_path=Path("."), view="front")
+                                pcap_path=Path("."), view="front", keep_unconfirmed=True)
         ego = run_pipeline.load_ego_motion(config, 0.0)
         events = [{"event_id": "001", "source_video": "GX010001.MP4",
                    "t_start_s": 2.0, "t_end_s": 6.0,
@@ -1491,10 +1515,10 @@ def test_adjacent_lane_suspicion_is_flagged_for_review():
 
     260701/ID1 を正解12件と突き合わせると、正しく追えた11件の実測LCは 1.89m 以下、
     正解に対応しない（隣車線の車を掴んだ）7件は 3.10m 以上だった。除外はせず、
-    人が点群を見て決められるよう残す。
+    人が点群を見て決められるよう残す（--keep-unconfirmed 相当の設定）。
     """
     config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
-                            pcap_path=Path("."), view="front")
+                            pcap_path=Path("."), view="front", keep_unconfirmed=True)
     events = [{"event_id": "1"}, {"event_id": "2"}, {"event_id": "3"}]
     tracking = {key: {"ok": True, "confidence": 0.9, "lc_estimate": 1.0}
                 for key in ("1", "2", "3")}
@@ -1514,10 +1538,11 @@ def test_truncated_pass_is_flagged_for_review():
     """通過区間を抜けきれていない解析（距離p3が短い）は「未確認」にする。
 
     追跡が通過区間の途中で切れると通過時間が短く出て、相対速度・TTCがまとめて
-    狂う。実データ260701/ID1の 389.8s が距離p3 2.51m でこの型（採用行は 5.27m 以上）。
+    狂う。実データ260701/ID1の 389.8s が距離p3 2.51m でこの型（採用行は 5.27m 以上。
+    --keep-unconfirmed 相当の設定で条件を見る）。
     """
     config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
-                            pcap_path=Path("."), view="front")
+                            pcap_path=Path("."), view="front", keep_unconfirmed=True)
     events = [{"event_id": "1"}, {"event_id": "2"}, {"event_id": "3"}]
     tracking = {key: {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}
                 for key in ("1", "2", "3")}

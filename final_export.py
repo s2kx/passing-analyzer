@@ -13,12 +13,14 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from edit_csv import EditPoint, analyze_edit_points, read_edit_points
 
 
+# 「車種」までは共有フォーマットの従来列。「車線数」は末尾へ追加した列で、
+# 既存列の位置（G列=危険感、R列=車種 の入力規則）を動かさないため最後に置く。
 FINAL_HEADERS = [
     "整理ID", "データ収集日", "被験者名またはID", "離隔距離（ｍ）",
     "自転車速度（km/h)", "自動車速度（km/h)", "危険感",
     "通過時間", "距離p2", "距離p3", "相対速度", "TTC",
     "動画ファイル名", "動画のタイムスタンプ", "LiDARデータファイル名",
-    "日本時間", "LiDARのタイムスタンプ", "車種",
+    "日本時間", "LiDARのタイムスタンプ", "車種", "車線数",
 ]
 VEHICLE_LIST = ["普通", "軽", "大型", "二輪"]
 DANGER_LIST = ["非常に危険", "危険", "やや危険", "なし"]
@@ -42,6 +44,12 @@ def _to_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _lane_count_value(value: object) -> object:
+    """車線数のセル値。数字ならExcelの数値、それ以外はそのまま（空欄含む）。"""
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() else text
 
 
 def _read_csv_dicts(path: Path) -> list[dict[str, str]]:
@@ -283,6 +291,7 @@ def _final_rows(
             Cell(_excel_jst_time_from_unix(lidar_timestamp if pcap_start_unix is not None else None), 3),
             Cell(_round_or_blank(lidar_timestamp, 6), 5),
             Cell(event.get("class", ""), 0),
+            Cell(_lane_count_value(event.get("lane_count")), 0),
         ]
         rows.append(row)
 
@@ -327,6 +336,7 @@ def _sheet_xml(rows: list[list[Cell]]) -> str:
         '<col min="7" max="12" width="14" customWidth="1"/>'
         '<col min="13" max="15" width="22" customWidth="1"/>'
         '<col min="16" max="18" width="17" customWidth="1"/>'
+        '<col min="19" max="19" width="10" customWidth="1"/>'
         '</cols>'
     )
     row_xml = []

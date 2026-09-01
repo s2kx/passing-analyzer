@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>全自動実行 - 自転車追い越し解析</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">MATSUMOTO LAB · AUTO PIPELINE</p>
+      <h1>全自動実行（検出〜最終Excel）</h1>
+    </div>
+    <div class="status-pill" id="globalStatus"><span></span>準備完了</div>
+  </header>
+
+  <main class="app-shell">
+    <nav class="steps" aria-label="画面切り替え">
+      <button class="step active" data-step="run"><b>1</b><span>実行<small>run_pipeline</small></span></button>
+      <button class="step" data-step="confirm"><b>2</b><span>確認・修正<small>危険感 / 車線数</small></span></button>
+    </nav>
+
+    <section class="panel active" id="panel-run">
+      <div class="section-heading">
+        <div><span class="section-number">01</span><h2>セッションを一括解析</h2></div>
+        <p>撮影セッションフォルダ（GOPRO/ と LiDAR/）を指定すると、検出・GPS同期・点群追跡・自動レビュー・最終Excel・閲覧レポートまでを一括実行します。完了すると確認画面へ自動で切り替わります。</p>
+      </div>
+      <div class="grid two-column">
+        <article class="card form-card">
+          <label>セッションフォルダ（GOPRO/ と LiDAR/ を含む）</label>
+          <div class="path-input"><input id="sessionPath" readonly><button data-pick="session">選択</button></div>
+          <label>出力フォルダ（空欄ならセッション内 out_auto）</label>
+          <div class="path-input"><input id="outPath" readonly><button data-pick="out">選択</button></div>
+          <div class="field-row">
+            <fieldset><legend>撮影方向</legend>
+              <label class="radio"><input type="radio" name="pipelineView" value="" checked>自動判定</label>
+              <label class="radio"><input type="radio" name="pipelineView" value="front">前方</label>
+              <label class="radio"><input type="radio" name="pipelineView" value="rear">後方</label>
+            </fieldset>
+            <fieldset><legend>検出（段階1）</legend>
+              <select id="pipelineDetectMode" class="field-select" aria-label="検出の扱い">
+                <option value="">通常（既存CSVがあればスキップ）</option>
+                <option value="skip">スキップ（検出済みの続きから）</option>
+                <option value="redetect">やり直す（既存CSVを無視）</option>
+              </select>
+            </fieldset>
+          </div>
+          <div class="final-fields">
+            <label>整理ID<input id="pipelineOrganizeId" placeholder="例: 1"></label>
+            <label>データ収集日<input id="pipelineDate" placeholder="空欄=親フォルダ名"></label>
+            <label>被験者名またはID<input id="pipelineSubject" placeholder="空欄=フォルダ名"></label>
+          </div>
+          <div class="final-fields pipeline-advanced">
+            <label>道路の車線数
+              <select id="pipelineLane" class="field-select" aria-label="道路の車線数">
+                <option value="">（未入力）</option>
+                <option value="1">1車線</option>
+                <option value="2">2車線</option>
+                <option value="3">3車線</option>
+                <option value="4">4車線</option>
+                <option value="5">5車線</option>
+                <option value="6">6車線</option>
+              </select>
+            </label>
+            <label>時刻オフセット(秒)<input id="pipelineOffset" placeholder="空欄=GPS自動同期"></label>
+            <label>追加オプション（空白区切り）<input id="pipelineExtra" placeholder="例: --skip-sync-check --no-report"></label>
+          </div>
+          <p class="lane-hint">車線数は全候補の「車線数」列の既定値になります（確認画面で候補ごとに修正できます）。</p>
+          <div class="button-row">
+            <button class="primary large" id="startPipeline">全自動実行を開始</button>
+            <button class="secondary" id="cancelPipeline" disabled>中止</button>
+          </div>
+          <div class="button-row open-existing-row">
+            <button class="secondary" id="openExisting">実行済みの出力フォルダを開いて確認へ進む</button>
+          </div>
+        </article>
+        <article class="card progress-card">
+          <div class="card-title"><h3>実行状況</h3><span id="pipelineProgressLabel">0%</span></div>
+          <div class="progress-track"><div id="pipelineBar"></div></div>
+          <p id="pipelineMessage" class="process-message">セッションフォルダを選択して開始してください。</p>
+          <div class="pipeline-stages" id="pipelineStages"><p class="empty">段階の完了ごとにここへ表示されます</p></div>
+          <pre id="pipelineLog" class="log pipeline-log">待機中...</pre>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-confirm">
+      <div class="section-heading">
+        <div><span class="section-number">02</span><h2>追い越しデータの確認・修正</h2></div>
+        <p>候補ごとにクリップを確認し、採否と車種を手動修正します。危険感と道路の車線数を入力し、「修正をCSVへ保存」→「最終Excelを再生成」で反映します。</p>
+      </div>
+      <article class="card summary-card">
+        <div class="summary-row">
+          <div>
+            <strong id="summaryCounts">結果未読込</strong>
+            <span id="summaryMeta" class="summary-meta"></span>
+          </div>
+          <div class="button-row summary-actions">
+            <button class="primary" id="saveReviews">修正をCSVへ保存</button>
+            <button class="secondary" id="generateFinal">最終Excelを再生成</button>
+            <button class="secondary" id="openReport">閲覧用レポート</button>
+            <button class="secondary" id="openOutDir">出力フォルダ</button>
+          </div>
+        </div>
+        <p id="finalStatus" class="final-status-line"></p>
+      </article>
+      <div class="review-layout">
+        <article class="card preview-card">
+          <div class="stage-tabs" role="tablist">
+            <button class="stage-tab active" id="stageClip" data-stage="clip" role="tab">クリップ</button>
+            <button class="stage-tab" id="stageCloud" data-stage="cloud" role="tab">点群ビュー</button>
+          </div>
+          <div class="video-stage" id="videoStage">
+            <div class="video-placeholder" id="videoPlaceholder"><span>▶</span><p>候補を選択すると<br>クリップを再生できます</p></div>
+            <video id="clipPlayer" controls hidden></video>
+          </div>
+          <div class="cloud-stage" id="cloudStage" hidden>
+            <div id="cloudHost" class="cloud-host"><p class="cloud-empty">候補を選択すると点群を表示できます</p></div>
+          </div>
+          <div class="preview-controls">
+            <div class="preview-meta">
+              <div><span id="previewId">候補未選択</span><span class="badge" id="previewStatus">未確認</span></div>
+              <strong id="previewTime">--:--</strong>
+            </div>
+            <p class="preview-reason" id="previewReason"></p>
+            <div class="control-row">
+              <label class="speed-select"><span>速度</span><select id="speedSelect" aria-label="再生速度">
+                <option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="1.5">1.5x</option><option value="2">2x</option><option value="3">3x</option>
+              </select></label>
+              <div class="transport-buttons"><button class="secondary" id="previousClip">← 前の候補</button><button class="secondary" id="nextClip">次の候補 →</button></div>
+            </div>
+            <div class="decision-buttons">
+              <button class="accept" data-status="採用">✓ 採用 <kbd>A</kbd></button>
+              <button class="reject" data-status="除外">× 除外 <kbd>D</kbd></button>
+              <button class="secondary" data-status="未確認">未確認へ戻す <kbd>W</kbd></button>
+            </div>
+            <div class="detail-fields">
+              <label>車種
+                <select id="vehicleSelect" aria-label="車種">
+                  <option value="大型">大型</option><option value="普通">普通</option><option value="軽">軽</option>
+                </select>
+              </label>
+              <label>危険感
+                <select id="dangerSelect" aria-label="危険感">
+                  <option value="0">（未入力）</option>
+                  <option value="1">1: やや危険</option>
+                  <option value="2">2: 危険</option>
+                  <option value="3">3: 非常に危険</option>
+                </select>
+              </label>
+              <label>道路の車線数
+                <select id="laneSelect" aria-label="道路の車線数">
+                  <option value="">（未入力）</option>
+                  <option value="1">1車線</option>
+                  <option value="2">2車線</option>
+                  <option value="3">3車線</option>
+                  <option value="4">4車線</option>
+                  <option value="5">5車線</option>
+                  <option value="6">6車線</option>
+                </select>
+              </label>
+            </div>
+            <div class="shortcut-help"><span><kbd>A</kbd> 採用</span><span><kbd>D</kbd> 除外</span><span><kbd>W</kbd> 未確認</span><span><kbd>Space</kbd> 再生 / 一時停止</span><span><kbd>←</kbd><kbd>→</kbd> 候補移動</span></div>
+          </div>
+        </article>
+        <aside class="card table-card">
+          <div class="card-title"><h3>追い越しデータ</h3><div class="counter"><span id="reviewedCount">0</span> / <span id="eventCount">0</span> 確認済み</div></div>
+          <div class="table-wrap">
+            <table><thead><tr><th>ID</th><th>開始</th><th>車種</th><th>危険感</th><th>車線数</th><th>判定</th></tr></thead><tbody id="eventRows"><tr><td colspan="6" class="empty">実行画面から結果を読み込んでください</td></tr></tbody></table>
+          </div>
+          <details class="manual-details">
+            <summary>警告・人手が必要な項目</summary>
+            <div id="manualList" class="manual-list"><p class="empty">項目はありません</p></div>
+          </details>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

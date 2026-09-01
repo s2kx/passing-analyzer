@@ -238,6 +238,9 @@ class PipelineConfig:
     subject_id: str = ""
     collection_date: str = ""
     organize_id: str = ""
+    #: 道路の車線数。全候補の lane_count 列（最終Excelの「車線数」）の既定値。
+    #: 自動では求まらないため、指定が無ければ空欄のまま人が後から入力する。
+    lane_count: str = ""
     skip_detect: bool = False
     redetect: bool = False
     skip_gps: bool = False
@@ -256,6 +259,10 @@ class PipelineConfig:
     turn_yaw_rate: float = EGO_TURN_YAW_RATE
     # 割り当て先の無い車を LiDAR 発の「未確認」行として起票するか。
     lidar_extra: bool = True
+    # 自動レビューで「未確認」相当の条件（隣車線の疑い・追跡不完全・低速・旋回・
+    # 低確信度・LiDAR発の行など）に当たった候補を「未確認」のまま残すか。
+    # 既定は残さず、そのまま不採用（除外）にする（人手確認を挟まない運用）。
+    keep_unconfirmed: bool = False
     # 段階3.5 の時刻同期の自己検証を行うか。
     sync_check: bool = True
     # 検証で「信頼できる推定値が現行値と3秒超ずれる」ときに推定値へ差し替えるか。
@@ -401,6 +408,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         subject_id=str(_pick(args.subject, metadata, "subject", session_dir.name)),
         collection_date=str(_pick(args.date, metadata, "date", session_dir.parent.name)),
         organize_id=str(_pick(args.organize_id, metadata, "organize_id", "")),
+        lane_count=str(_pick(args.lane_count, metadata, "lane_count", "")).strip(),
         skip_detect=bool(args.skip_detect),
         redetect=bool(args.redetect),
         skip_gps=bool(args.skip_gps),
@@ -413,6 +421,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         stop_speed=float(getattr(args, "stop_speed", EGO_STOP_SPEED)),
         turn_yaw_rate=float(getattr(args, "turn_yaw_rate", EGO_TURN_YAW_RATE)),
         lidar_extra=bool(getattr(args, "lidar_extra", True)),
+        keep_unconfirmed=bool(getattr(args, "keep_unconfirmed", False)),
         sync_check=bool(getattr(args, "sync_check", True)),
         auto_offset=bool(getattr(args, "auto_offset", True)),
         report_html=bool(getattr(args, "report_html", True)),
@@ -433,6 +442,9 @@ class PipelineReport:
     def stage(self, name: str, title: str, status: str, message: str = "", **detail) -> dict:
         entry = {"name": name, "title": title, "status": status, "message": message, **detail}
         self.stages.append(entry)
+        # 段階の完了を1行で流す。コンソールで進捗が追えるほか、web_gui の
+        # 全自動実行画面がこの行を解析して進捗バーと段階一覧を更新する。
+        print(f"[stage] {name} {title} [{status}] {message}", flush=True)
         return entry
 
     def warn(self, message: str) -> None:
@@ -2040,6 +2052,9 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
     自車運動（停止・低速・旋回）の判定には ``ego`` を渡す。``None`` の場合や
     ``--no-ego-gate`` の場合、GPSも自車速度も無い場合はその3つを飛ばす。
 
+    上記の「未確認」は条件の分類であって、既定（``config.keep_unconfirmed`` が
+    False）では最後にすべて「除外」へ落とす（人手確認を挟まない運用）。
+
     危険感(``danger_level``)は全自動実行では付けない（"0" のまま＝最終Excelでは空欄）。
     ``events`` は ``web_gui.read_events_csv`` の返す行の一覧で、戻り値は
     ``review_status`` を設定した同じ行の一覧。
@@ -2051,6 +2066,8 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
         event_id = str(event.get("event_id", ""))
         track = tracking.get(event_id) or {}
         event["danger_level"] = str(event.get("danger_level") or "0")
+        # 車線数は --lane-count の指定値を既定にする（後からGUIで候補ごとに直せる）
+        event["lane_count"] = str(event.get("lane_count") or "").strip() or config.lane_count
         if event.get("lidar_extra"):
             # 動画側に候補が無い車。採否は人が決めるので理由はそのまま残す
             event["review_status"] = LIDAR_EXTRA_STATUS
@@ -2154,6 +2171,13 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
             continue
         event["review_status"] = "採用"
         event["review_reason"] = ""
+    # 既定では「未確認」を人手確認へ残さず、そのまま不採用（除外）にする。
+    # どの条件で落ちたかは review_reason とレポートの reasons で追える。
+    # 従来どおり残して人が確認する場合は --keep-unconfirmed を付ける。
+    if not config.keep_unconfirmed:
+        for event in events:
+            if event.get("review_status") == "未確認":
+                event["review_status"] = "除外"
     return events
 
 
@@ -2341,6 +2365,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--subject", default="", help="被験者名またはID（既定: セッションフォルダ名）")
     parser.add_argument("--date", default="", help="データ収集日（既定: セッションの親フォルダ名 YYMMDD）")
     parser.add_argument("--organize-id", default="", help="整理ID")
+    parser.add_argument("--lane-count", default="",
+                        help="道路の車線数。全候補の「車線数」列（reviewed CSV と"
+                             "最終Excel）の既定値として入れる。後からGUIで候補ごとに直せる")
     parser.add_argument("--videos", nargs="+", help="GoPro動画を明示指定する（自動発見の代わり）")
     parser.add_argument("--pcap", default="", help="PCAPを明示指定する（自動発見の代わり）")
     parser.add_argument("--skip-detect", action="store_true", help="段階1の検出を行わない")
@@ -2379,6 +2406,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="自己検証の推定オフセットが信頼でき、現行値と"
                              f"{SYNC_CHECK_MISMATCH:g}秒超ずれていても差し替えず、"
                              "警告と人手項目だけ残す")
+    parser.add_argument("--keep-unconfirmed", dest="keep_unconfirmed",
+                        action="store_true", default=False,
+                        help="自動レビューの「未確認」を従来どおりレビューCSVへ残す。"
+                             "既定は未確認の条件（隣車線の疑い・追跡不完全・低速・旋回・"
+                             "低確信度・L###行など）をすべて「除外」にする")
     parser.add_argument("--no-lidar-extra", dest="lidar_extra", action="store_false",
                         default=True,
                         help="動画側に候補の無い車をレビューCSVへ「未確認」で"
