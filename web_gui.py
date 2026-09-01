@@ -1747,9 +1747,12 @@ def run_check() -> None:
                 target=lambda: view_box.update(result=view_api.detect_view_auto(payload)),
                 daemon=True)
             view_worker.start()
+            # 開始直後は start() が入れた「背景の動きを測っています」が見えるので、
+            # 検出器が progress で出す「測定中」に変わるまで待つ（メッセージが
+            # 空でないだけで抜けると、どちらを掴むかが実行ごとに変わる）。
             for _ in range(100):
                 view_progress = view_api.get_detect_view_progress()
-                if view_progress["running"] and view_progress["message"]:
+                if view_progress["running"] and "測定中" in view_progress["message"]:
                     break
                 time.sleep(0.02)
             assert view_progress["running"] and "測定中" in view_progress["message"], view_progress
