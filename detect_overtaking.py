@@ -17,10 +17,11 @@ GoPro 動画から「自動車に追い越される瞬間」を自動検出す�
         左端へ向かって大きくなりながら流れる。右端から現れて横切る車は除外する。
 
 検出ロジック(詳細は docs/計算方法.md の2章):
-    1. 各フレームを YOLO で車両検出 (car / truck / bus)
+    1. 各フレームを YOLO で車両検出 (car / truck / bus。NMS はクラス横断)
     2. ByteTrack で同一車両に track ID を付与し、5 サンプル以上かつ
        --min-track-seconds 以上続く track だけを残す
-    3. 出現端から現れている (front=右端 / rear=中央付近)
+    3. 出現端から現れている (front=右端 / rear=中央付近。代表値は 1/4 区間の中央値だが、
+       出現直後 --appear-window-seconds の窓で最も端へ寄った位置も併用する)
     4. 追い越し方向(画面を左へ流れる向き)へ移動している
     5. 逆向きに横切る車両は除外 (front=左端で消える / rear=右端から現れる)
     6. 自車運動ゲート(既定有効): 背景オプティカルフローが小さい=自転車が停止中に
@@ -151,6 +152,7 @@ def parse_args():
     p.add_argument("--model", default="yolov8n.pt", help="YOLO model path")
     p.add_argument("--conf", type=float, default=0.30, help="YOLO confidence threshold")
     p.add_argument("--appear-edge", type=float, default=0.70, help="edge threshold for track appearance")
+    p.add_argument("--appear-window-seconds", type=float, default=0.5, help="window used to take the most edge-side position at track appearance")
     p.add_argument("--exit-edge", type=float, default=0.40, help="opposite-edge threshold used to reject crossing tracks")
     p.add_argument("--margin", type=float, default=2.0, help="clip margin in seconds")
     p.add_argument("--clip", action="store_true", help="cut event clips with ffmpeg")
@@ -175,6 +177,7 @@ def parse_args():
     p.add_argument("--close-pass-min-lateral", type=float, default=0.08, help="minimum lateral move away from close-pass peak")
     p.add_argument("--close-pass-side-threshold", type=float, default=0.55, help="side position threshold for close-pass peak")
     p.add_argument("--close-pass-min-road-ratio", type=float, default=0.50, help="minimum road ROI occupancy for close-pass rescue")
+    p.add_argument("--close-pass-min-pre-samples", type=int, default=0, help="samples required before the area peak for close-pass rescue")
     p.add_argument("--no-trajectory-filter", action="store_true", help="disable trajectory filter")
     p.add_argument("--no-area-filter", action="store_true", help="disable area-change filter")
     p.add_argument("--road-roi", action="store_true", help="enable road ROI filter")
@@ -439,9 +442,14 @@ def build_tracks(args, out_dir: Path, video: str, overlay_suffix: str = ""):
         writer = cv2.VideoWriter(str(out_dir / f"annotated{overlay_suffix}.mp4"), fourcc, eff_fps, (w, h))
 
     def predict_batch(frames):
+        # agnostic_nms: NMS をクラス横断で行う。至近距離の大きな車は car / truck / bus の
+        # 判定が frame ごとに揺れ、クラス別 NMS だと同じ車体にほぼ同一の箱が 2 つ残る。
+        # ByteTrack はこれを別々の車とみなすので、追い越しの track が最接近の瞬間に
+        # 分断され、どちらの断片も追い越し条件を満たさなくなる(第6波A)。
         return model.predict(
             frames, classes=list(VEHICLE_CLASSES.keys()), conf=args.conf,
-            verbose=False, device=device, imgsz=args.imgsz, **precision_kwargs,
+            verbose=False, device=device, imgsz=args.imgsz, agnostic_nms=True,
+            **precision_kwargs,
         )
 
     # 自車運動ゲート用の状態。縮小したグレースケール画像から、検出した車両領域を
@@ -594,7 +602,11 @@ def _close_pass_rescue(
     peak_cx = float(cxs[peak_i])
     pre_samples = peak_i
     post_samples = len(cxs) - peak_i - 1
-    if pre_samples < 3 or post_samples < 3:
+    # 最接近の瞬間から track が始まる至近追い越し(接近側が画角外・別trackだった場合)を
+    # 拾うため、ピーク前のサンプル数は既定で問わない。遠ざかる証拠(ピーク後の縮小と
+    # 横移動)は引き続き 3 サンプル以上を要求する。
+    min_pre = getattr(args, "close_pass_min_pre_samples", 0)
+    if pre_samples < min_pre or post_samples < 3:
         return False, float("nan")
 
     shrink_after_peak = peak_area / max(area_end, 1e-9)
@@ -643,6 +655,15 @@ def classify_overtaking(track: Track, args, motion=None) -> Event | None:
     y_end = float(statistics.median(ground_ys[-q:]))
     area_start = float(statistics.median(areas[:q]))
     area_end = float(statistics.median(areas[-q:]))
+    # 出現端の判定を中央値だけで行うと、横を抜けるのが速い至近追い越しを取りこぼす。
+    # 1/4 区間(数秒)には「抜けたあと前方に小さく見え続ける尾」が入るため、中央値が
+    # 中央寄りへ引かれるためである。出現直後 appear_window_seconds の間に端へ最も
+    # 寄った位置を併用し、端から入ったという事実そのものを見る(第6波A)。
+    appear_window = getattr(args, "appear_window_seconds", 0.5)
+    head_cxs = [x.cx for x in s if x.t - s[0].t <= appear_window] or [cxs[0]]
+    tail_cxs = [x.cx for x in s if s[-1].t - x.t <= appear_window] or [cxs[-1]]
+    cx_head_edge = max(head_cxs)   # front: 出現直後に右端へ最も寄った位置
+    cx_tail_edge = min(tail_cxs)   # rear : 消失直前に左端へ最も寄った位置
     peak_i = max(range(len(areas)), key=areas.__getitem__)
     peak_in_middle = int(0.2 * len(s)) <= peak_i <= int(0.8 * len(s))
     mid_peak_ratio = float(areas[peak_i]) / max(area_start, area_end, 1e-9)
@@ -652,14 +673,14 @@ def classify_overtaking(track: Track, args, motion=None) -> Event | None:
     )
 
     if args.view == "front":
-        appeared = cx_start >= args.appear_edge          # 3) 右端から現れる
+        appeared = max(cx_start, cx_head_edge) >= args.appear_edge   # 3) 右端から現れる
         toward_center = cx_end < cx_start
         exits_far_edge = cx_end <= args.exit_edge
         side = "left"
     else:  # rear
         # 後方カメラでは追い越し車は消失点(画面中央)付近に小さく現れ、右側を抜けるため、
         # 左右反転した映像では「中央→左端」へ拡大しながら流れる(前方の奥行き進行と逆)。
-        appeared = cx_end <= (1.0 - args.appear_edge)       # 左端で最接近して抜ける
+        appeared = min(cx_end, cx_tail_edge) <= (1.0 - args.appear_edge)  # 左端で最接近して抜ける
         toward_center = cx_end < cx_start                    # 中央→左端(左へ流れる)
         exits_far_edge = cx_start >= (1.0 - args.exit_edge)  # 右端から現れて横切る車は除外
         side = "right"

@@ -14,6 +14,7 @@ YOLO や動画を使わず、合成した track 軌跡・合成した最近接�
     portable\\python\\python.exe test_logic.py
 """
 import math
+import statistics
 from argparse import Namespace
 
 from detect_overtaking import (
@@ -29,6 +30,7 @@ from edit_csv import (
 def default_args(view="rear"):
     # 自車運動ゲートは合成データでは検証しないため無効化 (no_stop_filter=True)
     return Namespace(view=view, appear_edge=0.70, exit_edge=0.40,
+                     appear_window_seconds=0.5,
                      no_stop_filter=True, stop_flow=0.8,
                      min_track_seconds=0.6,
                      no_trajectory_filter=True, no_area_filter=True,
@@ -39,6 +41,7 @@ def geometry_args(view="rear", road_roi=False):
     """新しい誤検知フィルタをすべて有効にした既定値。"""
     return Namespace(
         view=view, appear_edge=0.70, exit_edge=0.40,
+        appear_window_seconds=0.5, close_pass_min_pre_samples=0,
         no_stop_filter=True, stop_flow=0.8, min_track_seconds=0.6,
         no_trajectory_filter=False, min_vertical_motion=0.025,
         max_lateral_vertical_ratio=8.0,
@@ -193,6 +196,53 @@ def test_close_front_pass_with_mid_peak_detected():
     ev = classify_overtaking(make_track(25, values), args)
     assert ev is not None and ev.area_change_ratio > 1.8
     print("  OK: 近距離で中盤ピークになる front 追い越しを検出")
+
+
+def test_fast_close_pass_with_long_tail_detected():
+    # 至近を1秒未満で抜けたあと、前方に小さく映り続ける追い越し。出現端を「先頭1/4
+    # 区間の中央値」だけで見ると、長い尾に引かれて中央寄りの値になり取りこぼす。
+    # 出現直後 appear_window_seconds の間に端へ最も寄った位置も見て拾う (第6波A)。
+    values = []
+    pass_cx = [0.92, 0.88, 0.85, 0.82, 0.78, 0.74, 0.70, 0.66]
+    pass_y = [0.79, 0.76, 0.73, 0.70, 0.68, 0.66, 0.64, 0.62]
+    pass_area = [0.065, 0.090, 0.130, 0.180, 0.150, 0.100, 0.060, 0.040]
+    for i, (cx, cy, area) in enumerate(zip(pass_cx, pass_y, pass_area)):
+        values.append((i / 24.0, cx, cy, area))
+    tail_n = 60                                    # 前方に映り続ける尾 (約6秒)
+    for i in range(tail_n):
+        r = i / (tail_n - 1)
+        values.append((8 / 24.0 + i * 0.1, 0.65 - 0.13 * r,
+                       0.60 - 0.06 * r, 0.030 - 0.0294 * r))
+    tr = make_track(26, values)
+
+    cxs = [x.cx for x in tr.samples]
+    q = max(1, len(cxs) // 4)
+    assert statistics.median(cxs[:q]) < 0.70, "中央値では出現端を満たさない軌跡であること"
+
+    args = geometry_args("front")
+    args.close_pass_min_road_ratio = 1.1           # 近接救済を止めて出現端の判定だけを見る
+    ev = classify_overtaking(tr, args)
+    assert ev is not None, "速く抜けた至近追い越しを検出すべき"
+    print("  OK: 速く抜けて前方に映り続ける追い越しを検出 (出現端の窓)")
+
+
+def test_close_pass_starting_at_peak_detected():
+    # 最接近の瞬間から track が始まる至近追い越し。接近側が画角外・別trackだと
+    # 面積ピークが先頭に来る。ピーク前のサンプルを要求すると救済できない (第6波A)。
+    values = []
+    n = 12
+    for i in range(n):
+        r = i / (n - 1)
+        values.append((i * 0.1, 0.60 - 0.10 * r, 0.80, 0.19 - 0.189 * r))
+    tr = make_track(27, values)
+
+    args = geometry_args("front")
+    ev = classify_overtaking(tr, args)
+    assert ev is not None, "先頭が最接近の至近追い越しを救済すべき"
+
+    args.close_pass_min_pre_samples = 3            # 旧仕様ではピーク前3点が必要だった
+    assert classify_overtaking(tr, args) is None
+    print("  OK: 先頭が最接近になる至近追い越しを救済 (ピーク前サンプルの要求なし)")
 
 
 def test_road_roi_rejects_off_road_track():

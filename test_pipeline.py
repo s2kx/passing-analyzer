@@ -881,11 +881,14 @@ def test_retry_exclusion_keeps_the_target_track():
     """
     candidates = [{"track_key": "f6662x+2.3"}, {"track_key": "f6671x+1.7"},
                   {"track_key": "f6717x+1.4"}, {"track_key": "f6720x+2.0"}]
-    excluded = run_pipeline.keys_before(candidates, "f6720x+2.0")
+    excluded = run_pipeline.keys_other_than(candidates, "f6720x+2.0")
     assert excluded == ["f6662x+2.3", "f6671x+1.7"], excluded
-    # 採用順で後ろにあるキーや、一覧に無いキーは従来どおり何も除外しない
-    assert run_pipeline.keys_before(candidates, "f6662x+2.3") == []
-    assert run_pipeline.keys_before(candidates, "f9999x+9.9") == []
+    # 採用順で後ろにあるキーも除外する（選び直しは補正後の期待時刻で走るため、
+    # 1回目の採用順は当てにならない。260701/ID5 753.1s はこれで隣車線の車に化けた）
+    assert run_pipeline.keys_other_than(candidates, "f6662x+2.3") == [
+        "f6671x+1.7", "f6717x+1.4", "f6720x+2.0"]
+    # 一覧に無いキーは従来どおり何も除外しない
+    assert run_pipeline.keys_other_than(candidates, "f9999x+9.9") == []
     print("  OK: 選び直しの除外キーから狙ったトラック自身を外す")
 
 

@@ -1253,20 +1253,25 @@ def same_vehicle_key(left: str, right: str) -> bool:
     return bool(track_key_matches(left, right))
 
 
-def keys_before(candidates: list[dict], track_key: str) -> list[str]:
-    """``candidates`` の採用順で ``track_key`` より前にあるキーを返す。
+def keys_other_than(candidates: list[dict], track_key: str) -> list[str]:
+    """``candidates`` から ``track_key`` 以外のキーを返す（選び直しの除外キー）。
 
-    ``track_overtaking`` は ``candidates`` を採用順に返すので、ここで返したキーを
-    ``exclude_track_keys`` に渡せば、狙ったトラックが選ばれる。ただし狙った
-    トラック自身と同一視されるキー（通過フレームが数フレーム・横位置が1m以内しか
-    違わない別候補）は除くこと。これを渡すと追跡側が狙ったトラックごと除外して
+    ``exclude_track_keys`` へ渡すと、追跡側には狙ったトラックしか残らない。ただし
+    狙ったトラック自身と同一視されるキー（通過フレームが数フレーム・横位置が1m以内
+    しか違わない別候補）は除くこと。これを渡すと追跡側が狙ったトラックごと除外して
     しまい、「候補はすべて他のイベントへ割り当て済み」になって車を失う。
+
+    採用順で狙ったトラックより**後ろ**にあるキーも除外する。``candidates`` の順は
+    1回目の走査（補正前の期待時刻）での採用順だが、選び直しは系統ずれを補正した
+    期待時刻で走らせるため、順番が入れ替わるからである。後ろのキーを残していると、
+    補正で近くなった別の車（隣車線など）を掴んで割り当ての決定が覆る
+    （実データ260701/ID5 の 753.1s が、ずれ0.17秒で隣車線の車に化けていた）。
     """
     keys = [candidate["track_key"] for candidate in candidates]
     if track_key not in keys:
         return []
-    return [key for key in keys[:keys.index(track_key)]
-            if not same_vehicle_key(key, track_key)]
+    return [key for key in keys
+            if key != track_key and not same_vehicle_key(key, track_key)]
 
 
 def _scan_event(tracker, pcap: VelodynePcap, config: PipelineConfig, event: dict,
@@ -1500,7 +1505,7 @@ def run_autotrack(config: PipelineConfig, pcap: VelodynePcap, events: list[dict]
             continue
         if result.get("track_key") == target["track_key"]:
             continue
-        exclude = keys_before(candidate_sets[event_id], target["track_key"])
+        exclude = keys_other_than(candidate_sets[event_id], target["track_key"])
         retry = _scan_event(tracker, pcap, config, event, offset, report,
                             expected.get(event_id), exclude)
         if retry is not None:
