@@ -49,6 +49,14 @@ LiDAR には追い越し車が居るのに動画側の候補が無い（車列�
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 埋め込みPython（portable/python）は実行したスクリプトの場所を import の起点にしないので、
+# 隣のモジュール（src/）を読めるよう自分のフォルダを足す。
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import inspect
 import json
@@ -91,7 +99,10 @@ from web_gui import (
 )
 
 
-APP_DIR = Path(__file__).resolve().parent
+# このファイルは src/ にある。APP_DIR はプロジェクトのルート（portable/・output/・tools/・
+# yolov8n.pt・設定ファイルの置き場）、SRC_DIR はコードと画面（web_ui*/）の置き場。
+SRC_DIR = Path(__file__).resolve().parent
+APP_DIR = SRC_DIR.parent
 VIDEO_SUFFIXES = {".mp4", ".mov"}
 # 実データ検証(260701/ID1)より: 1.5秒では接近区間が窓に入らずフェーズ2が
 # フォールバックになりやすい。5秒で追跡成功が大きく増える。--track-margin を
@@ -635,7 +646,7 @@ def resolve_view(config: PipelineConfig, report: PipelineReport, detector=None) 
 def detection_command(config: PipelineConfig) -> list[str]:
     """GUIの start_detection と同じ検出コマンドを組み立てる。"""
     return [
-        str(detection_python()), str(APP_DIR / "detect_overtaking.py"),
+        str(detection_python()), str(SRC_DIR / "detect_overtaking.py"),
         *[str(video) for video in config.videos],
         "--view", config.view, "--out", str(config.out_dir),
         "--clip", "--imgsz", "640", "--batch", "32",

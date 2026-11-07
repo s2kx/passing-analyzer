@@ -14,6 +14,14 @@ save_reviewed_events）を使い回す。
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 埋め込みPython（portable/python）は実行したスクリプトの場所を import の起点にしないので、
+# 隣のモジュール（src/）を読めるよう自分のフォルダを足す。
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import json
 import os
@@ -26,6 +34,7 @@ from pathlib import Path
 
 from web_gui import (
     APP_DIR,
+    SRC_DIR,
     detection_python,
     read_events_csv,
     save_reviewed_events,
@@ -35,7 +44,7 @@ from final_export import generate_final_workbook
 # 点群ビューのデータは report.html と同じ読み取り・間引きを使う
 from make_report import _safe_id, load_metrics, load_point_frames, load_trajectory
 
-AUTO_UI_DIR = APP_DIR / "web_ui_auto"
+AUTO_UI_DIR = SRC_DIR / "web_ui_auto"
 SETTINGS_PATH = APP_DIR / "auto_gui_settings.json"
 
 # run_pipeline は段階の完了ごとに「[stage] 名前 タイトル [状態] メッセージ」を
@@ -89,7 +98,7 @@ def pipeline_command(payload: dict) -> tuple[list[str], Path]:
     session = Path(session_value).expanduser()
     if not session.is_dir():
         raise FileNotFoundError(f"セッションフォルダが見つかりません: {session}")
-    cmd = [str(detection_python()), str(APP_DIR / "run_pipeline.py"), str(session)]
+    cmd = [str(detection_python()), str(SRC_DIR / "run_pipeline.py"), str(session)]
     out_value = str(payload.get("out") or "").strip()
     if out_value:
         cmd += ["--out", out_value]
@@ -523,7 +532,7 @@ def run_check() -> None:
         "name": "report", "title": "8.レポート", "status": "ok", "message": ""}
     assert parse_pipeline_stage("processing frame 3/100") is None
     assert PIPELINE_STAGE_PROGRESS["report"] == 100
-    pipeline_source = (APP_DIR / "run_pipeline.py").read_text(encoding="utf-8")
+    pipeline_source = (SRC_DIR / "run_pipeline.py").read_text(encoding="utf-8")
     assert 'print(f"[stage] {name} {title} [{status}] {message}"' in pipeline_source
     # 実行時の車線数は run_pipeline の --lane-count として渡す（reviewed CSV へ入る）
     assert '"--lane-count"' in pipeline_source

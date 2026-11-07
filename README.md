@@ -19,7 +19,26 @@
 
 **方向の取り違えは致命的**。前向き撮影を `rear` で解析した実測では、誤検知66件・
 取りこぼし8件になった(同じ動画を `front` で解析すると40候補で正解12件をほぼ網羅した)。
-自信が無い場合は `python detect_view.py <動画>` で先に判定するとよい(数秒で終わる)。
+自信が無い場合は `python src\detect_view.py <動画>` で先に判定するとよい(数秒で終わる)。
+
+## フォルダ構成
+
+```text
+起動.bat / 全自動実行.bat / 全自動実行GUI.bat / 車長変換GUI.bat   ダブルクリックで使う入口
+src/            本体のコード（web_gui.py・run_pipeline.py など）と画面（web_ui/・web_ui_auto/）
+tests/          テスト（tests\test_logic.py など。1本ずつ実行する）
+setup/          初回セットアップ用（prepare_portable_python.ps1・prepare_ffmpeg_tools.ps1・requirements.txt）
+tools/          補助ツール（sync_check.py・compare_truth.py）と ffmpeg.exe
+AutoAnalysis/   車長変換ツール（単独でも配布する）
+docs/           資料（使い方・計算方法・引継ぎ書・フロー図）
+--- 以下は git に入れない（PCごとに作られる） ---
+portable/       Python 本体とライブラリ        yolov8n.pt   YOLO モデル
+output/         解析結果                       dist/        配布用に作ったフォルダ
+*_settings.json GUI の前回の入力
+```
+
+コマンドで直接実行するときも、作業フォルダはこのルートのまま `portable\python\python.exe src\run_pipeline.py ...`
+のように `src\` を付けて呼ぶ（bat も同じ）。
 
 ## セットアップ
 
@@ -33,7 +52,7 @@ PC上へ自動作成する。利用者が実行するファイルは `起動.bat
 
 初回セットアップでは次を自動で準備する。
 
-- `portable\python` ... Python 本体と `requirements.txt` のライブラリ
+- `portable\python` ... Python 本体と `setup\requirements.txt` のライブラリ
 - PyTorch ... CUDA対応GPUを検出した場合はGPU版、検出できない場合はCPU版を自動インストール
 - `yolov8n.pt` ... YOLO の既定モデル
 - `tools\ffmpeg.exe` / `tools\ffprobe.exe` ... クリップ切り出し用。既に PATH 上に ffmpeg がある場合は省略可
@@ -143,9 +162,9 @@ GUIを開かず起動環境だけ確認する場合:
 GUIのStep1〜6を人が順に操作する代わりに使う。
 
 ```powershell
-portable\python\python.exe run_pipeline.py E:\データ\260701\ID1
-portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --view rear --organize-id 1
-portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect   # 検出済みの続きから
+portable\python\python.exe src\run_pipeline.py E:\データ\260701\ID1
+portable\python\python.exe src\run_pipeline.py E:\データ\260701\ID1 --view rear --organize-id 1
+portable\python\python.exe src\run_pipeline.py E:\データ\260701\ID1 --skip-detect   # 検出済みの続きから
 ```
 
 ### 実行ファイル (全自動実行.bat)
@@ -172,7 +191,7 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 
 全自動実行を画面から操作する専用GUI。従来のワークフローGUI（`起動.bat` / `web_gui.py`）
 とは**独立したアプリ**で、`全自動実行GUI.bat` のダブルクリックで起動する
-（画面は `web_ui_auto/`、前回の入力は `auto_gui_settings.json` に保存）。
+（画面は `src/web_ui_auto/`、前回の入力は `auto_gui_settings.json` に保存）。
 
 画面は2つ。
 
@@ -356,9 +375,9 @@ APIキーは環境変数 `OPENAI_API_KEY`、無ければリポジトリ直下の
 既存の出力フォルダには後から実行できる（推定後に解析Excelと最終Excelを作り直す）。
 
 ```powershell
-.\portable\python\python.exe car_length.py --out output\w5o\ID1            # 推定
-.\portable\python\python.exe car_length.py --out output\w5o\ID1 --dry-run  # 写真の切り出しだけ（APIは呼ばない）
-.\portable\python\python.exe car_length.py --import-lengths output_車長変換\car_lengths.csv --src output
+.\portable\python\python.exe src\car_length.py --out output\w5o\ID1            # 推定
+.\portable\python\python.exe src\car_length.py --out output\w5o\ID1 --dry-run  # 写真の切り出しだけ（APIは呼ばない）
+.\portable\python\python.exe src\car_length.py --import-lengths output_車長変換\car_lengths.csv --src output
     # 車長変換ツールで推定・確認済みの車長を各セッションへ取り込む（APIは呼ばない）
 ```
 
@@ -545,9 +564,9 @@ def track_overtaking(pcap: VelodynePcap, first_frame: int, last_frame: int,
 (明示指定が常に優先)。単体でも使える:
 
 ```powershell
-portable\python\python.exe detect_view.py E:\データ\260701\ID1\GOPRO\GX010731.MP4
-portable\python\python.exe detect_view.py <動画...> --json          # 結果をJSONで出す
-portable\python\python.exe detect_view.py <動画...> --with-detection # 検出件数も参考表示
+portable\python\python.exe src\detect_view.py E:\データ\260701\ID1\GOPRO\GX010731.MP4
+portable\python\python.exe src\detect_view.py <動画...> --json          # 結果をJSONで出す
+portable\python\python.exe src\detect_view.py <動画...> --with-detection # 検出件数も参考表示
 ```
 
 **原理: 背景オプティカルフローの放射方向**。自転車が前進しているとき、
@@ -596,7 +615,7 @@ portable\python\python.exe detect_view.py <動画...> --with-detection # 検出�
 通過区間 |Y|<3m の帯・離隔距離LCの位置・フェーズ1〜4の点を補助線で表示）が並ぶ。
 ヘッダにはセッション名・実行日時・採用/未確認の件数、カードには離隔距離LC・通過時間・相対速度・
 TTC・車種・レビュー理由が出る。既存の出力フォルダからは
-`portable\python\python.exe make_report.py --out output\ID1` でいつでも作り直せる
+`portable\python\python.exe src\make_report.py --out output\ID1` でいつでも作り直せる
 （`--max-points-per-frame` / `--max-points-total` で点群の間引き量を変えられる）。
 **ダブルクリックで開ける file:// 前提**なので外部CDNもネット接続も使わず、点群だけは
 `report_data\event_NNN.js`（`window.__EVT["001"]=...` の代入文）に分けてカードを開いたときに
@@ -760,14 +779,14 @@ GoProの向き・画角で変わるため既定では無効になっている。
 ## テスト
 
 ```powershell
-.\portable\python\python.exe test_logic.py
-.\portable\python\python.exe web_gui.py --check
-.\portable\python\python.exe auto_gui.py --check
-.\portable\python\python.exe test_pipeline.py
-.\portable\python\python.exe test_autotrack.py
-.\portable\python\python.exe test_detect_view.py
-.\portable\python\python.exe test_make_report.py
-.\portable\python\python.exe test_car_length.py
+.\portable\python\python.exe tests\test_logic.py
+.\portable\python\python.exe src\web_gui.py --check
+.\portable\python\python.exe src\auto_gui.py --check
+.\portable\python\python.exe tests\test_pipeline.py
+.\portable\python\python.exe tests\test_autotrack.py
+.\portable\python\python.exe tests\test_detect_view.py
+.\portable\python\python.exe tests\test_make_report.py
+.\portable\python\python.exe tests\test_car_length.py
 ```
 
 - `test_logic.py` … 判定ロジック(`classify_overtaking`)を YOLO/動画なしの合成軌跡で検証する

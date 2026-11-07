@@ -5,7 +5,7 @@
 YOLO も実データも使わず、合成した最小PCAPと一時フォルダで段階4〜8を検証する。
 段階1（YOLO検出）は ``--skip-detect`` 相当のパスで通す。
 
-    portable\\python\\python.exe test_pipeline.py
+    portable\\python\\python.exe tests\\test_pipeline.py
 """
 from __future__ import annotations
 
@@ -19,6 +19,11 @@ import tempfile
 from pathlib import Path
 from zipfile import ZipFile
 
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# 本体（src/）と tools/ を import できるようにする（埋め込みPythonはテストの場所を起点にしない）
+sys.path[:0] = [str(Path(__file__).resolve().parent.parent / name) for name in ("src", "tools")]
 import run_pipeline
 from final_export import DANGER_BY_LEVEL, generate_final_workbook
 from run_pipeline import (

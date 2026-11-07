@@ -34,9 +34,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# リポジトリ内（AutoAnalysis/ 配下）でも配布版（単独フォルダ）でも動くよう、本体の web_gui.py が隣に
+# リポジトリ内（AutoAnalysis/ 配下）でも配布版（単独フォルダ）でも動くよう、本体の src/web_gui.py が隣に
 # あればその階層を、無ければ自分の階層をルート（output・yolov8n.pt・portable/python の置き場）にする。
-ROOT = HERE.parent if (HERE.parent / "web_gui.py").is_file() else HERE
+ROOT = HERE.parent if (HERE.parent / "src" / "web_gui.py").is_file() else HERE
 DEFAULT_SRC = ROOT / "output"
 WORK_SUFFIX = "_車長変換"
 STAGES = ("extract", "gpt", "convert")

@@ -11,12 +11,17 @@ YOLO や動画を使わず、合成した track 軌跡・合成した最近接�
   4) 追い越し方向へ移動 (front=中央へ左流れ / rear=左端へ左流れ)
   5) 逆向きに横切る車は除外 (front=左端で消える / rear=右端から現れる)
 
-    portable\\python\\python.exe test_logic.py
+    portable\\python\\python.exe tests\\test_logic.py
 """
 import math
 import statistics
 from argparse import Namespace
 
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# 本体（src/）と tools/ を import できるようにする（埋め込みPythonはテストの場所を起点にしない）
+sys.path[:0] = [str(Path(__file__).resolve().parent.parent / name) for name in ("src", "tools")]
 from detect_overtaking import (
     Track, TrackSample, classify_overtaking, classify_vehicle_type,
     yellow_plate_score,

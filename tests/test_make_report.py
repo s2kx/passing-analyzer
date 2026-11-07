@@ -7,7 +7,7 @@ report.html と report_data/event_*.js の生成を検証する。実データ�
 ``output/ID1``）が見つかる環境では、その reviewed CSV と点群CSV を一時フォルダへ
 写して読み込めることも確かめる（**実データのフォルダには一切書き込まない**）。
 
-    portable\\python\\python.exe test_make_report.py
+    portable\\python\\python.exe tests\\test_make_report.py
 
 実データの場所は自動で探す（このファイルから上のフォルダの ``output`` 配下）。
 別のフォルダを使うときは環境変数 ``REPORT_REAL_OUT`` に出力フォルダを指定する。
@@ -23,6 +23,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# 本体（src/）と tools/ を import できるようにする（埋め込みPythonはテストの場所を起点にしない）
+sys.path[:0] = [str(Path(__file__).resolve().parent.parent / name) for name in ("src", "tools")]
 import make_report
 from make_report import (
     ReportError,

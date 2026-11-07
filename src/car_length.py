@@ -32,6 +32,14 @@ APIキーは環境変数 OPENAI_API_KEY、無ければ本体フォルダの ``.e
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 埋め込みPython（portable/python）は実行したスクリプトの場所を import の起点にしないので、
+# 隣のモジュール（src/）を読めるよう自分のフォルダを足す。
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import base64
 import csv
@@ -47,7 +55,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-APP_DIR = Path(__file__).resolve().parent
+# このファイルは src/ にある。APP_DIR はプロジェクトのルート（portable/・output/・tools/・
+# yolov8n.pt・設定ファイルの置き場）、SRC_DIR はコードと画面（web_ui*/）の置き場。
+SRC_DIR = Path(__file__).resolve().parent
+APP_DIR = SRC_DIR.parent
 CAR_LENGTH_DIR = "car_length"
 LENGTHS_NAME = "car_lengths.csv"
 COLUMNS = ["event_id", "car_length_m", "source", "make", "model", "body_type",

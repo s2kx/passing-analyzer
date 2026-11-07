@@ -43,6 +43,14 @@ GoPro 動画から「自動車に追い越される瞬間」を自動検出す�
     out/annotated.mp4           検出可視化動画 (--overlay 指定時)
 """
 
+import sys
+from pathlib import Path
+
+# 埋め込みPython（portable/python）は実行したスクリプトの場所を import の起点にしないので、
+# 隣のモジュール（src/）を読めるよう自分のフォルダを足す。
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import csv
 import queue
@@ -70,7 +78,7 @@ VEHICLE_CLASSES = {2: "car", 5: "bus", 7: "truck"}
 
 def ffmpeg_executable() -> str | None:
     """Return bundled ffmpeg first, then PATH ffmpeg."""
-    app_dir = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parent.parent   # プロジェクトのルート（src/ の1つ上）
     names = ["ffmpeg.exe", "ffmpeg"] if sys.platform == "win32" else ["ffmpeg"]
     for folder in (app_dir / "tools", app_dir):
         for name in names:

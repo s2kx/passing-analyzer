@@ -5,11 +5,16 @@
 PCAP を使わず、numpy で合成した点群（地面平面 + 静止障害物 + 通過車両）で
 地面除去・クラスタリング・トラッキング・同定・矩形生成を検証する。
 
-    portable\\python\\python.exe test_autotrack.py
+    portable\\python\\python.exe tests\\test_autotrack.py
 """
 
 import numpy as np
 
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# 本体（src/）と tools/ を import できるようにする（埋め込みPythonはテストの場所を起点にしない）
+sys.path[:0] = [str(Path(__file__).resolve().parent.parent / name) for name in ("src", "tools")]
 from lidar_autotrack import (
     MIN_TRACK_FRAMES, PASS_ZONE, ROI_MAX_ABS_Y, Cluster, Track, Tracker, build_tracks,
     cluster_points,

@@ -24,7 +24,7 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent if (HERE.parent / "web_gui.py").is_file() else HERE
+ROOT = HERE.parent if (HERE.parent / "src" / "web_gui.py").is_file() else HERE
 DIST_NAME = "車長変換ツール"
 
 CODE_FILES = (
@@ -238,7 +238,8 @@ def build(dest: Path) -> Path:
     for name in UI_FILES:
         shutil.copy2(HERE / "web_ui_length" / name, dest / "web_ui_length" / name)
     for name in SETUP_FILES:
-        source = ROOT / name
+        # 本体では setup/ に置いてある。配布版では隣（ルート）に置く
+        source = ROOT / "setup" / name
         if not source.is_file():
             sys.exit(f"同梱するファイルがありません: {source}")
         shutil.copy2(source, dest / name)

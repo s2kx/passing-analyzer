@@ -30,7 +30,7 @@ call :ensure_python || exit /b 1
 call :ensure_yolo_model || exit /b 1
 call :ensure_ffmpeg
 
-"%PY%" auto_gui.py --check
+"%PY%" src\auto_gui.py --check
 if errorlevel 1 (
     echo [ERROR] Auto GUI startup check failed.
     pause
@@ -38,7 +38,7 @@ if errorlevel 1 (
 )
 
 echo [start] Launching the auto pipeline GUI...
-start "Passing Analyzer Auto" "%PYW%" auto_gui.py
+start "Passing Analyzer Auto" "%PYW%" src\auto_gui.py
 exit /b 0
 
 :ensure_python
@@ -55,8 +55,8 @@ echo [setup] Installing Python and the required libraries into portable\python.
 echo [setup] This can take several minutes and requires internet access.
 echo.
 
-if not exist "prepare_portable_python.ps1" (
-    echo [ERROR] prepare_portable_python.ps1 was not found.
+if not exist "setup\prepare_portable_python.ps1" (
+    echo [ERROR] setup\prepare_portable_python.ps1 was not found.
     echo Re-clone the repository or restore the setup files.
     pause
     exit /b 1
@@ -66,9 +66,9 @@ set "SETUP_FORCE="
 if exist "portable\python\" set "SETUP_FORCE=-Force"
 
 if defined TORCH_INDEX_URL (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" %SETUP_FORCE% -TorchIndexUrl "%TORCH_INDEX_URL%"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\setup\prepare_portable_python.ps1" %SETUP_FORCE% -TorchIndexUrl "%TORCH_INDEX_URL%"
 ) else (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" %SETUP_FORCE%
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\setup\prepare_portable_python.ps1" %SETUP_FORCE%
 )
 
 if errorlevel 1 (
@@ -119,12 +119,12 @@ if not errorlevel 1 exit /b 0
 echo.
 echo [setup] System FFmpeg is not installed.
 echo [setup] Installing bundled FFmpeg into tools\ for clip extraction.
-if not exist "prepare_ffmpeg_tools.ps1" (
-    echo [WARN] prepare_ffmpeg_tools.ps1 was not found. Clip extraction may be unavailable.
+if not exist "setup\prepare_ffmpeg_tools.ps1" (
+    echo [WARN] setup\prepare_ffmpeg_tools.ps1 was not found. Clip extraction may be unavailable.
     exit /b 0
 )
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_ffmpeg_tools.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\setup\prepare_ffmpeg_tools.ps1"
 if errorlevel 1 (
     echo [WARN] FFmpeg setup failed. Clip extraction may be unavailable.
 )

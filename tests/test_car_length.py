@@ -3,7 +3,7 @@
 OpenAI API と YOLO は呼ばない。API は ``car_length.call_openai`` を差し替え、写真は
 あらかじめ置いた画像を使う（既存の写真は切り出し直さない仕様を利用する）。
 
-    portable\\python\\python.exe test_car_length.py
+    portable\\python\\python.exe tests\\test_car_length.py
 """
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ import json
 import tempfile
 from pathlib import Path
 
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# 本体（src/）と tools/ を import できるようにする（埋め込みPythonはテストの場所を起点にしない）
+sys.path[:0] = [str(Path(__file__).resolve().parent.parent / name) for name in ("src", "tools")]
 import car_length
 from car_length import (
     answer_to_row,
@@ -167,7 +172,7 @@ def test_conversion_tool_matches_main_formulas():
 
     from edit_csv import analyze_edit_points, read_edit_points, write_edit_analysis_xlsx
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "AutoAnalysis"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "AutoAnalysis"))
     from convert_relative_speed import Length, convert_analysis, read_analysis
     from xlsx_cells import read_cells
 

@@ -1,6 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# This script lives in setup\; the project root (tools\, .cache\) is one level up.
+if ((Split-Path -Leaf $scriptDir) -eq "setup") { $root = Split-Path -Parent $scriptDir } else { $root = $scriptDir }
 $cache = Join-Path $root ".cache\ffmpeg"
 $zip = Join-Path $cache "ffmpeg-release-essentials.zip"
 $extract = Join-Path $cache "extract"

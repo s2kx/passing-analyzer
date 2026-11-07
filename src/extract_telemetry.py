@@ -19,6 +19,14 @@ GPS・加速度計・ジャイロスコープ等のデータをCSVに保存す�
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 埋め込みPython（portable/python）は実行したスクリプトの場所を import の起点にしないので、
+# 隣のモジュール（src/）を読めるよう自分のフォルダを足す。
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import csv
 import datetime as _dt

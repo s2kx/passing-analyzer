@@ -144,17 +144,17 @@ if exist "portable\python\" (
 )
 
 :install_runtime
-if not exist "prepare_portable_python.ps1" (
-    echo [ERROR] prepare_portable_python.ps1 was not found.
+if not exist "setup\prepare_portable_python.ps1" (
+    echo [ERROR] setup\prepare_portable_python.ps1 was not found.
     echo Re-clone the repository or restore the setup files.
     pause
     exit /b 1
 )
 
 if defined TORCH_INDEX_URL (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" %SETUP_FORCE% -TorchIndexUrl "%TORCH_INDEX_URL%"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\setup\prepare_portable_python.ps1" %SETUP_FORCE% -TorchIndexUrl "%TORCH_INDEX_URL%"
 ) else (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" %SETUP_FORCE%
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\setup\prepare_portable_python.ps1" %SETUP_FORCE%
 )
 
 if errorlevel 1 (
@@ -220,12 +220,12 @@ if not errorlevel 1 (
 echo.
 echo [setup] System FFmpeg is not installed.
 echo [setup] Installing bundled FFmpeg into tools\ for clip extraction.
-if not exist "prepare_ffmpeg_tools.ps1" (
-    echo [WARN] prepare_ffmpeg_tools.ps1 was not found. Clip extraction may be unavailable.
+if not exist "setup\prepare_ffmpeg_tools.ps1" (
+    echo [WARN] setup\prepare_ffmpeg_tools.ps1 was not found. Clip extraction may be unavailable.
     exit /b 0
 )
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_ffmpeg_tools.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\setup\prepare_ffmpeg_tools.ps1"
 if errorlevel 1 (
     echo [WARN] FFmpeg setup failed. The app can run, but clip extraction may be unavailable.
     exit /b 0
@@ -234,7 +234,7 @@ if errorlevel 1 (
 exit /b 0
 
 :gui
-"%PY%" web_gui.py --check
+"%PY%" src\web_gui.py --check
 if errorlevel 1 (
     echo [ERROR] GUI startup check failed.
     pause
@@ -242,7 +242,7 @@ if errorlevel 1 (
 )
 
 echo [start] Launching GUI...
-start "Passing Analyzer" "%PYW%" web_gui.py
+start "Passing Analyzer" "%PYW%" src\web_gui.py
 exit /b 0
 
 :detect
@@ -285,7 +285,7 @@ echo   preset: GPU auto, imgsz 416, batch 32, clip enabled
 echo   output: out\
 echo.
 
-"%PY%" detect_overtaking.py "%VIDEO%" --view "%VIEW%" --clip --imgsz 416 --batch 32 !EXTRA!
+"%PY%" src\detect_overtaking.py "%VIDEO%" --view "%VIEW%" --clip --imgsz 416 --batch 32 !EXTRA!
 set "RESULT=%ERRORLEVEL%"
 
 echo.

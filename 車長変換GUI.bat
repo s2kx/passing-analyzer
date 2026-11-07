@@ -60,8 +60,8 @@ echo [setup] Installing Python and the required libraries into portable\python.
 echo [setup] This can take several minutes and requires internet access.
 echo.
 
-if not exist "prepare_portable_python.ps1" (
-    echo [ERROR] prepare_portable_python.ps1 was not found.
+if not exist "setup\prepare_portable_python.ps1" (
+    echo [ERROR] setup\prepare_portable_python.ps1 was not found.
     echo Re-clone the repository or restore the setup files.
     pause
     exit /b 1
@@ -71,9 +71,9 @@ set "SETUP_FORCE="
 if exist "portable\python\" set "SETUP_FORCE=-Force"
 
 if defined TORCH_INDEX_URL (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" %SETUP_FORCE% -TorchIndexUrl "%TORCH_INDEX_URL%"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\setup\prepare_portable_python.ps1" %SETUP_FORCE% -TorchIndexUrl "%TORCH_INDEX_URL%"
 ) else (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\prepare_portable_python.ps1" %SETUP_FORCE%
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CD%\setup\prepare_portable_python.ps1" %SETUP_FORCE%
 )
 
 if errorlevel 1 (

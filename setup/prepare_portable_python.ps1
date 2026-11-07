@@ -8,7 +8,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# In the main project this script lives in setup\ (the project root is one level up).
+# In the standalone car-length tool it sits directly in the root.
+if ((Split-Path -Leaf $scriptDir) -eq "setup") { $root = Split-Path -Parent $scriptDir } else { $root = $scriptDir }
 $runtime = Join-Path $root "portable\python"
 $cache = Join-Path $root ".cache\portable-python"
 $pythonZip = Join-Path $cache "python-$PythonVersion-embed-amd64.zip"
@@ -154,7 +157,7 @@ Write-Host "Installing PyTorch ($torchInstallMode) from: $selectedTorchIndexUrl"
 Invoke-Checked $python @("-m", "pip", "install", "--upgrade", "torch", "torchvision", "--index-url", $selectedTorchIndexUrl, "--extra-index-url", "https://pypi.org/simple", "--no-warn-script-location")
 
 Write-Host "Installing project requirements..."
-Invoke-Checked $python @("-m", "pip", "install", "-r", (Join-Path $root "requirements.txt"), "--no-warn-script-location")
+Invoke-Checked $python @("-m", "pip", "install", "-r", (Join-Path $scriptDir "requirements.txt"), "--no-warn-script-location")
 
 Write-Host "Verifying runtime imports..."
 Invoke-Checked $python @("-c", "import sys, cv2, numpy, torch, ultralytics, webview; print('Python:', sys.version.split()[0]); print('OpenCV:', cv2.__version__); print('Ultralytics:', ultralytics.__version__); print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available())")

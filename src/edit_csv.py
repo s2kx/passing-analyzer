@@ -8,6 +8,14 @@ XYZ 座標が 9, 10, 11 列目）が入ったフォルダを受け取り、各�
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 埋め込みPython（portable/python）は実行したスクリプトの場所を import の起点にしないので、
+# 隣のモジュール（src/）を読めるよう自分のフォルダを足す。
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import csv
 import math
 import re

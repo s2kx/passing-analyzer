@@ -3,6 +3,14 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 埋め込みPython（portable/python）は実行したスクリプトの場所を import の起点にしないので、
+# 隣のモジュール（src/）を読めるよう自分のフォルダを足す。
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import csv
 import inspect
@@ -27,8 +35,11 @@ from edit_csv import write_edit_analysis_xlsx, write_edit_csv
 from final_export import generate_final_workbook
 
 
-APP_DIR = Path(__file__).resolve().parent
-UI_DIR = APP_DIR / "web_ui"
+# このファイルは src/ にある。APP_DIR はプロジェクトのルート（portable/・output/・tools/・
+# yolov8n.pt・設定ファイルの置き場）、SRC_DIR はコードと画面（web_ui*/）の置き場。
+SRC_DIR = Path(__file__).resolve().parent
+APP_DIR = SRC_DIR.parent
+UI_DIR = SRC_DIR / "web_ui"
 SETTINGS_PATH = APP_DIR / "gui_settings.json"
 DEFAULT_OUT = APP_DIR / "output"
 VEHICLE_TYPES = {"大型", "普通", "軽"}
@@ -592,7 +603,7 @@ class AppApi:
         except OSError as exc:
             return {"ok": False, "error": f"出力フォルダを準備できません: {exc}"}
         cmd = [
-            str(detection_python()), str(APP_DIR / "detect_overtaking.py"),
+            str(detection_python()), str(SRC_DIR / "detect_overtaking.py"),
             *[str(video) for video in videos],
             "--view", str(payload.get("view", "rear")), "--out", str(out_dir),
             "--clip", "--imgsz", "640", "--batch", "32",
@@ -1483,7 +1494,7 @@ def run_check() -> None:
     assert autotrack_margins("") == (8.0, 8.0)
     assert autotrack_margins("unknown") == (8.0, 8.0)
     # run_pipeline 側の値と食い違ったら気付けるようにソースを突き合わせる
-    pipeline_source = (APP_DIR / "run_pipeline.py").read_text(encoding="utf-8")
+    pipeline_source = (SRC_DIR / "run_pipeline.py").read_text(encoding="utf-8")
     margins_line = re.search(r"^VIEW_TRACK_MARGINS = (.+)$", pipeline_source, re.MULTILINE)
     assert margins_line and eval(margins_line.group(1)) == AUTOTRACK_VIEW_MARGINS, margins_line
 

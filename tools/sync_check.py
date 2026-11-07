@@ -43,8 +43,9 @@ from pathlib import Path
 import numpy as np
 
 APP_DIR = Path(__file__).resolve().parent.parent
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
+# 本体のモジュールは src/ にある
+if str(APP_DIR / "src") not in sys.path:
+    sys.path.insert(0, str(APP_DIR / "src"))
 
 from extract_telemetry import read_gps_workbook  # noqa: E402
 from lidar_autotrack import estimate_ground_plane, filter_points  # noqa: E402

@@ -6,7 +6,7 @@
 フロー計算そのものは合成動画(拡大／縮小するテクスチャ)で検証する。
 `detect_overtaking.py` のサブプロセスもスタブ化する。
 
-    portable\\python\\python.exe test_detect_view.py
+    portable\\python\\python.exe tests\\test_detect_view.py
 """
 from __future__ import annotations
 
@@ -14,6 +14,11 @@ import struct
 import tempfile
 from pathlib import Path
 
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# 本体（src/）と tools/ を import できるようにする（埋め込みPythonはテストの場所を起点にしない）
+sys.path[:0] = [str(Path(__file__).resolve().parent.parent / name) for name in ("src", "tools")]
 import detect_view as dv
 from detect_view import (
     DECISION_CONFIDENCE,

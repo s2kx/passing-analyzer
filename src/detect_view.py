@@ -40,6 +40,14 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 埋め込みPython（portable/python）は実行したスクリプトの場所を import の起点にしないので、
+# 隣のモジュール（src/）を読めるよう自分のフォルダを足す。
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import csv
 import json
@@ -58,7 +66,10 @@ from detect_overtaking import ffmpeg_executable
 from web_gui import detection_python
 
 
-APP_DIR = Path(__file__).resolve().parent
+# このファイルは src/ にある。APP_DIR はプロジェクトのルート（portable/・output/・tools/・
+# yolov8n.pt・設定ファイルの置き場）、SRC_DIR はコードと画面（web_ui*/）の置き場。
+SRC_DIR = Path(__file__).resolve().parent
+APP_DIR = SRC_DIR.parent
 VIEWS = ("front", "rear")
 
 DEFAULT_SAMPLES = 3
@@ -396,7 +407,7 @@ def _cut_clip(plan: SamplePlan, work_dir: Path) -> Path:
 def detection_command_for_view(clip: Path, view: str, out_dir: Path) -> list[str]:
     """参考値用の検出コマンド。クリップ・可視化は作らず、検出条件は本番と揃える。"""
     return [
-        str(detection_python()), str(APP_DIR / "detect_overtaking.py"), str(clip),
+        str(detection_python()), str(SRC_DIR / "detect_overtaking.py"), str(clip),
         "--view", view, "--out", str(out_dir),
         "--imgsz", "640", "--batch", "32",
         "--flow-stride", "3", "--prefetch-batches", "2",

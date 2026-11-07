@@ -5,7 +5,7 @@
 実データを使わず、合成した点群と合成した速度プロファイルで
 「自車速度の推定」→「相互相関でのオフセット推定」の全経路を検証する。
 
-    portable\\python\\python.exe test_sync_check.py
+    portable\\python\\python.exe tests\\test_sync_check.py
 """
 
 import math
@@ -15,7 +15,11 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# 本体（src/）と tools/ を import できるようにする（埋め込みPythonはテストの場所を起点にしない）
+sys.path[:0] = [str(Path(__file__).resolve().parent.parent / name) for name in ("src", "tools")]
 
 import sync_check as sc  # noqa: E402
 
