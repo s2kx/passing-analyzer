@@ -783,8 +783,8 @@ async function generateFinalExcel(){
     if(!saved){ status.className='final-status error'; status.textContent='レビュー結果を保存できませんでした'; return; }
   }
   await saveSettings();
-  status.textContent='最終Excelを生成中...';
-  setStatus('最終Excelを生成中',true);
+  status.textContent='車長を推定中（採用の候補の写真を切り出して ChatGPT へ送ります。推定済みの候補は飛ばします）→ 最終Excelを生成中...';
+  setStatus('車長の推定と最終Excelの生成中',true);
   const result=await api().generate_final_excel(formData());
   setStatus('準備完了');
   if(!result.ok){
@@ -793,7 +793,11 @@ async function generateFinalExcel(){
     return toast(result.error||'最終Excel生成に失敗しました',true);
   }
   const warn=(result.warnings||[]).length?`\n警告 ${result.warnings.length} 件:\n${(result.warnings||[]).slice(0,4).join('\n')}`:'';
-  status.textContent=`生成完了: ${result.rows} 件\n${result.path}${warn}`;
+  const car=result.car_length||{};
+  const carLine=car.targets!==undefined
+    ?`\n車長: 採用 ${car.targets} 件 / 今回推定 ${car.estimated} / 推定済み・手入力 ${car.kept} / 失敗 ${car.failed}${car.no_key?'（APIキーが無いため推定していません）':''}`
+    :'';
+  status.textContent=`生成完了: ${result.rows} 件\n${result.path}${carLine}${warn}`;
   toast(`最終Excelを生成しました（${result.rows} 件）`);
 }
 

@@ -372,6 +372,9 @@ APIキーは環境変数 `OPENAI_API_KEY`、無ければリポジトリ直下の
 `car_lengths.csv` の `car_length_m` に手入力（`source` は `manual`）して最終Excelを再生成すれば反映
 される。最終Excelの末尾には使った車長と出典（`車長(m)` `車長の出典`）の列が付く。
 
+手動の GUI（`起動.bat`）では「最終Excelを生成」を押したときに、採用の候補について同じ推定を
+自動で行ってから Excel を作る（推定済み・手入力済みは飛ばす）。
+
 既存の出力フォルダには後から実行できる（推定後に解析Excelと最終Excelを作り直す）。
 
 ```powershell

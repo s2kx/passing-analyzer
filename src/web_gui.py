@@ -1023,6 +1023,19 @@ class AppApi:
         try:
             out_dir = output_dir_from_payload(payload)
             pcap_start = self._pcap.start_unix_time if self._pcap is not None else None
+            # 相対速度 = 3.6 × (距離p3 + 車長) / 通過時間 の車長を、採用の候補について先に
+            # 推定する（写真1枚を切り出して ChatGPT へ送る。推定済みの候補は飛ばす）。
+            # 推定に失敗しても最終Excelは作る（その行の相対速度・自動車速度が空欄になる）。
+            car_messages: list[str] = []
+            car_summary: dict = {}
+            try:
+                from car_length import estimate_for_final
+
+                car_summary = estimate_for_final(
+                    out_dir, str(payload.get("view") or ""), log=lambda line: print(line, flush=True))
+                car_messages = list(car_summary.get("messages") or [])
+            except Exception as exc:  # noqa: BLE001
+                car_messages = [f"車長を推定できません: {exc}"]
             result = generate_final_workbook(
                 out_dir,
                 organize_id=str(payload.get("final_id") or "").strip(),
@@ -1032,7 +1045,10 @@ class AppApi:
                 pcap_path=str(payload.get("pcap") or ""),
                 pcap_start_unix=pcap_start,
             )
-            return {"ok": True, **result}
+            car_length = {key: car_summary.get(key, 0)
+                          for key in ("targets", "estimated", "kept", "failed", "no_key")}
+            return {"ok": True, **result, "car_length": car_length,
+                    "warnings": car_messages + list(result.get("warnings") or [])}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -1468,6 +1484,10 @@ def run_check() -> None:
             "102.0,-1.0,3.2,0,3.35,16\n",
             encoding="utf-8-sig",
         )
+        # 手入力の車長があれば、最終Excelの生成時の車長推定はそれを使い API を呼ばない
+        (out_dir / "car_length").mkdir()
+        (out_dir / "car_length" / "car_lengths.csv").write_text(
+            "event_id,car_length_m,source\n001,4.5,manual\n", encoding="utf-8-sig")
         api = AppApi()
         result = api.generate_final_excel({
             "out": str(out_dir), "final_id": "4", "final_subject": "ID1",
@@ -1476,6 +1496,10 @@ def run_check() -> None:
         })
         assert result["ok"], result
         assert result["rows"] == 1, result
+        # 採用は001の1件だけ（002は除外なので推定しない）
+        assert result["car_length"]["targets"] == 1, result["car_length"]
+        assert result["car_length"]["kept"] == 1, result["car_length"]
+        assert not any("車長が無い" in w for w in result["warnings"]), result["warnings"]
         final_path = Path(result["path"])
         assert final_path.parent.name == "final", result
         assert final_path.is_file(), result
@@ -1484,6 +1508,9 @@ def run_check() -> None:
         assert "整理ID" in sheet_xml, sheet_xml
         assert "通過時間" in sheet_xml, sheet_xml
         assert "相対速度" in sheet_xml, sheet_xml
+        # 相対速度 = 3.6 × (距離p3 0.7 + 車長 4.5) / 通過時間 1.0 = 18.72
+        assert '<c r="K2" s="4"><v>18.72</v></c>' in sheet_xml, sheet_xml
+        assert "車長(m)" in sheet_xml and "manual" in sheet_xml, sheet_xml
         assert _vehicle_speed_kmh(18.36, 10.35) == 28.71
         assert 'sqref="G2:G51"' in sheet_xml, sheet_xml
         assert 'sqref="R2:R51"' in sheet_xml, sheet_xml

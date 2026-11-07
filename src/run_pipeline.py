@@ -74,6 +74,7 @@ from car_length import (
     estimate_car_lengths,
     load_car_lengths,
     read_review_events,
+    rewrite_analysis_xlsx,
     target_events,
 )
 from detect_view import (
@@ -2274,11 +2275,8 @@ def run_car_length(config: PipelineConfig, report: PipelineReport) -> dict:
         return {}
     for message in summary["messages"]:
         report.warn(message)
-    for edit in sorted((config.out_dir / "lidar_edit").glob("overtaking_*_edit.csv")):
-        try:
-            write_edit_analysis_xlsx(edit)
-        except Exception:  # noqa: BLE001 - 解析できない候補は段階5で警告済み
-            pass
+    # 解析できない候補は段階5で警告済みなので、ここでは黙って飛ばす
+    rewrite_analysis_xlsx(config.out_dir, log=None)
     lengths = load_car_lengths(config.out_dir)
     missing = sum(1 for event in events if str(event.get("event_id", "")) not in lengths)
     status = "ok" if not missing else "warning"

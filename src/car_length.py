@@ -669,20 +669,48 @@ def session_view(out_dir: Path) -> str:
     return view if view in WINDOWS else "front"
 
 
-def refresh_outputs(out_dir: Path, log: Callable[[str], None] = print) -> None:
-    """車長を反映するため、解析xlsx と最終Excel（実行レポートの設定で）を作り直す。"""
+def rewrite_analysis_xlsx(out_dir: Path, log: Callable[[str], None] | None = print) -> int:
+    """車長を反映するため、lidar_edit/ の解析xlsx を全部作り直す。作り直した件数を返す。"""
     from edit_csv import write_edit_analysis_xlsx
-    from final_export import generate_final_workbook
 
-    out_dir = Path(out_dir)
     rewritten = 0
-    for edit in sorted((out_dir / "lidar_edit").glob("overtaking_*_edit.csv")):
+    for edit in sorted((Path(out_dir) / "lidar_edit").glob("overtaking_*_edit.csv")):
         try:
             write_edit_analysis_xlsx(edit)
             rewritten += 1
         except Exception as exc:  # noqa: BLE001 - 解析できない候補は飛ばす
-            log(f"[car_length] {edit.name}: 解析xlsxを作り直せません: {exc}")
-    log(f"[car_length] 解析xlsx {rewritten} 件を作り直しました")
+            if log:
+                log(f"[car_length] {edit.name}: 解析xlsxを作り直せません: {exc}")
+    if log:
+        log(f"[car_length] 解析xlsx {rewritten} 件を作り直しました")
+    return rewritten
+
+
+def estimate_for_final(out_dir: Path, view: str = "",
+                       log: Callable[[str], None] = print) -> dict:
+    """最終Excelを作る前に、採用の候補の車長を推定して解析xlsx を作り直す（手動GUI用）。
+
+    最終Excelに載るのは「採用」だけなので、それ以外は推定しない（API の料金を抑える）。
+    推定済み・手入力済みの候補は飛ばすので、最終Excelを何度作り直しても API は
+    新しい候補の分しか呼ばない。戻り値は estimate_car_lengths の要約に ``targets``
+    （採用の候補数）を足したもの。
+    """
+    out_dir = Path(out_dir)
+    events = [e for e in read_review_events(out_dir)
+              if (e.get("review_status") or "採用") == "採用"]
+    summary = estimate_car_lengths(out_dir, events, view if view in WINDOWS else session_view(out_dir),
+                                   log=log)
+    summary["targets"] = len(events)
+    rewrite_analysis_xlsx(out_dir, log)
+    return summary
+
+
+def refresh_outputs(out_dir: Path, log: Callable[[str], None] = print) -> None:
+    """車長を反映するため、解析xlsx と最終Excel（実行レポートの設定で）を作り直す。"""
+    from final_export import generate_final_workbook
+
+    out_dir = Path(out_dir)
+    rewrite_analysis_xlsx(out_dir, log)
     try:
         report = json.loads((out_dir / "pipeline_report.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
