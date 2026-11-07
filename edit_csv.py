@@ -596,13 +596,25 @@ def classify_phases(
 
 
 def analyze_edit_points(
-    points: list[EditPoint], strict: bool = False
-) -> dict[str, float | EditPoint | list[str]]:
+    points: list[EditPoint], strict: bool = False, car_length: float | None = None
+) -> dict[str, float | EditPoint | list[str] | None]:
     """フェーズ判定と分析指標をまとめて返す。
 
     既定（``strict=False``）は全自動処理向けにフォールバックを使い、採用した
     フォールバックや外れ値除外を ``"warnings"`` キーに文字列リストで返す。
-    ``strict=True`` を渡すと従来どおり、フェーズ2・4が無い場合は例外になる。
+    ``strict=True`` を渡すと従来どおり、フェーズ2・4が無い場合と、通過時間の終端
+    （下記）が取れない場合は例外になる。
+
+    通過時間は「フェーズ4の1つ前の有効行」（通過区間 ``|Y| < 3m`` にいた最後の点。
+    戻り値の ``"passing_end"``）の時刻からフェーズ3の時刻を引いたもの。フェーズ4は
+    区間を出たあとの最初の点なので、その時刻は通過時間に含めない。距離p3は従来どおり
+    フェーズ4の行で測る（``docs/計算方法.md`` 9.2）。
+
+    相対速度 = 3.6 × (距離p3 + 車長) / 通過時間。車長（``car_length``、m）は
+    ``car_length.py`` が動画の写真から求める。車長が無ければ相対速度は ``None``。
+
+    TTC = フェーズ2の distance / (フェーズ2の speed / 3.6)。相対速度と車長には
+    依らない。フェーズ2の speed が空欄か0以下なら ``None``。
     """
     warnings: list[str] = []
     phases = classify_phases(points, strict=strict, warnings=warnings)
@@ -612,28 +624,60 @@ def analyze_edit_points(
     end = next(i for i, point in enumerate(points) if point is p4)
     section = points[start:end + 1]
     lc_section = [point for point in section if point.distance >= LC_MIN_DISTANCE] or section
-    passing_time = p4.unixtime - p3.unixtime
+    # 通過時間の終端 = フェーズ4の1つ前の有効行。フェーズ3の直後がフェーズ4（通過区間内の
+    # 点がフェーズ3の1点だけ）だと終端が取れないので、全自動ではフェーズ4の行で代用して
+    # 警告を残す（「代用」を含む警告は自動レビューが「未確認」にする）。
+    if end - 1 > start:
+        passing_end = points[end - 1]
+    elif strict:
+        raise ValueError(
+            "フェーズ3とフェーズ4の間に行が無いため通過時間を計算できません"
+            "（通過区間内の点がフェーズ3の1点だけです）"
+        )
+    else:
+        passing_end = p4
+        warnings.append(
+            "通過区間内の点がフェーズ3の1点だけのため、通過時間の終端をフェーズ4の行で"
+            "代用しました（本来はフェーズ4の1つ前の行。通過時間・相対速度・TTCは目安）"
+        )
+    passing_time = passing_end.unixtime - p3.unixtime
     if passing_time == 0:
-        raise ValueError("フェーズ3とフェーズ4の時刻差が0のため計算できません")
+        raise ValueError("フェーズ3と通過時間の終端行の時刻差が0のため計算できません")
     lc, lc_notes = lateral_clearance(lc_section)
     warnings.extend(lc_notes)
     distance_p3 = p4.y - p3.y
-    relative_speed = distance_p3 / passing_time * 3.6
-    ttc = abs(p2.y) / (relative_speed / 3.6) if relative_speed != 0 else float("nan")
-    if relative_speed <= 0:
-        # 追い越し車ならフェーズ3→4で Y は必ず増える。負や0になるのは軌跡が
-        # 別物体へ乗り移った証拠で、TTC・相対速度も符号ごと壊れている。
+    if car_length is not None and not (math.isfinite(car_length) and car_length > 0):
+        car_length = None
+    relative_speed = (
+        3.6 * (distance_p3 + car_length) / passing_time if car_length is not None else None
+    )
+    # TTC はフェーズ2の行の値だけで決まる（距離 / その時点の速度）。
+    p2_speed = p2.speed
+    if p2_speed is not None and p2_speed > 0:
+        ttc: float | None = p2.distance / (p2_speed / 3.6)
+    else:
+        ttc = None
         warnings.append(
-            f"相対速度が {relative_speed:.2f} km/h（0以下）です。フェーズ4がフェーズ3より"
+            "フェーズ2の speed が"
+            + ("空欄" if p2_speed is None else f" {p2_speed:g} km/h（0以下）")
+            + " のため TTC を計算できません"
+        )
+    if distance_p3 <= 0:
+        # 追い越し車ならフェーズ3→4で Y は必ず増える。負や0になるのは軌跡が
+        # 別物体へ乗り移った証拠で、通過時間・相対速度も成り立たない。
+        warnings.append(
+            f"距離p3 が {distance_p3:.2f} m（0以下）です。フェーズ4がフェーズ3より"
             "手前にあり、追い越し車以外を追跡している可能性が高いので点群を目視で"
             "確認してください"
         )
     return {
         **phases,
+        "passing_end": passing_end,
         "lc": lc,
         "passing_time": passing_time,
         "distance_p2": abs(p2.y),
         "distance_p3": distance_p3,
+        "car_length": car_length,
         "relative_speed": relative_speed,
         "ttc": ttc,
         "warnings": warnings,
@@ -732,16 +776,37 @@ def build_analysis_rows(points: list[EditPoint], metrics: dict[str, float | Edit
         6: ["距離p3", metrics["distance_p3"], "m"],
         7: ["相対速度", metrics["relative_speed"], "km/h"],
         8: ["TTC", metrics["ttc"], "秒"],
+        9: ["車長", metrics.get("car_length"), "m"],
+        10: ["車長の出典", metrics.get("car_length_source", ""), ""],
     }
     for i, point in enumerate(points, start=2):
         analysis = indicator_rows.get(i, ["", "", ""])
         rows.append(point.raw + [point.phase, ""] + analysis)
+    # 点が少ないと指標欄が途中で切れる（TTC・車長が書かれない）ので、点の列を空けて続ける。
+    blank_point = [""] * (len(EDIT_HEADER) + 2)
+    for i in range(len(points) + 2, max(indicator_rows) + 1):
+        rows.append(blank_point + indicator_rows[i])
     return rows
 
 
-def write_edit_analysis_xlsx(edit_path: Path) -> Path:
+def _event_id_from_edit_path(edit_path: Path) -> str:
+    match = re.match(r"overtaking_(.+)_edit$", Path(edit_path).stem)
+    return match.group(1) if match else ""
+
+
+def write_edit_analysis_xlsx(edit_path: Path, car_length: float | None = None,
+                             car_length_source: str = "") -> Path:
+    """解析xlsxを書く。車長を渡さなければ ``<out>/car_length/car_lengths.csv`` から引く。"""
     points = read_edit_points(edit_path)
-    metrics = analyze_edit_points(points)
+    if car_length is None:
+        from car_length import lookup_car_length  # 循環を避けるためここで読む
+
+        found = lookup_car_length(Path(edit_path).parent.parent,
+                                  _event_id_from_edit_path(edit_path))
+        if found is not None:
+            car_length, car_length_source = found.meters, found.source
+    metrics = analyze_edit_points(points, car_length=car_length)
+    metrics["car_length_source"] = car_length_source if metrics["car_length"] is not None else ""
     out_path = Path(edit_path).with_name(f"{Path(edit_path).stem}_analysis.xlsx")
     _write_simple_xlsx(out_path, "走行挙動解析", build_analysis_rows(points, metrics))
     return out_path

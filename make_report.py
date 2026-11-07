@@ -36,6 +36,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from car_length import lookup_car_length
 from edit_csv import analyze_edit_points, read_edit_points
 
 # ── 点群の軽量化のしきい値 ───────────────────────────────────────────────────
@@ -165,7 +166,9 @@ def load_metrics(out_dir: Path, event_id: str) -> tuple[dict, list[str], str]:
         return {}, [], ""
     try:
         points = read_edit_points(path)
-        metrics = analyze_edit_points(points)
+        car_length = lookup_car_length(out_dir, event_id)
+        metrics = analyze_edit_points(
+            points, car_length=car_length.meters if car_length else None)
     except Exception as exc:  # noqa: BLE001 - 1件の失敗でレポート全体を止めない
         return {}, [], str(exc)
     warnings = [str(w) for w in (metrics.get("warnings") or [])]

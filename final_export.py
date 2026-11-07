@@ -10,17 +10,20 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as _xml_escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from car_length import load_car_lengths
 from edit_csv import EditPoint, analyze_edit_points, read_edit_points
 
 
-# 「車種」までは共有フォーマットの従来列。「車線数」は末尾へ追加した列で、
-# 既存列の位置（G列=危険感、R列=車種 の入力規則）を動かさないため最後に置く。
+# 「車種」までは共有フォーマットの従来列。「車線数」「車長(m)」「車長の出典」は末尾へ
+# 追加した列で、既存列の位置（G列=危険感、R列=車種 の入力規則）を動かさないため最後に置く。
+# 車長は相対速度 = 3.6 × (距離p3 + 車長) / 通過時間 に使った値（car_length.py が推定）。
 FINAL_HEADERS = [
     "整理ID", "データ収集日", "被験者名またはID", "離隔距離（ｍ）",
     "自転車速度（km/h)", "自動車速度（km/h)", "危険感",
     "通過時間", "距離p2", "距離p3", "相対速度", "TTC",
     "動画ファイル名", "動画のタイムスタンプ", "LiDARデータファイル名",
     "日本時間", "LiDARのタイムスタンプ", "車種", "車線数",
+    "車長(m)", "車長の出典",
 ]
 VEHICLE_LIST = ["普通", "軽", "大型", "二輪"]
 DANGER_LIST = ["非常に危険", "危険", "やや危険", "なし"]
@@ -245,15 +248,18 @@ def _final_rows(
     gps_rows = _gps_cache(out_dir)
     data_date = _excel_date(_collection_date(out_dir, collection_date))
     pcap_name = Path(pcap_path).name if pcap_path else ""
+    car_lengths = load_car_lengths(out_dir)
 
     for event in events:
         event_id = event.get("event_id", "")
         edit_path = out_dir / "lidar_edit" / f"overtaking_{_event_id_for_path(event_id)}_edit.csv"
         metrics: dict[str, object] = {}
         phase3_time: float | None = None
+        car_length = car_lengths.get(str(event_id)) or car_lengths.get(_event_id_for_path(event_id))
         try:
             points = read_edit_points(edit_path)
-            metrics = analyze_edit_points(points)
+            metrics = analyze_edit_points(
+                points, car_length=car_length.meters if car_length else None)
             p3 = metrics.get("phase3")
             if isinstance(p3, EditPoint):
                 phase3_time = p3.unixtime
@@ -261,6 +267,11 @@ def _final_rows(
             notes = metrics.get("warnings")
             if isinstance(notes, list):
                 warnings.extend(f"候補 {event_id}: {note}" for note in notes)
+            if car_length is None:
+                warnings.append(
+                    f"候補 {event_id}: 車長が無いため相対速度・自動車速度は空欄です"
+                    "（car_length.py で車長を推定するか、car_length/car_lengths.csv に入力してください）"
+                )
         except Exception as exc:
             warnings.append(f"候補 {event_id}: 分析できません ({exc})")
 
@@ -292,6 +303,8 @@ def _final_rows(
             Cell(_round_or_blank(lidar_timestamp, 6), 5),
             Cell(event.get("class", ""), 0),
             Cell(_lane_count_value(event.get("lane_count")), 0),
+            Cell(round(car_length.meters, 3) if car_length else "", 4 if car_length else 0),
+            Cell(car_length.source if car_length else "", 0),
         ]
         rows.append(row)
 
@@ -337,6 +350,8 @@ def _sheet_xml(rows: list[list[Cell]]) -> str:
         '<col min="13" max="15" width="22" customWidth="1"/>'
         '<col min="16" max="18" width="17" customWidth="1"/>'
         '<col min="19" max="19" width="10" customWidth="1"/>'
+        '<col min="20" max="20" width="10" customWidth="1"/>'
+        '<col min="21" max="21" width="24" customWidth="1"/>'
         '</cols>'
     )
     row_xml = []

@@ -1406,20 +1406,21 @@ def run_check() -> None:
             "unixtime,X,Y,Z,distance(m),speed(km/h)\n"
             "0,-0.5,8,0,8.02,\n"
             "1,-1.0,7,0,7.10,12\n"
-            "2,-1.5,6,0,6.20,8\n"
-            "3,-2.0,5,0,5.40,7\n"
-            "4,-2.5,2.5,0,3.54,14\n"
+            "2,-1.5,5,0,5.22,8\n"
+            "3,-2.0,2.5,0,3.20,7\n"
+            "4,-2.5,1.0,0,2.69,14\n"
             "5,-1.0,3.2,0,3.35,16\n",
             encoding="utf-8-sig",
         )
         points = read_edit_points(edit_path)
         metrics = analyze_edit_points(points)
-        assert metrics["phase2"].row_number == 5, metrics
-        assert metrics["phase3"].row_number == 6, metrics
+        assert metrics["phase2"].row_number == 4, metrics
+        assert metrics["phase3"].row_number == 5, metrics
         assert metrics["phase4"].row_number == 7, metrics
-        # LC は通過区間(フェーズ3〜4, X=-2.5 と -1.0)の通過側で |X| が最小の点。
+        # LC は通過区間(フェーズ3〜4, X=-2.0, -2.5, -1.0)の通過側で |X| が最小の点。
         # 旧実装の abs(min(X)) は X が負側だと「最も遠い横距離」(2.5) を返していた。
         assert metrics["lc"] == 1.0, metrics
+        # 通過時間はフェーズ4の1つ前の行(t=4) − フェーズ3(t=3)。
         assert metrics["passing_time"] == 1.0, metrics
         analysis_path = write_edit_analysis_xlsx(edit_path)
         assert analysis_path.is_file(), analysis_path
@@ -1450,9 +1451,9 @@ def run_check() -> None:
             "unixtime,X,Y,Z,distance(m),speed(km/h)\n"
             "97.0,-0.5,8,0,8.0,\n"
             "98.0,-1.0,7,0,7.1,12\n"
-            "99.0,-1.5,6,0,6.2,8\n"
-            "100.0,-2.0,5,0,5.4,7\n"
-            "101.0,-2.5,2.5,0,2.8,14\n"
+            "99.0,-1.5,5,0,5.2,8\n"
+            "100.0,-2.0,2.5,0,3.2,7\n"
+            "101.0,-2.5,1.0,0,2.7,14\n"
             "102.0,-1.0,3.2,0,3.35,16\n",
             encoding="utf-8-sig",
         )

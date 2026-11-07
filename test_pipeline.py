@@ -34,15 +34,16 @@ from run_pipeline import (
 
 
 # 追い越し車の軌跡（1秒刻み）。後方から近づいて横に並び、前方へ抜けていく。
-#   フェーズ2 = 4行目(t=3), フェーズ3 = 5行目(t=4, |Y|<3), フェーズ4 = 6行目(t=5)
+#   フェーズ2 = 3行目(t=2), フェーズ3 = 4行目(t=3, |Y|<3), フェーズ4 = 6行目(t=5)
+#   通過時間 = フェーズ4の1つ前の行(t=4) − フェーズ3(t=3) = 1.0秒、距離p3 = 3.5 − (−2.0) = 5.5m
 # 通過区間（|Y| < 3m）を後ろから前へ抜けきる形にしてある。抜けきらない軌跡だと
 # 距離p3が MIN_PASS_PROGRESS を下回り、自動レビューが「未確認」にする。
 TRAJECTORY = [
     (0.0, -0.5, -8.0),
     (1.0, -1.0, -7.0),
-    (2.0, -1.5, -6.0),
-    (3.0, -2.0, -5.0),
-    (4.0, -2.5, -2.0),
+    (2.0, -1.5, -5.0),
+    (3.0, -2.0, -2.0),
+    (4.0, -2.5, 0.5),
     (5.0, -1.0, 3.5),
 ]
 PCAP_START_UNIX = 1782000000.0
@@ -341,8 +342,14 @@ def test_pipeline_end_to_end():
             assert abs(float(row[2]) - y) < 0.02, row
         assert (out_dir / "lidar_edit" / "overtaking_001_edit_analysis.xlsx").is_file()
 
-        # 段階7: 最終Excel。危険感は未設定なので空欄。
-        assert status["final"] == "ok", status
+        # 段階6.5: 動画が無いので写真を切り出せず、車長は得られない（APIは呼ばない）
+        assert status["car_length"] == "warning", status
+        assert any("車長" in item for item in data["manual_actions"]), data["manual_actions"]
+
+        # 段階7: 最終Excel。危険感は未設定なので空欄。車長が無いので相対速度も空欄で警告。
+        assert status["final"] == "warning", status
+        final_stage = next(s for s in data["stages"] if s["name"] == "final")
+        assert any("車長が無い" in w for w in final_stage["warnings"]), final_stage
         final_path = out_dir / "final" / "out_auto_final.xlsx"
         assert final_path.is_file(), final_path
         with ZipFile(final_path) as book:
@@ -350,6 +357,8 @@ def test_pipeline_end_to_end():
         assert "整理ID" in sheet_xml
         assert sheet_cell(sheet_xml, "C2") == "ID1", "被験者IDがセッションフォルダ名から入らなかった"
         assert sheet_cell(sheet_xml, "G2") == "", "危険感が空欄になっていない"
+        assert not re.search(r'<c r="K2"[^>]*><v>', sheet_xml), "車長が無いのに相対速度が入った"
+        assert re.search(r'<c r="L2"[^>]*><v>', sheet_xml), "TTC は車長に依らず入るはず"
 
         # 段階8: レポート
         assert (out_dir / "pipeline_report.json").is_file()
@@ -776,10 +785,10 @@ def test_skip_sync_check_skips_the_stage():
 def test_non_advancing_analysis_is_flagged_for_review():
     """フェーズ3→4で車が前進していない解析は採用せず人手確認へ回す。
 
-    通過区間を抜けるまで追えず、代用のフェーズ4が後方の点になると距離p3・
-    相対速度・TTC がすべて負になる。最終Excelへ「TTC が負の行」を入れないよう
-    「未確認」にする（実データ260701/ID1の281.9s、ID3の869.1sがこの型。
-    既定では未確認→除外に落ちるため --keep-unconfirmed 相当の設定で条件を見る）。
+    通過区間を抜けるまで追えず、代用のフェーズ4が後方の点になると距離p3 が
+    負になる。相対速度は車長を足すので正に見えることがあり、判定には距離p3 を
+    使う（実データ260701/ID1の281.9s、ID3の869.1sがこの型。既定では未確認→除外に
+    落ちるため --keep-unconfirmed 相当の設定で条件を見る）。
     """
     config = PipelineConfig(session_dir=Path("."), out_dir=Path("."), videos=[],
                             pcap_path=Path("."), view="front", keep_unconfirmed=True)
@@ -787,8 +796,8 @@ def test_non_advancing_analysis_is_flagged_for_review():
     tracking = {"1": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2},
                 "2": {"ok": True, "confidence": 0.9, "lc_estimate": 1.2}}
     analyses = {
-        "1": {"metrics": {"lc": 1.27, "relative_speed": -0.32, "ttc": -40.31}},
-        "2": {"metrics": {"lc": 1.30, "relative_speed": 15.6, "ttc": 1.2}},
+        "1": {"metrics": {"lc": 1.27, "distance_p3": -0.2, "relative_speed": 9.5, "ttc": 1.4}},
+        "2": {"metrics": {"lc": 1.30, "distance_p3": 6.0, "relative_speed": 15.6, "ttc": 1.2}},
     }
     reviewed = run_pipeline.auto_review_events(events, config, tracking, analyses)
     assert [row["review_status"] for row in reviewed] == ["未確認", "採用"], reviewed
@@ -1110,8 +1119,8 @@ def test_danger_level_is_blank_unless_reviewed():
         for event_id in ("001", "002"):
             (edit_dir / f"overtaking_{event_id}_edit.csv").write_text(
                 "unixtime,X,Y,Z,distance(m),speed(km/h)\n"
-                "0,-0.5,8,0,8.0,\n1,-1.0,7,0,7.1,12\n2,-1.5,6,0,6.2,8\n"
-                "3,-2.0,5,0,5.4,7\n4,-2.5,2.5,0,2.8,14\n5,-1.0,3.2,0,3.35,16\n",
+                "0,-0.5,8,0,8.0,\n1,-1.0,7,0,7.1,12\n2,-1.5,5,0,5.2,8\n"
+                "3,-2.0,2.5,0,3.2,7\n4,-2.5,1.0,0,2.7,14\n5,-1.0,3.2,0,3.35,16\n",
                 encoding="utf-8-sig",
             )
         result = generate_final_workbook(out_dir, organize_id="1", subject_id="ID1")
@@ -1287,11 +1296,14 @@ def test_report_html_is_generated_after_the_final_workbook():
 
 
 def test_no_report_option_skips_the_html():
-    """--no-report で段階7bを省く。"""
+    """--no-report で段階7bを省く。手入力の車長があれば段階6.5は推定せずそれを使う。"""
     with tempfile.TemporaryDirectory() as temp_value:
         session = make_session(Path(temp_value))
         out_dir = session / "out_auto"
         write_events_csv(out_dir, "001,普通,car,right,0.5,2.5,4.5,4.0,0.1,0,GX010001.MP4,0.5,4.5\n")
+        (out_dir / "car_length").mkdir(parents=True)
+        (out_dir / "car_length" / "car_lengths.csv").write_text(
+            "event_id,car_length_m,source\n001,4.5,manual\n", encoding="utf-8-sig")
         config = build_config(parse_args([str(session), "--skip-detect", "--skip-gps",
                                           "--no-report"]))
         assert config.report_html is False, config
@@ -1299,8 +1311,18 @@ def test_no_report_option_skips_the_html():
         stages = {stage["name"]: stage for stage in data["stages"]}
         assert stages["report_html"]["status"] == "skipped", stages["report_html"]
         assert not (out_dir / "report.html").exists()
+        assert stages["car_length"]["status"] == "ok", stages["car_length"]
+        assert stages["car_length"]["kept"] == 1, stages["car_length"]
         assert stages["final"]["status"] == "ok", stages
-        print("  OK: --no-report で閲覧用レポートを省略する")
+        with ZipFile(stages["final"]["path"]) as z:
+            sheet_xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        # 相対速度 = 3.6 × (距離p3 5.5 + 車長 4.5) / 通過時間 1.0 = 36.0
+        assert "<c r=\"K2\" s=\"4\"><v>36.0</v></c>" in sheet_xml, sheet_xml
+        assert "車長(m)" in sheet_xml and "<v>4.5</v>" in sheet_xml and "manual" in sheet_xml
+        analysis = out_dir / "lidar_edit" / "overtaking_001_edit_analysis.xlsx"
+        with ZipFile(analysis) as z:
+            assert "車長" in z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        print("  OK: --no-report で閲覧用レポートを省略し、手入力の車長で相対速度を出す")
 
 
 def gps_workbook(path: Path, rows: list[tuple[float, float, float, float]]) -> Path:

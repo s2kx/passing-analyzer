@@ -38,3 +38,10 @@ auto_gui_settings.json
 dist/
 tools/ffmpeg.exe
 tools/ffprobe.exe
+
+# APIキー（AutoAnalysis/.env など。絶対にコミットしない）
+.env
+# 車長変換の保存先（解析結果フォルダの隣の <名前>_車長変換。写真・車長一覧・変換xlsx）
+*_車長変換/
+# 車長変換GUIの前回のフォルダ指定（PC依存）
+AutoAnalysis/length_gui_settings.json

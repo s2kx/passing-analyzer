@@ -197,6 +197,71 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
    既定では「未確認」の条件はすべて除外されるため確認対象は採用行のみ。未確認を残して
    GUIで採否を決めたい場合は、実行画面の追加オプションに `--keep-unconfirmed` を付ける
 
+### 車長込みの相対速度への変換 (車長変換GUI.bat / AutoAnalysis/)
+
+既存の解析結果を、本体の 2026-11-07 以降の式（`docs/計算方法.md` 9.2・9.5・9.6）へ直す道具一式。
+コードは `AutoAnalysis/` にまとまっていて、元の解析結果は一切書き換えない。
+
+| 指標 | 旧 | 新 |
+|---|---|---|
+| 通過時間 | `t(フェーズ4) − t(フェーズ3)` | `t(フェーズ4の1つ前の行) − t(フェーズ3)` |
+| 相対速度 | `距離p3 ÷ 通過時間 × 3.6` | `3.6 × (距離p3 + 車長) ÷ 通過時間` |
+| TTC | `距離p2 ÷ (相対速度 ÷ 3.6)` | `フェーズ2の distance ÷ (フェーズ2の speed ÷ 3.6)` |
+| 自動車速度 | `自転車速度 + 相対速度` | 同じ式（新しい相対速度で計算し直す） |
+
+単独でも配布するため本体のコードは読まず、解析xlsx の行（点の列とフェーズ区分）から計算し直す。
+既存の解析結果 401 件で、本体の `analyze_edit_points` と通過時間・TTC が全件一致することを確かめてある
+（`test_car_length.py` でも照合している）。車長の無いイベントも通過時間と TTC は新しい式へ直し、
+相対速度・自動車速度だけ空欄にする。
+
+> 2026-11-07 から本体の全自動実行が段階6.5（[車長推定](#車長推定段階65--car_lengthpy)）で同じ式の値を
+> 直接出すようになった。このツールはそれより前に作った解析結果を変換するためのもの。ここで推定・確認した
+> 車長は `car_length.py --import-lengths` で本体の各セッションへ取り込める。
+
+1. `extract_car_images.py` … `clips/` の動画から追い越し車の写真を切り出す（YOLO + ByteTrack。
+   `car_images/` が ChatGPT へ送る切り抜き、`car_frames/` が枠を描いた確認用）
+2. `car_length_gpt.py` … 写真を ChatGPT（OpenAI API）へ送り、車名とカタログ全長を推定して
+   `car_lengths.csv` へ書く。生の応答は `gpt_raw/` に残す。APIキーは `AutoAnalysis/.env` の
+   `OPENAI_API_KEY`（.gitignore 済み。絶対にコミットしない）。`source=manual` の行は上書きしない
+3. `convert_relative_speed.py` … `car_lengths.csv` を使って解析xlsx と最終Excel を変換する
+   （`xlsx_cells.py` でセルだけ差し替えるので書式や危険感などの手入力列は保たれる）。
+   車長の無いイベントは相対速度を空欄にし、`--fallback lidar`（点群の実測長）/ `--fallback class`
+   （車種の代表値）で代用できる。全イベントの新旧比較（通過時間・相対速度・TTC・自動車速度）は
+   `converted/conversion_summary.csv`。解析xlsx には旧値と3つの式も書き足す
+
+**フォルダ**: 入力は「解析結果フォルダ」（セッションごとの `lidar_edit/` `final/` `clips/` を
+含むフォルダ。例: `output/`）。写真・`car_lengths.csv`・`gpt_raw/`・`converted/` はすべて
+「保存先フォルダ」に入り、既定では解析結果フォルダの隣に `<フォルダ名>_車長変換`
+（例: `output_車長変換/`）を作る。`*_車長変換/` は .gitignore 済み。
+
+`AutoAnalysis/length_pipeline.py` が3段階を順に実行する（`--src` で解析結果フォルダ、`--work` で
+保存先を指定。どの段階も未処理分だけ扱うので何度実行してもよい。セッションの限定・作り直し・
+代用などの細かい指定はこのコマンドのオプションで行う。リポジトリ直下の `run_pipeline.py` は
+全自動解析の方で別物）。`車長変換GUI.bat` のダブルクリックで専用GUI（`AutoAnalysis/length_gui.py`、
+画面は `AutoAnalysis/web_ui_length/`、前回のフォルダ指定は `length_gui_settings.json`）が起動する。
+
+1. **実行**: 解析結果フォルダ（必要なら保存先も）を選び、「実行」ボタン1つで3段階を既定の設定
+   （採用イベントのみ・既存は飛ばす・車長の無い行は空欄）で通す。進捗バー・段階一覧・ログが
+   更新され、「中止」で YOLO/GPT の子プロセスごと止められる。ChatGPT の API キーは同じ画面で
+   貼り付けて保存する（`AutoAnalysis/.env` に書かれ、そのPCだけで使う。値は画面に出ない）。
+   下の表にセッションごとの写真・車長・変換済み/未取得の数が出る
+2. **車長の確認・修正**: 切り抜き写真/全体フレームと GPT の車名・確度・判断理由を見て車長を
+   確かめる（`←`/`→` で移動、一覧は「写真あり / 要確認 / 手入力 / すべて」で絞れる）。
+   数値を直して保存すると「手入力」（`source=manual`）になり、以後の再推定でも上書きされない。
+   「手入力を取り消す」で `gpt_raw/` の生応答から GPT の値へ戻す。直した後に実行画面で
+   もう一度「実行」を押すと Excel に反映される（段階1・2は済んでいる分を飛ばす）
+
+**別のPCへ配布するとき**: `portable\python\python.exe AutoAnalysis\make_dist.py` で
+`dist\車長変換ツール\`（と同名の zip）ができる。これは git に依存しない単独フォルダで、コード一式・
+初回セットアップ用の `requirements.txt` と `prepare_portable_python.ps1`・起動 bat・`はじめに.txt` を含み、
+`.env` や解析データは含まない。渡した先では `車長変換GUI.bat` をダブルクリックするだけでよい。
+作業フォルダごと（git clone か外付けSSD）持っていく場合も同様に、
+`車長変換GUI.bat` をダブルクリックする。初回は他のランチャーと同じく `portable\python` と
+`yolov8n.pt` を自動準備する（インターネット接続が必要）。起動したら解析結果フォルダを選び、
+API キーを貼り付けて保存すれば使える。PC依存のもの（`.env`・`length_gui_settings.json`・
+`*_車長変換/`）は .gitignore 済みなので、持ち運んでも衝突しない。
+`length_gui.py --check` で画面なしの検証、`--serve-only` でブラウザから同じ画面を使える。
+
 ### 入力フォルダの規約
 
 ```text
@@ -238,6 +303,7 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 | `--keep-unconfirmed` | off | 自動レビューの「未確認」を従来どおりレビューCSVへ残す。既定は未確認の条件をすべて「除外」にする |
 | `--no-lidar-extra` | off | 動画側に候補の無い車を `L###` の「未確認」行として起票しない |
 | `--no-report` | off | 段階7bの閲覧用HTMLレポート (`out\report.html`) を作らない |
+| `--no-car-length` | off | 段階6.5の車長推定（写真を ChatGPT へ送る）を行わない。車長が無い候補の相対速度・自動車速度は空欄 |
 
 `overtaking_events.csv` が既にある場合、段階1は自動でスキップされる。
 
@@ -255,6 +321,8 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 4. **点群自動追跡** — 候補と車両を1対1に割り当てて追跡 → `out/lidar/overtaking_*.csv`
 5. **edit CSV** — 最近接点の軌跡と解析Excel → `out/lidar_edit/`
 6. **自動レビュー** — LiDARの結果と自車運動で採否を判定 → `out/reviewed_overtaking_events.csv`
+6.5. **車長推定** — 動画から追い越し車の写真を1枚切り出し、ChatGPT で車長を求める → `out/car_length/`
+   （[下記](#車長推定段階65--car_lengthpy)）。推定後に解析Excelを作り直す
 7. **最終Excel** — `out/final/<出力フォルダ名>_final.xlsx`
 7b. **閲覧用レポート** — 動画クリップと点群を見る `out/report.html`（[下記](#結果閲覧用htmlレポート-make_reportpy)）
 8. **レポート** — `out/pipeline_report.json` と `out/pipeline_report.txt`
@@ -265,6 +333,34 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 
 レポートには各段階の成否、オフセット値、候補数、警告、**人手が必要な項目**の一覧が出る。
 段階2〜7は個別の失敗で止まらず、その候補を「手動作業が必要」としてレポートへ記録して続行する。
+
+### 車長推定（段階6.5 / car_length.py）
+
+相対速度は `3.6 × (距離p3 + 車長) ÷ 通過時間` で求める（`docs/計算方法.md` 9.5）。車長は
+「除外」以外の候補ごとに次の手順で求める。
+
+1. 動画（`out/clips` のクリップ、無ければ元動画）の最接近時刻の前後を YOLO + ByteTrack で調べ、
+   追い越し車が画面の端で切れずに最も大きく写った1枚を切り抜く → `out/car_length/images/<ID>.jpg`
+   （確認用に枠を描いた全体は `frames/`）
+2. その1枚を ChatGPT（OpenAI API、既定 `gpt-5.5`）へ送り、車名とカタログ全長（特定できなければ
+   形状からの推定）を答えさせる。生の応答は `gpt_raw/` に残す
+3. `out/car_length/car_lengths.csv` に書く（`source` が `manual` の行は上書きしない。推定済みの行は
+   次回の実行でも推定し直さない）
+
+APIキーは環境変数 `OPENAI_API_KEY`、無ければリポジトリ直下の `.env`、`AutoAnalysis/.env` の順に
+探す（`.env` は .gitignore 済み。絶対にコミットしない）。キーが無い・写真を切り出せない・車長を
+特定できなかった候補は、相対速度と自動車速度が空欄になり、最終Excelの警告と人手項目に残る。
+`car_lengths.csv` の `car_length_m` に手入力（`source` は `manual`）して最終Excelを再生成すれば反映
+される。最終Excelの末尾には使った車長と出典（`車長(m)` `車長の出典`）の列が付く。
+
+既存の出力フォルダには後から実行できる（推定後に解析Excelと最終Excelを作り直す）。
+
+```powershell
+.\portable\python\python.exe car_length.py --out output\w5o\ID1            # 推定
+.\portable\python\python.exe car_length.py --out output\w5o\ID1 --dry-run  # 写真の切り出しだけ（APIは呼ばない）
+.\portable\python\python.exe car_length.py --import-lengths output_車長変換\car_lengths.csv --src output
+    # 車長変換ツールで推定・確認済みの車長を各セッションへ取り込む（APIは呼ばない）
+```
 
 ### 時刻同期の自己検証（段階3.5）
 
@@ -342,9 +438,9 @@ portable\python\python.exe run_pipeline.py E:\データ\260701\ID1 --skip-detect
 | 自転車が停止中 (自車速度 < `--stop-speed`、既定1.0m/s) | 除外 |
 | 離隔距離 LC > `--max-lane-clearance` (既定3.5m) | 除外 (隣車線の通過) |
 | 離隔距離 LC > `--review-lane-clearance` (既定2.6m) | 未確認 (隣車線の車を掴んだ疑い) |
-| フェーズ3→4で車が前進していない (相対速度 ≤ 0) | 未確認 (通過区間を抜けるまで追えていない) |
+| フェーズ3→4で車が前進していない (距離p3 ≤ 0) | 未確認 (通過区間を抜けるまで追えていない) |
 | 距離p3 < 4.5m | 未確認 (通過区間を抜けきれていない) |
-| フェーズ2・4を代用している | 未確認 (距離p2・TTCが実測でない) |
+| フェーズ2・4や通過時間の終端を代用している | 未確認 (距離p2・通過時間・TTCが実測でない) |
 | 自転車が低速 (自車速度 < 2.0m/s) | 未確認 (発進直後・停止直前) |
 | 自転車が旋回中 (> `--turn-yaw-rate`、既定20度/秒) | 未確認 (曲がり角) |
 | 追跡の確信度 < 0.5 | 未確認 (レポートの人手項目へ) |
@@ -671,6 +767,7 @@ GoProの向き・画角で変わるため既定では無効になっている。
 .\portable\python\python.exe test_autotrack.py
 .\portable\python\python.exe test_detect_view.py
 .\portable\python\python.exe test_make_report.py
+.\portable\python\python.exe test_car_length.py
 ```
 
 - `test_logic.py` … 判定ロジック(`classify_overtaking`)を YOLO/動画なしの合成軌跡で検証する
@@ -683,6 +780,8 @@ GoProの向き・画角で変わるため既定では無効になっている。
   (地面+静止物+通過車両、車列の2台目を含む)で検証する
 - `test_detect_view.py` … `detect_view.py` の判定ロジックをスタブで、フロー計算そのものを
   合成動画(拡大／縮小するテクスチャ)で検証する(実データ・GPU不要)
+- `test_car_length.py` … `car_length.py` の車長一覧の読み書き・取り込みと、推定の流れ（手入力を
+  保つ・キーが無ければAPIを呼ばない）を検証する。OpenAI API と YOLO は呼ばない
 - `test_make_report.py` … `make_report.py` を合成した最小の出力フォルダで検証する
   (report.html の必須要素、点群jsの構造、点数上限、クリップの有無、単体CLI)。
   実データの `output/ID1` が見つかる環境では、その reviewed CSV と点群CSV を一時フォルダへ

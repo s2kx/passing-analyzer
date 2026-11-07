@@ -1,0 +1,75 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "追い越し解析ソフト 処理フロー",
+    "quality_profile": "showcase",
+    "legend": { "mode": "hidden" }
+  },
+  "lanes": [
+    { "id": "gui", "label": "専用GUI / 実行ファイル" },
+    { "id": "video", "label": "動画 (GoPro)" },
+    { "id": "lidar", "label": "点群 (Velodyne PCAP)" },
+    { "id": "analysis", "label": "解析と判定" },
+    { "id": "output", "label": "出力" }
+  ],
+  "phases": [
+    { "id": "p-video", "label": "動画の解析", "fromCol": 0, "toCol": 1 },
+    { "id": "p-sync", "label": "時刻合わせ", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "p-lidar", "label": "点群の解析と出力", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["launch", "view", "detect", "gps", "sync", "synccheck", "track", "edit", "review", "final"],
+  "nodes": [
+    { "id": "launch", "lane": "gui", "col": 0, "type": "frontend", "label": "起動 (実行画面)", "sublabel": "全自動実行.bat / GUI", "tag": "MP4 + PCAP のフォルダ", "width": 148 },
+    { "id": "confirm", "lane": "gui", "col": 5, "type": "frontend", "label": "確認・修正画面", "sublabel": "auto_gui.py", "tag": "危険感・車線数を入力", "width": 148 },
+    { "id": "view", "lane": "video", "col": 0, "type": "backend", "label": "0. 撮影方向の判定", "sublabel": "detect_view.py", "tag": "front / rear", "width": 148 },
+    { "id": "detect", "lane": "video", "col": 1, "type": "backend", "label": "1. 追い越し検出", "sublabel": "detect_overtaking.py", "tag": "YOLO → 候補CSV・クリップ", "width": 148 },
+    { "id": "gps", "lane": "video", "col": 2, "type": "backend", "label": "2. GPS抽出", "sublabel": "extract_telemetry.py", "width": 148 },
+    { "id": "sync", "lane": "lidar", "col": 2, "type": "backend", "label": "3. 時刻同期", "sublabel": "gpmf_sync.py", "tag": "sync.json", "width": 148 },
+    { "id": "synccheck", "lane": "lidar", "col": 3, "type": "security", "label": "3.5 同期の自己検証", "sublabel": "tools/sync_check.py", "tag": "3秒超なら差し替え", "width": 148 },
+    { "id": "track", "lane": "lidar", "col": 4, "type": "backend", "label": "4. 点群の自動追跡", "sublabel": "lidar_autotrack.py", "tag": "車両と1対1に割り当て", "width": 148 },
+    { "id": "edit", "lane": "analysis", "col": 4, "type": "backend", "label": "5. edit CSV", "sublabel": "edit_csv.py", "tag": "LC・通過時間・TTC", "width": 148 },
+    { "id": "review", "lane": "analysis", "col": 5, "type": "security", "label": "6. 自動レビュー", "sublabel": "採否と車種を判定", "tag": "reviewed CSV", "width": 148 },
+    { "id": "final", "lane": "output", "col": 5, "type": "database", "label": "7/8. 最終Excel", "sublabel": "final_export.py", "tag": "xlsx + report.html", "width": 148 }
+  ],
+  "edges": [
+    { "id": "launch-view", "from": "launch", "to": "view", "variant": "default" },
+    { "id": "view-detect", "from": "view", "to": "detect", "variant": "default" },
+    { "id": "detect-gps", "from": "detect", "to": "gps", "variant": "default" },
+    { "id": "gps-sync", "from": "gps", "to": "sync", "variant": "default" },
+    { "id": "sync-check", "from": "sync", "to": "synccheck", "variant": "default" },
+    { "id": "check-track", "from": "synccheck", "to": "track", "label": "確定オフセット", "variant": "emphasis" },
+    { "id": "track-edit", "from": "track", "to": "edit", "variant": "default" },
+    { "id": "edit-review", "from": "edit", "to": "review", "variant": "default" },
+    { "id": "review-final", "from": "review", "to": "final", "label": "採用行のみ", "variant": "default" },
+    { "id": "final-confirm", "from": "final", "to": "confirm", "label": "完了後に確認画面へ", "variant": "default", "role": "return" },
+    { "id": "confirm-final", "from": "confirm", "to": "final", "label": "最終Excelを再生成", "variant": "dashed", "role": "return" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "3つの入口",
+      "items": [
+        "起動.bat: 手動GUI (web_gui.py)。検出→クリップ確認→PCAP同期→点群選択→edit CSV→最終Excel を人が操作する",
+        "全自動実行.bat / 全自動実行GUI.bat: セッションフォルダを渡すと run_pipeline.py が段階0〜8を一気に実行する"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "自動レビューの判定 (上から順に最初の条件)",
+      "items": [
+        "除外: LiDARで対応車両なし / 自転車が停止中 / 離隔距離 LC > 3.5m",
+        "未確認: LC > 2.6m / 通過区間を抜けていない / 低速・旋回 / 確信度 < 0.5 (既定では除外扱い)",
+        "採用: 上記以外。最終Excelには採用行だけが並ぶ"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "主な出力 (out/) と後処理",
+      "items": [
+        "overtaking_events.csv, clips/, sync.json, lidar/, lidar_edit/, reviewed_overtaking_events.csv, final/*_final.xlsx, report.html, pipeline_report.json",
+        "後処理 (任意): 車長変換GUI.bat で写真の切り出し → ChatGPT で車長推定 → 車長込みの相対速度へ変換"
+      ]
+    }
+  ]
+}

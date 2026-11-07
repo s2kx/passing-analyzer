@@ -391,21 +391,106 @@ def edit_points(rows):
 def test_phases_normal_case():
     """通常データ: フェーズ2は一桁速度の最後の点、フェーズ3/4は Y で決まる。"""
     points = edit_points([
-        (0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -1.5, 6, 8),
-        (3, -2.0, 5, 7), (4, -2.5, 2.5, 14), (5, -1.0, 3.2, 16),
+        (0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -1.5, 5, 8),
+        (3, -2.0, 2.5, 7), (4, -2.5, 1.0, 14), (5, -1.0, 3.2, 16),
     ])
     metrics = analyze_edit_points(points)
-    assert metrics["phase2"].row_number == 5, metrics
-    assert metrics["phase3"].row_number == 6, metrics
+    assert metrics["phase2"].row_number == 4, metrics
+    assert metrics["phase3"].row_number == 5, metrics
     assert metrics["phase4"].row_number == 7, metrics
+    # 通過時間はフェーズ4の1つ前の行(t=4) − フェーズ3(t=3)。フェーズ4の行(t=5)は含めない。
+    assert metrics["passing_end"].row_number == 6, metrics
     assert metrics["passing_time"] == 1.0, metrics
+    assert abs(metrics["distance_p3"] - 0.7) < 1e-9, metrics   # 距離p3はフェーズ4の行のまま
     assert metrics["warnings"] == [], metrics
     print("  OK: 通常データのフェーズ判定は従来どおり")
 
 
+def test_passing_time_ends_at_row_before_phase4():
+    """通過時間は「フェーズ4の1つ前の行 − フェーズ3の行」。距離p3はフェーズ4の行のまま。"""
+    rows = [
+        (0, -1.0, -8.0, None), (1, -1.0, -5.0, 11),
+        (2, -1.0, -2.0, 11),    # フェーズ3（|Y| < 3 に入る）
+        (3, -1.0, 0.0, 7),
+        (4, -1.0, 2.0, 7),      # 通過区間内の最後の行 = 通過時間の終端
+        (5, -1.0, 4.0, 7),      # フェーズ4（|Y| >= 3 に戻る）
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["phase3"].row_number == 4 and metrics["phase4"].row_number == 7, metrics
+    assert metrics["passing_end"].row_number == 6, metrics
+    assert metrics["passing_time"] == 2.0, metrics            # 4 − 2（旧定義 t4−t3 なら 3.0）
+    assert metrics["distance_p3"] == 6.0, metrics             # Y4 − Y3 はフェーズ4の行で測る
+    assert metrics["relative_speed"] is None, metrics       # 車長が無ければ空欄
+    assert metrics["warnings"] == [], metrics
+    print("  OK: 通過時間はフェーズ4の1つ前の行までで測る")
+
+
+def test_relative_speed_includes_car_length():
+    """相対速度 = 3.6 × (距離p3 + 車長) / 通過時間。"""
+    rows = [
+        (0, -1.0, -8.0, None), (1, -1.0, -5.0, 11),
+        (2, -1.0, -2.0, 11), (3, -1.0, 0.0, 7), (4, -1.0, 2.0, 7), (5, -1.0, 4.0, 7),
+    ]
+    metrics = analyze_edit_points(edit_points(rows), car_length=4.5)
+    # 距離p3 = 6.0、通過時間 = 2.0
+    assert abs(metrics["relative_speed"] - 3.6 * (6.0 + 4.5) / 2.0) < 1e-9, metrics
+    assert metrics["car_length"] == 4.5, metrics
+    for bad in (0.0, -1.0, float("nan")):
+        assert analyze_edit_points(edit_points(rows), car_length=bad)["relative_speed"] is None
+    print("  OK: 相対速度に車長を足す")
+
+
+def test_ttc_uses_phase2_distance_and_speed():
+    """TTC = フェーズ2の distance / (フェーズ2の speed / 3.6)。相対速度・車長に依らない。"""
+    rows = [
+        (0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -1.5, 5, 8),
+        (3, -2.0, 2.5, 7), (4, -2.5, 1.0, 14), (5, -1.0, 3.2, 16),
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    p2 = metrics["phase2"]
+    assert p2.speed == 8.0, p2
+    expected = math.hypot(-1.5, 5) / (8.0 / 3.6)
+    assert abs(metrics["ttc"] - expected) < 1e-9, metrics
+    assert metrics["distance_p2"] == 5.0, metrics           # 距離p2 は |Y| のまま
+    with_length = analyze_edit_points(edit_points(rows), car_length=4.0)
+    assert with_length["ttc"] == metrics["ttc"], with_length
+    print("  OK: TTC はフェーズ2の distance と speed で計算する")
+
+
+def test_ttc_blank_when_phase2_speed_is_zero():
+    """フェーズ2の speed が0なら TTC は空欄にして警告する。"""
+    rows = [
+        (0, -0.5, 8, None), (1, -1.0, 5, 0),
+        (2, -2.0, 2.5, 7), (3, -2.5, 1.0, 14), (4, -1.0, 3.2, 16),
+    ]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["phase2"].speed == 0.0, metrics
+    assert metrics["ttc"] is None, metrics
+    assert any("TTC" in w for w in metrics["warnings"]), metrics
+    print("  OK: フェーズ2の speed が0なら TTC は空欄")
+
+
+def test_single_frame_in_zone_falls_back_to_phase4_row():
+    """通過区間内の点がフェーズ3の1点だけなら、終端をフェーズ4の行で代用して警告する。"""
+    rows = [(0, -1.0, -8.0, None), (1, -1.0, -5.0, 11), (2, -1.0, -2.0, 11), (3, -1.0, 4.0, 21)]
+    metrics = analyze_edit_points(edit_points(rows))
+    assert metrics["passing_end"] is metrics["phase4"], metrics
+    assert metrics["passing_time"] == 1.0, metrics
+    assert any("通過時間" in w and "代用" in w for w in metrics["warnings"]), metrics
+
+    try:
+        analyze_edit_points(edit_points(rows), strict=True)
+    except ValueError as exc:
+        assert "通過時間" in str(exc), exc
+    else:
+        raise AssertionError("strict=True では通過区間内が1点だけの場合は例外になるべき")
+    print("  OK: 通過区間内が1点だけならフェーズ4の行で代用し警告（strictは例外）")
+
+
 def test_phase2_fallback_uses_point_before_phase3():
     """フェーズ2欠落(|Y|<3 の前に speed が無い) → フェーズ3直前の点で代用し警告。"""
-    rows = [(0, -2.0, 8, None), (1, -2.5, 5, None), (2, -2.5, 2.5, 14), (3, -1.0, 3.2, 16)]
+    rows = [(0, -2.0, 8, None), (1, -2.5, 5, None), (2, -2.5, 2.5, 14),
+            (3, -2.0, 1.0, 16), (4, -1.0, 3.2, 16)]
     metrics = analyze_edit_points(edit_points(rows))
     assert metrics["phase2"].row_number == 3, metrics          # フェーズ3直前の有効点
     assert metrics["phase3"].row_number == 4, metrics
@@ -426,12 +511,12 @@ def test_phase4_fallback_uses_last_point():
     """フェーズ4欠落(|Y|>=3 に戻らない) → 最終有効点で代用し警告。"""
     rows = [
         (0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -1.5, 6, 8),
-        (3, -2.0, 5, 7), (4, -2.5, 2.5, 14), (5, -1.0, 1.0, 16),
+        (3, -2.0, 5, 7), (4, -2.5, 2.5, 14), (5, -2.0, 1.5, 16), (6, -1.0, 1.0, 16),
     ]
     metrics = analyze_edit_points(edit_points(rows))
     assert metrics["phase3"].row_number == 6, metrics
-    assert metrics["phase4"].row_number == 7, metrics          # 最終有効点
-    assert metrics["passing_time"] == 1.0, metrics
+    assert metrics["phase4"].row_number == 8, metrics          # 最終有効点
+    assert metrics["passing_time"] == 1.0, metrics             # 1つ前の行(t=5) − フェーズ3(t=4)
     assert any("フェーズ4" in w for w in metrics["warnings"]), metrics
 
     try:
@@ -476,10 +561,10 @@ def test_lc_is_nearest_lateral_distance():
     """LCは通過側で |X| が最小の点（最も近い横距離）。"""
     rows = [
         (0, -0.5, 8, None), (1, -1.0, 7, 12), (2, -2.0, 5, 7),
-        (3, -2.5, 2.5, 14), (4, -1.0, 3.2, 16),
+        (3, -2.5, 2.5, 14), (4, -2.0, 1.0, 15), (5, -1.0, 3.2, 16),
     ]
     metrics = analyze_edit_points(edit_points(rows))
-    assert metrics["lc"] == 1.0, metrics     # min(|-2.5|, |-1.0|)
+    assert metrics["lc"] == 1.0, metrics     # min(|-2.5|, |-2.0|, |-1.0|)
     print("  OK: 通過側で最も近い横距離をLCにする")
 
 
@@ -500,7 +585,7 @@ def test_phase2_speed_spike_is_reported():
     """最近接点の乗り移りによる速度スパイクは候補から外し、警告を残す。"""
     rows = [
         (0, -0.5, 8, None), (1, -1.0, 7, 480), (2, -1.5, 6, 8),
-        (3, -2.0, 5, 320), (4, -2.5, 2.5, 14), (5, -1.0, 3.2, 16),
+        (3, -2.0, 5, 320), (4, -2.5, 2.5, 14), (5, -2.0, 1.0, 15), (6, -1.0, 3.2, 16),
     ]
     metrics = analyze_edit_points(edit_points(rows))
     assert metrics["phase2"].row_number == 4, metrics   # 一桁速度(8)の点
@@ -520,7 +605,8 @@ def test_phase2_ignores_far_candidates():
         (2, 2.0, 12, 30),
         (3, 2.0, 5.0, 28),     # |Y| <= 5.5 の候補
         (4, 2.5, 2.5, 26),     # フェーズ3
-        (5, 2.0, 3.2, 25),     # フェーズ4
+        (5, 2.0, 1.0, 26),
+        (6, 2.0, 3.2, 25),     # フェーズ4
     ]
     metrics = analyze_edit_points(edit_points(rows))
     assert metrics["phase2"].row_number == 5, metrics     # Y=5.0 の点
@@ -534,7 +620,8 @@ def test_phase2_far_only_falls_back_with_warning():
     rows = [
         (0, 2.0, 20, None), (1, 2.0, 18, 11), (2, 2.0, 12, 30),
         (3, 2.5, 2.5, 26),     # フェーズ3（直前に近い候補が無い）
-        (4, 2.0, 3.2, 25),     # フェーズ4
+        (4, 2.0, 1.0, 26),
+        (5, 2.0, 3.2, 25),     # フェーズ4
     ]
     metrics = analyze_edit_points(edit_points(rows))
     assert metrics["distance_p2"] == 18.0, metrics        # 速度最小の点に戻る
@@ -542,8 +629,8 @@ def test_phase2_far_only_falls_back_with_warning():
     print("  OK: 近い候補が無いときは制限を外して警告")
 
 
-def test_negative_relative_speed_is_warned():
-    """フェーズ4がフェーズ3より手前（相対速度が0以下）なら警告を出す。"""
+def test_negative_distance_p3_is_warned():
+    """フェーズ4がフェーズ3より手前（距離p3が0以下）なら警告を出す。"""
     rows = [
         (0, 2.0, 8, None), (1, 2.0, 5.0, 20),
         (2, 2.0, 2.5, 20),      # フェーズ3
@@ -551,9 +638,9 @@ def test_negative_relative_speed_is_warned():
         (4, 2.0, -3.2, 20),     # フェーズ4（フェーズ3より手前）
     ]
     metrics = analyze_edit_points(edit_points(rows))
-    assert metrics["relative_speed"] < 0, metrics
-    assert any("相対速度" in w and "0以下" in w for w in metrics["warnings"]), metrics
-    print("  OK: 相対速度が0以下のフェーズ崩壊を警告する")
+    assert metrics["distance_p3"] < 0, metrics
+    assert any("距離p3" in w and "0以下" in w for w in metrics["warnings"]), metrics
+    print("  OK: 距離p3が0以下のフェーズ崩壊を警告する")
 
 
 def _write_frames_csv(path, frames):
@@ -600,9 +687,11 @@ def test_trajectory_ignores_ego_structure():
     xs = [float(r[1]) for r in rows[1:] if r[1]]
     assert xs and all(abs(x - 1.2) < 1e-6 for x in xs), rows
     metrics = analyze_edit_points(edit_points_from_rows(rows))
-    assert abs(metrics["passing_time"] - 0.8) < 1e-6, metrics
+    # フェーズ3 = i=5 (Y=-2.5)、フェーズ4 = i=13 (Y=3.1)。通過時間は i=12 までの 0.7 秒。
+    assert abs(metrics["passing_time"] - 0.7) < 1e-6, metrics
     assert abs(metrics["distance_p3"] - 5.6) < 1e-6, metrics
-    assert metrics["relative_speed"] > 0 and metrics["ttc"] > 0, metrics
+    assert metrics["ttc"] is not None and metrics["ttc"] > 0, metrics
+    assert analyze_edit_points(edit_points_from_rows(rows), car_length=4.0)["relative_speed"] > 0
     print("  OK: 自車構造物に乗り移らず追い越し車を追い続ける")
 
 

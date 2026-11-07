@@ -62,6 +62,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from car_length import (
+    estimate_car_lengths,
+    load_car_lengths,
+    read_review_events,
+    target_events,
+)
 from detect_view import (
     DEFAULT_SAMPLE_SECONDS as VIEW_SAMPLE_SECONDS,
     DEFAULT_SAMPLES as VIEW_SAMPLES,
@@ -270,6 +276,8 @@ class PipelineConfig:
     auto_offset: bool = True
     # 段階7b で閲覧用HTMLレポート（report.html）を作るか。
     report_html: bool = True
+    # 段階6.5 で動画の写真から ChatGPT で車長を推定するか（相対速度の式に使う）。
+    car_length: bool = True
 
     def track_margins(self) -> tuple[float, float]:
         """追跡窓の (開始側, 終了側) マージン秒を返す。
@@ -425,6 +433,7 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         sync_check=bool(getattr(args, "sync_check", True)),
         auto_offset=bool(getattr(args, "auto_offset", True)),
         report_html=bool(getattr(args, "report_html", True)),
+        car_length=bool(getattr(args, "car_length", True)),
     )
 
 
@@ -2121,14 +2130,14 @@ def auto_review_events(events: list[dict], config: PipelineConfig,
             )
             continue
         # フェーズ3→4で車が前進していない解析は成り立たない。通過区間の途中で追跡が
-        # 切れ、代用のフェーズ4が後方の点になった場合に起きる（距離p3・相対速度・TTC
-        # がすべて負になる）。値を採用すると最終Excelへ TTC が負の行が入るので、
-        # 除外はせず人手確認へ回す。
-        speed = _analysis_metric(analyses.get(event_id), "relative_speed")
-        if speed is not None and speed <= 0:
+        # 切れ、代用のフェーズ4が後方の点になった場合に起きる（距離p3 が負になる）。
+        # 値を採用すると最終Excelへ成り立たない通過時間・相対速度が入るので、除外は
+        # せず人手確認へ回す。相対速度は車長を足すので符号の判定に使えない。
+        advance = _analysis_metric(analyses.get(event_id), "distance_p3")
+        if advance is not None and advance <= 0:
             event["review_status"] = "未確認"
             event["review_reason"] = (
-                f"フェーズ3→4で車が前進していません（相対速度 {speed:.1f} km/h）。"
+                f"フェーズ3→4で車が前進していません（距離p3 {advance:.2f} m）。"
                 "通過区間を抜けるまで追えておらず、通過時間・距離p3・TTCが"
                 "成り立たないため目視確認が必要です"
             )
@@ -2225,6 +2234,57 @@ def run_review(config: PipelineConfig, events: list[dict], tracking: dict[str, d
     if not counts["採用"]:
         report.warn("採用された候補がありません。時刻オフセットと検出結果を確認してください")
     return counts["採用"]
+
+
+# ── 段階6.5: 車長推定 ─────────────────────────────────────────────────────────
+
+def run_car_length(config: PipelineConfig, report: PipelineReport) -> dict:
+    """「除外」以外の候補の車長を、動画の写真1枚から ChatGPT で求める（car_length.py）。
+
+    相対速度 = 3.6 × (距離p3 + 車長) / 通過時間 に使う。車長が得られなかった候補は
+    相対速度・自動車速度が空欄になるだけで、他の指標（TTC を含む）はそのまま出る。
+    推定後は解析xlsx を作り直して車長と相対速度を書き込む。
+    """
+    if not config.car_length:
+        report.stage("car_length", "6.5.車長推定", "skipped",
+                     "--no-car-length が指定されました（相対速度・自動車速度は車長があるものだけ）")
+        return {}
+    events = target_events(read_review_events(config.out_dir))
+    if not events:
+        report.stage("car_length", "6.5.車長推定", "skipped", "対象の候補がありません")
+        return {}
+    try:
+        summary = estimate_car_lengths(
+            config.out_dir, events, config.view or DEFAULT_VIEW,
+            log=lambda line: print(line, flush=True))
+    except Exception as exc:  # noqa: BLE001 - 車長が無くても最終Excelは作る
+        report.stage("car_length", "6.5.車長推定", "failed", f"予期しないエラー: {exc}")
+        report.warn(f"車長を推定できません: {exc}")
+        return {}
+    for message in summary["messages"]:
+        report.warn(message)
+    for edit in sorted((config.out_dir / "lidar_edit").glob("overtaking_*_edit.csv")):
+        try:
+            write_edit_analysis_xlsx(edit)
+        except Exception:  # noqa: BLE001 - 解析できない候補は段階5で警告済み
+            pass
+    lengths = load_car_lengths(config.out_dir)
+    missing = sum(1 for event in events if str(event.get("event_id", "")) not in lengths)
+    status = "ok" if not missing else "warning"
+    message = (f"対象 {len(events)} 件: 推定 {summary['estimated']} / 既存 {summary['kept']} / "
+               f"失敗 {summary['failed']} 件")
+    if summary["no_key"]:
+        message += "（APIキーが無いため推定していません）"
+    report.stage("car_length", "6.5.車長推定", status, message,
+                 path=summary["path"], estimated=summary["estimated"],
+                 kept=summary["kept"], failed=summary["failed"], missing=missing)
+    if missing:
+        report.manual(
+            f"車長が無い候補が {missing} 件あります。相対速度・自動車速度が空欄です。"
+            f"{Path(summary['path']).name} の car_length_m に入力（source は manual）し、"
+            "最終Excelを再生成してください"
+        )
+    return summary
 
 
 # ── 段階7: 最終Excel ──────────────────────────────────────────────────────────
@@ -2340,6 +2400,7 @@ def run_pipeline(config: PipelineConfig, tracker=None, view_detector=None,
         analyses = run_edit_csv(config, report)
         # LiDAR発の「未確認」行は候補行の後ろへ足す（列は候補行から作るため順序が重要）
         run_review(config, events + extra_events, tracking, analyses, offset, report)
+        run_car_length(config, report)
         run_final_export(config, pcap, offset, report)
         run_report_html(config, report)
     except PipelineError as exc:
@@ -2420,6 +2481,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=True,
                         help="動画側に候補の無い車をレビューCSVへ「未確認」で"
                              "起票しない（既定は起票する）")
+    parser.add_argument("--no-car-length", dest="car_length", action="store_false",
+                        default=True,
+                        help="段階6.5の車長推定（動画の写真1枚を ChatGPT へ送る）を行わない。"
+                             "車長が無い候補の相対速度・自動車速度は空欄になる")
     parser.add_argument("--no-report", dest="report_html", action="store_false",
                         default=True,
                         help="段階7bの閲覧用HTMLレポート（report.html）を作らない"

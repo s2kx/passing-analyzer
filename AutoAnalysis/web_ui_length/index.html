@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>車長変換 - 自転車追い越し解析</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">MATSUMOTO LAB · CAR LENGTH</p>
+      <h1>車長込みの相対速度へ変換</h1>
+    </div>
+    <div class="status-pill" id="globalStatus"><span></span>準備完了</div>
+  </header>
+
+  <main class="app-shell">
+    <nav class="steps" aria-label="画面切り替え">
+      <button class="step active" data-step="run"><b>1</b><span>実行<small>切り出し → GPT推定 → 変換</small></span></button>
+      <button class="step" data-step="review"><b>2</b><span>車長の確認・修正<small>写真を見て直す</small></span></button>
+    </nav>
+
+    <!-- ───────── 1. 実行 ───────── -->
+    <section class="panel active" id="panel-run">
+      <div class="section-heading">
+        <div><span class="section-number">01</span><h2>実行</h2></div>
+      </div>
+      <div class="grid two-column">
+        <article class="card form-card">
+          <label for="srcPath">解析結果フォルダ（セッションごとの lidar_edit / final / clips を含む）</label>
+          <div class="path-input"><input id="srcPath" placeholder="例: E:\data\output"><button data-pick="src">選択</button></div>
+          <label for="workPath">保存先フォルダ（写真・車長の一覧・変換した Excel）</label>
+          <div class="path-input"><input id="workPath" placeholder="空欄 = 解析結果フォルダの隣に <名前>_車長変換"><button data-pick="work">選択</button></div>
+          <p class="hint" id="folderHint"></p>
+          <ol class="stage-list">
+            <li><b>1</b><span>写真の切り出し<small>clips の動画から追い越し車を探して切り抜く</small></span></li>
+            <li><b>2</b><span>車長の推定（ChatGPT）<small>車長の無い写真だけ API に送る。手入力した行は触らない</small></span></li>
+            <li><b>3</b><span>相対速度の変換<small>通過時間・相対速度・TTC を新しい式に直し、解析xlsx と最終Excel を converted フォルダに書き出す</small></span></li>
+          </ol>
+          <div class="button-row">
+            <button class="primary large" id="startRun">実行</button>
+            <button class="secondary" id="cancelRun" disabled>中止</button>
+          </div>
+          <div class="key-row">
+            <label for="apiKeyInput">ChatGPT の API キー <span id="apiKeyStatus" class="badge">確認中</span></label>
+            <div class="path-input"><input id="apiKeyInput" type="password" autocomplete="off" placeholder="sk-... を貼り付けて保存"><button id="saveApiKey">保存</button></div>
+          </div>
+        </article>
+        <article class="card progress-card">
+          <div class="card-title"><h3>実行状況</h3><span id="progressLabel">0%</span></div>
+          <div class="progress-track"><div id="progressBar"></div></div>
+          <p id="runMessage" class="process-message">「実行」を押してください。</p>
+          <div class="pipeline-stages" id="runStages"><p class="empty">段階の開始・完了ごとにここへ表示されます</p></div>
+          <pre id="runLog" class="log">待機中...</pre>
+        </article>
+      </div>
+
+      <article class="card overview-card">
+        <div class="card-title">
+          <h3>現在の状態</h3>
+          <div class="button-row summary-actions">
+            <button class="secondary" id="openConverted">結果フォルダを開く</button>
+          </div>
+        </div>
+        <p class="summary-meta" id="overviewMeta"></p>
+        <div class="table-wrap overview-wrap">
+          <table>
+            <thead><tr><th>セッション</th><th>写真</th><th>車長あり / イベント</th><th>手入力</th><th>変換済み</th><th>車長未取得</th></tr></thead>
+            <tbody id="overviewRows"><tr><td colspan="6" class="empty">解析結果フォルダを選んでください</td></tr></tbody>
+          </table>
+        </div>
+        <p class="hint">「車長未取得」は最終Excelに載っているのに車長が無い行です。clips の無いセッションでは写真を作れないため、相対速度・自動車速度が空欄になります（通過時間・TTC は新しい式で入ります）。</p>
+      </article>
+    </section>
+
+    <!-- ───────── 2. 車長の確認・修正 ───────── -->
+    <section class="panel" id="panel-review">
+      <div class="section-heading">
+        <div><span class="section-number">02</span><h2>車長の確認・修正</h2></div>
+        <p>写真と GPT の判断理由を見て車長を確かめます。数値を直して保存すると「手入力」になり、以後の再推定でも上書きされません。直したら実行画面でもう一度「実行」を押すと Excel に反映されます。</p>
+      </div>
+      <div class="review-layout">
+        <article class="card preview-card">
+          <div class="stage-tabs" role="tablist">
+            <button class="stage-tab active" data-image="crop" role="tab">切り抜き（GPT に送った写真）</button>
+            <button class="stage-tab" data-image="frame" role="tab">全体フレーム</button>
+          </div>
+          <div class="image-stage">
+            <div class="video-placeholder" id="imagePlaceholder"><span>▣</span><p>右の一覧からイベントを選ぶと<br>写真を表示します</p></div>
+            <img id="previewImage" alt="追い越し車の写真" hidden>
+          </div>
+          <div class="preview-controls">
+            <div class="preview-meta">
+              <div><span id="previewId">イベント未選択</span><span id="previewSource"></span></div>
+              <strong id="previewLength">-- m</strong>
+            </div>
+            <dl class="detail-list" id="detailList"></dl>
+            <div class="edit-row">
+              <label>車長 (m)<input id="lengthInput" class="field-input" placeholder="例: 4.695" inputmode="decimal"></label>
+              <label>メモ<input id="noteInput" class="field-input" placeholder="確認した根拠など"></label>
+            </div>
+            <div class="decision-buttons">
+              <button class="accept" id="saveLength">✓ この値で保存（手入力）<kbd>Enter</kbd></button>
+              <button class="reject" id="restoreGpt" disabled>手入力を取り消す</button>
+              <div class="transport-buttons"><button class="secondary" id="prevRow">← 前</button><button class="secondary" id="nextRow">次 →</button></div>
+            </div>
+          </div>
+        </article>
+        <aside class="card table-card">
+          <div class="card-title">
+            <h3>イベント一覧</h3>
+            <div class="counter"><span id="shownCount">0</span> 件表示 ／ 車長あり <span id="withLengthCount">0</span></div>
+          </div>
+          <div class="filter-row">
+            <select id="filterSession" class="field-select" aria-label="セッションで絞る"><option value="">すべてのセッション</option></select>
+            <select id="filterKind" class="field-select" aria-label="種類で絞る">
+              <option value="image" selected>写真あり</option>
+              <option value="check">要確認（形状からの推定・確度 0.7 未満）</option>
+              <option value="manual">手入力</option>
+              <option value="all">すべて</option>
+            </select>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>セッション</th><th>ID</th><th>車種</th><th>車長</th><th>出典</th><th>車名</th><th>確度</th></tr></thead>
+              <tbody id="lengthRows"><tr><td colspan="7" class="empty">実行画面で解析結果フォルダを選んでください</td></tr></tbody>
+            </table>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
